@@ -1,31 +1,65 @@
-                                                   Screenshots
-<img width="1388" height="913" alt="Screenshot_20260922_092311" src="https://github.com/user-attachments/assets/7f934240-6965-4d5a-9b5e-a8a1af04b7f7" />
-<img width="1419" height="944" alt="Screenshot_20260922_092335" src="https://github.com/user-attachments/assets/d61ccdf1-3468-422a-bde3-efcdecec3edb" />
-<img width="1419" height="944" alt="Screenshot_20260922_092346" src="https://github.com/user-attachments/assets/5496acc4-e20b-44bd-9bbf-9e6029268810" />
-<img width="1419" height="944" alt="Screenshot_20260922_092403" src="https://github.com/user-attachments/assets/0226c791-089c-4f7f-bd56-d09f7abb22d7" />
-<img width="1419" height="944" alt="Screenshot_20260922_092420" src="https://github.com/user-attachments/assets/7065451a-2228-4ddc-ae52-8e2c6b597c7a" />
-<img width="1265" height="789" alt="Screenshot_20260921_065400" src="https://github.com/user-attachments/assets/f84c3824-5372-4343-b24b-f16fa04f438b" />
-<img width="1265" height="789" alt="Screenshot_20260921_065412" src="https://github.com/user-attachments/assets/e919c2db-b50d-4848-b3d7-b353815bd043" />
-<img width="1265" height="789" alt="Screenshot_20260921_065431" src="https://github.com/user-attachments/assets/c7539f4a-e734-45d9-aadc-8881ebe0bde4" />
-<img width="1265" height="789" alt="Screenshot_20260921_065442" src="https://github.com/user-attachments/assets/30315e48-c752-4b1e-9169-c9a4e4fb9bf3" />
-                                                   
-
 # Legion Power Manager 2 — Rust + C++/Qt6
 
 Port of the PySide6 Legion Power Manager: privileged work in Rust, GUI in Qt6.
+Five tabs: Home (power profile), Firmware Attributes, NVIDIA Curve Optimizer,
+Ryzen Curve Optimizer, Optimizations (system tuning).
 
 ## Install
 
     sudo ./install.sh                   # build + install to /usr
     sudo ./install.sh --remove-legacy   # …and remove the old Python install
-    sudo rc-update add nvcurve-autoload default   # boot-time GPU profile (optional)
+
+Needs: Rust ≥ 1.75, Qt ≥ 6.4 (Widgets, Network), CMake ≥ 3.19, polkit.
+Runtime: NVIDIA proprietary driver (for the NVIDIA tab), root-owned `ryzenadj`
+in `/usr/bin`, `/usr/sbin`, `/usr/local/{bin,sbin}` or `/opt/ryzenadj` (for the
+Ryzen tab). Neither is required to install or use the other tabs.
 
 Gentoo: `./make-dist.sh` produces `dist/legion-power-manager-2.0.0.tar.xz`
 (crates vendored, offline build). Copy it into DISTDIR and use the ebuild in
 `packaging/gentoo/sys-power/legion-power-manager/` from a local overlay.
 
-Needs: Rust ≥ 1.75, Qt ≥ 6.4 (Widgets, Network), CMake ≥ 3.19, polkit.
-Runtime: NVIDIA proprietary driver (NVIDIA tab), root-owned `ryzenadj` (Ryzen tab).
+After installing, launch `legion-power-manager` once (it starts hidden in the
+tray — pass `--window` to open it immediately, or click the tray icon) to
+create your config directories.
+
+### Quick start
+
+- **Power profile (Home tab).** Pick a profile card; it's applied immediately
+  through `legion-profile-helper`, no reboot needed.
+- **GPU curve (NVIDIA tab).** *Read Current Curve* first, drag points or set
+  Core/Memory offsets, *Apply Offsets*. *Save As…* keeps a named profile;
+  ★ *Default* auto-applies one at every boot (needs
+  `systemctl enable --now nvcurve-autoload` / `rc-update add nvcurve-autoload default`,
+  see below).
+- **CPU curve (Ryzen tab).** Per-core Curve Optimizer offsets, or one offset
+  for every core with *Apply All-Core*. *Disable* a slot if your CPU has fewer
+  physical cores than SMU slots (common on cut-down/partially-populated CCDs).
+- **System tuning (Optimizations tab).** Pick a built-in preset (top dropdown),
+  *Load*, review the checked rows, *Apply checked*. ★ *Use for games* wires it
+  into Lutris/Steam (see the Game launch sub-tab for the exact hooks); ⏻ *Apply
+  at boot* stores it as the boot preset (needs enabling the `lpm-tune` service,
+  see below). *Restore originals* always available at the top of the tab.
+  **Every row's tooltip explains what it does, when to change it, and what
+  numbers to enter for common scenarios — hover before asking "what do I put
+  here?"**; the section further down also walks through several tuning goals
+  end to end.
+
+### Boot-time services (optional)
+
+Both nvcurve-autoload (★ Default GPU profile) and lpm-tune (⏻ Optimizations
+boot preset) are installed for either init system; enable only the one your
+distro actually runs:
+
+    # systemd
+    systemctl enable --now nvcurve-autoload.service
+    systemctl enable --now lpm-tune.service
+
+    # OpenRC
+    rc-update add nvcurve-autoload default
+    rc-update add lpm-tune boot
+
+Neither does anything until you've actually set a ★ default profile / ⏻ boot
+preset from the GUI — enabling the service early is harmless.
 
 ### Layout
 
@@ -41,6 +75,8 @@ Runtime: NVIDIA proprietary driver (NVIDIA tab), root-owned `ryzenadj` (Ryzen ta
     /etc/xdg/autostart/legion-power-manager.desktop  starts in the tray on login
     /etc/init.d/nvcurve-autoload                     OpenRC (GPU profile)
     /etc/init.d/lpm-tune                             OpenRC (tuning boot preset, runlevel boot)
+    /usr/lib/systemd/system/nvcurve-autoload.service systemd (GPU profile)
+    /usr/lib/systemd/system/lpm-tune.service         systemd (tuning boot preset)
 
 Unchanged data locations: `/etc/nvcurve/{config.json,profiles/}` (GPU),
 `~/.config/ryzen-curve-optimizer/profiles/` (CPU). New: `~/.config/legion-power-manager/
@@ -220,7 +256,7 @@ came up during the sysfs review, as one tab backed by a Rust root helper.
     gui/src/optimizetab.{h,cpp}             the tab
     packaging/openrc/lpm-tune               boot preset service
 
-**Rows** (51, grouped CPU · Memory · Scheduler · Storage · Devices · Stability):
+**Rows** (59, grouped CPU · Memory · Scheduler · Storage · Devices · Stability):
 all lutris-game-tune parameters (governor/EPP, epp_boost, X3D mode, ASPM, deep
 C-states, VM set, MGLRU, THP ×3, split-lock, watchdog, autogroup, CFS slice,
 debugfs scheduler knobs, HDA power save, PCI latency timers) and new ones:
@@ -230,6 +266,14 @@ amd-pstate mode, boost, min freq = lowest_nonlinear, **SMT**, **CCD parking**
 cpumask** and **IRQ affinity** by CCD role, I/O scheduler / WBT / read-ahead
 per disk, USB autosuspend, amdgpu iGPU DPM level, MCE poll interval.
 Rows the machine does not have are shown greyed out ("n/a").
+
+**Per-CCD governor / EPP / boost / max frequency.** amd-pstate has one
+cpufreq policy per CPU, so `Governor · CCDn`, `EPP · CCDn`, `Boost · CCDn`
+(per-policy `boost`, 6.11+) and `Max frequency · CCDn` write only the
+policies whose CPUs sit on that L3 domain. They come after the global rows in
+the table and therefore override them (a unit test pins that order); the GUI
+names each die's role, e.g. "(V-Cache)". `epp_boost` stays global: the patch
+series has no per-policy file. EPP's read-only `custom` state is not offered.
 
 **CCD roles instead of CPU lists.** Values like `cache`, `frequency`, `ccd1`
 are resolved against the live L3 topology (largest L3 = V-Cache die; highest
@@ -291,3 +335,105 @@ the active user can therefore retune the kernel; tighten
 Dev aids: `LPM_TUNE_FAKE=/path/describe.json` renders canned data,
 `LPM_OPT_SUBTAB=N` and `LPM_OPT_LOAD=<preset>` pick the sub-tab and preset
 for `LPM_SCREENSHOT`.
+
+### Deep-optimization guide
+
+Every row's tooltip already explains what it does, when to touch it, and what
+to enter — this section is for combining rows toward a goal, the reasoning a
+single tooltip can't carry. All of it applies through **checking rows and
+Apply checked**, or by loading/editing one of the six built-in presets
+(Preset dropdown → *Load*) and saving your own variant (*Save as…*).
+
+**Chasing 1% lows / frame-time spikes in a specific game.** Start from
+*Gaming X3D* and change one thing at a time — this is empirical, not a
+formula:
+1. `cpu.x3d_mode` = cache, launch affinity (Game launch tab) = the V-Cache
+   CCD. This alone is usually the single biggest win on an X3D chip for
+   cache-hungry games (open-world, simulation-heavy, emulators).
+2. `wq.cpumask` and `irq.affinity` = the *other* CCD, so filesystem/network
+   work and interrupts physically cannot land on the game's cores.
+3. Try `cpu.smt` = off. Some titles' 1% lows improve with SMT off (no sibling
+   cache contention), most don't care — this is genuinely per-game, test it.
+4. If still spiky, `cpu.cstate_max` to a shallow state (e.g. `1`) trims
+   wake-from-idle jitter at the cost of idle power/heat while gaming.
+5. Last resort, not first: `cpu.ccd_park` the non-gaming CCD (*Competitive*
+   preset). Total isolation, but you lose those cores entirely until restored
+   — only worth it if steps 1–4 didn't get you there.
+
+**A game crashes or hangs specifically under Wine/Proton, not on native
+titles.** Check `kernel.split_lock_mitigate` = 0 first (some titles trigger
+the split-lock mitigation and stall ~1000× on affected instructions) and
+`vm.max_map_count` = 2147483642 (some Proton titles map more regions than
+old distro defaults allow and crash on it). Both are already in every gaming
+preset; if you built a preset from scratch, these two are the "don't forget"
+rows for Proton compatibility specifically.
+
+**Validating a Ryzen Curve Optimizer offset (Ryzen tab) before trusting it.**
+Load the *CO validation* preset here first: it keeps boost on and every
+C-state enabled (idle→boost transitions are where a marginal core first
+misbehaves — you want that path exercised, not avoided), re-enables the
+kernel watchdog, and drops the MCE poll interval to 10s. Apply it, then apply
+your CO offsets in the Ryzen tab, then stress the affected cores while
+watching `dmesg -w` (or rasdaemon if installed) for correctable-error or
+watchdog messages. Restore this preset once you're done — it's deliberately
+not a tab to leave applied permanently.
+
+**Compiling / long parallel builds (kernel, emerge -j).** *Compile
+throughput* trades every latency-favouring row for throughput: EPP
+`balance_performance` rather than `performance` (better sustained clocks
+under sustained load), `cpu.x3d_mode` = frequency (compilers are usually more
+clock-sensitive than cache-hungry), SMT on, no CCD parked, wider scheduler
+slices (`sched.preempt` = voluntary, `sched.base_slice_ns` larger), and I/O
+scheduler back to `mq-deadline` for fair multi-process disk access instead of
+`none`'s raw single-queue latency.
+
+**Battery life on the go.** *Quiet battery*: EPP `power`, boost off, min
+frequency at hardware floor rather than the efficient-but-higher
+`lowest_nonlinear`, `cpu.cstate_max` = all (never restrict idle depth on
+battery), aggressive ASPM (`powersupersave`), HDA and USB power-saving
+re-enabled. This preset is the one place a lot of the "always safe" rows from
+other presets get deliberately reversed — that's intentional, they trade
+latency for power savings which is exactly backwards for gaming but right
+here.
+
+**Building your own preset from scratch.** A reasonable order: (1) start
+from the closest built-in preset and *Load* it, (2) uncheck what you don't
+want, (3) use *Select → Changed* to see at a glance which rows currently
+differ from the live system, (4) *Apply checked* and actually use the system
+for a while before deciding it's right, (5) *Save as…*. Rows marked ⚠ are the
+ones most likely to cost you something (stability, heat, idle power) if
+misapplied — read those tooltips before checking them, and prefer testing
+them individually rather than as part of a first-time bulk apply.
+
+**Per-CCD splits in general (X3D 2-CCD chips only).** The pattern behind
+`Governor · CCDn` / `EPP · CCDn` / `Boost · CCDn` / `Max frequency · CCDn`:
+treat the two CCDs as two different machines with two different jobs. The
+game's CCD gets the aggressive settings (performance EPP, boost on, no
+frequency cap); the other CCD gets efficiency settings (balance_power EPP,
+maybe boost off, maybe a frequency cap) since it's mostly idle plus whatever
+background work you steered onto it with `wq.cpumask`/`irq.affinity`. None of
+these four rows do anything by themselves — they only matter paired with the
+launch affinity (Game launch tab) that actually puts the game process on the
+CCD you're optimizing for.
+
+### NVIDIA curve: zoom
+Zoom slider (1–12×, voltage axis) and pan slider under the graph; the
+frequency axis auto-fits to the visible points. Over the graph: wheel zooms at
+the cursor, Shift+wheel pans, `+`/`−` zoom, `0` fits. A strip at the top of the
+plot shows where the window sits on the whole curve. Dev aid:
+`LPM_NVCURVE_VIEW=zoom,pan` with `LPM_NVCURVE_FAKE`.
+
+### systemd
+Both init flavours are installed; the running init picks its own files.
+
+    systemctl enable --now nvcurve-autoload.service   # ★ Default GPU profile
+    systemctl enable --now lpm-tune.service           # ⏻ Apply at boot preset
+    journalctl -u lpm-tune                            # helper's JSON result
+
+`lpm-tune.service` runs after `systemd-sysctl` (so its values win over
+`/etc/sysctl.d`) and module loading, before the display manager; `systemctl
+stop lpm-tune` restores the originals. `nvcurve-autoload.service` retries for
+a while if the NVIDIA device is not up yet. Both are skipped by a
+`ConditionPathExists` when no default profile / boot preset is set.
+Service files hold `@BINDIR@`/`@LIBEXEC@`; install.sh and the ebuild fill them
+in (`PREFIX`, `UNITDIR` are honoured).

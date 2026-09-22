@@ -14,12 +14,15 @@
 #   /etc/polkit-1/rules.d/49-legion-power-manager.rules
 #   /etc/init.d/nvcurve-autoload                    OpenRC boot-time GPU profile
 #   /etc/init.d/lpm-tune                            OpenRC boot-time tuning preset
+#   $PREFIX/lib/systemd/system/{nvcurve-autoload,lpm-tune}.service   systemd equivalents
+# Both init flavours are installed; only the running init uses its files.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 PREFIX=${PREFIX:-/usr}
 DESTDIR=${DESTDIR:-}
 LIBEXEC="$PREFIX/libexec/legion-power-manager"
+UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
 BUILD=1 LEGACY=0
 for a in "$@"; do
     case "$a" in
@@ -52,7 +55,18 @@ install -d "${own[@]}" -m 0755 "$DESTDIR$PREFIX/share/polkit-1/actions" "$DESTDI
     "$DESTDIR/etc/init.d" "$DESTDIR/etc/nvcurve/profiles"
 install "${own[@]}" -m 0644 packaging/polkit/com.legion-power-manager.policy "$DESTDIR$PREFIX/share/polkit-1/actions/"
 install "${own[@]}" -m 0644 packaging/polkit/49-legion-power-manager.rules "$DESTDIR/etc/polkit-1/rules.d/"
-install "${own[@]}" -m 0755 packaging/openrc/nvcurve-autoload packaging/openrc/lpm-tune "$DESTDIR/etc/init.d/"
+# Service files carry @BINDIR@/@LIBEXEC@ so a non-/usr PREFIX points at the right binaries.
+subst() { sed -e "s|@BINDIR@|$PREFIX/bin|g" -e "s|@LIBEXEC@|$LIBEXEC|g" "$1"; }
+for s in nvcurve-autoload lpm-tune; do
+    subst "packaging/openrc/$s" > "$DESTDIR/etc/init.d/$s"
+    chmod 0755 "$DESTDIR/etc/init.d/$s"
+done
+install -d "${own[@]}" -m 0755 "$DESTDIR$UNITDIR"
+for u in nvcurve-autoload lpm-tune; do
+    subst "packaging/systemd/$u.service" > "$DESTDIR$UNITDIR/$u.service"
+    chmod 0644 "$DESTDIR$UNITDIR/$u.service"
+done
+[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR"/etc/init.d/{nvcurve-autoload,lpm-tune} "$DESTDIR$UNITDIR"/{nvcurve-autoload,lpm-tune}.service
 
 if (( LEGACY )) && [[ -z "$DESTDIR" ]]; then
     # Old Python layout (and the step-1/2 drop-in binaries that replaced its .py helpers).
@@ -66,8 +80,14 @@ if [[ -z "$DESTDIR" ]]; then
     command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$PREFIX/share/icons/hicolor" || true
     echo
     echo "Installed. Optional boot services:"
-    echo "  rc-update add nvcurve-autoload default   # GPU V/F profile"
-    echo "  rc-update add lpm-tune boot              # Optimizations boot preset"
+    if [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload || true
+        echo "  systemctl enable nvcurve-autoload.service   # GPU V/F profile"
+        echo "  systemctl enable lpm-tune.service           # Optimizations boot preset"
+    else
+        echo "  rc-update add nvcurve-autoload default   # GPU V/F profile"
+        echo "  rc-update add lpm-tune boot              # Optimizations boot preset"
+    fi
     if [[ -x /usr/local/bin/lutris-game-tune-wrapper ]]; then
         echo
         echo "Note: lutris-game-tune is still installed (setuid wrapper). lpm-gamemode replaces it;"

@@ -4,6 +4,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QWheelEvent>
 #include <cmath>
 
 static QColor C(const char *s) { return QColor(QString::fromLatin1(s)); }
@@ -26,14 +27,81 @@ void VfCurveWidget::fitAxes() {
     if (pts_.isEmpty()) return;
     double x0 = pts_[0].x(), x1 = x0, y1 = pts_[0].y();
     for (const QPointF &p : pts_) { x0 = std::min(x0, p.x()); x1 = std::max(x1, p.x()); y1 = std::max(y1, p.y()); }
-    xMin_ = x0 - 50; xMax_ = x1 + 50; yMin_ = 0; yMax_ = y1 + 200;
+    fullX0_ = x0 - 50; fullX1_ = x1 + 50; fullY1_ = y1 + 200;
+    zoom_ = 1.0;
+    pan_ = 0.5;
+    applyView();
+}
+
+void VfCurveWidget::applyView() {
+    const double full = fullX1_ - fullX0_;
+    const double span = full / zoom_;
+    xMin_ = fullX0_ + pan_ * (full - span);
+    xMax_ = xMin_ + span;
+    if (zoom_ <= 1.0001) {
+        yMin_ = 0;
+        yMax_ = fullY1_;
+    } else {
+        // Frequency follows the visible points, otherwise a zoomed-in
+        // stretch of the curve would be a flat line at the top.
+        double lo = 1e9, hi = -1e9;
+        for (const QPointF &p : pts_) {
+            if (p.x() < xMin_ - 1 || p.x() > xMax_ + 1) continue;
+            lo = std::min(lo, p.y());
+            hi = std::max(hi, p.y());
+        }
+        if (lo > hi) { yMin_ = 0; yMax_ = fullY1_; }
+        else {
+            const double pad = std::max(60.0, (hi - lo) * 0.15);
+            yMin_ = std::max(0.0, lo - pad);
+            yMax_ = hi + pad;
+        }
+    }
     update();
+    Q_EMIT viewChanged();
+}
+
+void VfCurveWidget::setZoom(double z) {
+    z = std::clamp(z, 1.0, MAX_ZOOM);
+    if (std::abs(z - zoom_) < 1e-6) return;
+    zoomAt(z / zoom_, (xMin_ + xMax_) / 2);
+}
+
+void VfCurveWidget::setPan(double p) {
+    p = std::clamp(p, 0.0, 1.0);
+    if (std::abs(p - pan_) < 1e-6) return;
+    pan_ = p;
+    applyView();
+}
+
+void VfCurveWidget::zoomAt(double factor, double anchorMv) {
+    const double z = std::clamp(zoom_ * factor, 1.0, MAX_ZOOM);
+    const double full = fullX1_ - fullX0_;
+    const double frac = (anchorMv - xMin_) / std::max(1e-9, xMax_ - xMin_);  // anchor's screen position
+    const double span = full / z;
+    const double newMin = anchorMv - frac * span;
+    zoom_ = z;
+    pan_ = full - span > 1e-9 ? std::clamp((newMin - fullX0_) / (full - span), 0.0, 1.0) : 0.5;
+    applyView();
+}
+
+void VfCurveWidget::wheelEvent(QWheelEvent *e) {
+    if (pts_.isEmpty()) return QWidget::wheelEvent(e);
+    const double steps = e->angleDelta().y() / 120.0;
+    if (steps == 0) return QWidget::wheelEvent(e);
+    if (e->modifiers() & Qt::ShiftModifier) {
+        setPan(pan_ - steps * 0.1 / zoom_ * 2);
+    } else {
+        zoomAt(std::pow(1.25, steps), toValue(e->position()).x());
+    }
+    e->accept();
 }
 
 void VfCurveWidget::setPoints(const QVector<QPointF> &pts) {
     const bool reshaped = pts.size() != pts_.size();
     pts_ = pts;
     if (reshaped) { sel_.clear(); cur_ = 0; fitAxes(); }
+    else if (zoom_ > 1.0001 && dragIndex_ < 0 && !groupDrag_) applyView();  // keep edited points in frame
     update();
     Q_EMIT selectionChanged();
 }
@@ -115,6 +183,16 @@ void VfCurveWidget::paintEvent(QPaintEvent *) {
     p.restore();
     p.setPen(QPen(C(theme::BORDER), 1));
     p.drawRect(r);
+    if (zoom_ > 1.0001) {
+        // Overview strip: where the visible window sits on the whole curve.
+        const double full = fullX1_ - fullX0_;
+        const QRectF strip(r.left() + 1, r.top() + 1, r.width() - 2, 3);
+        p.fillRect(strip, C(theme::BG2));
+        p.fillRect(QRectF(strip.left() + (xMin_ - fullX0_) / full * strip.width(), strip.top(),
+                          strip.width() / zoom_, strip.height()), C(theme::ACCENT_SOFT));
+        p.setPen(C(theme::MUTED));
+        p.drawText(r.adjusted(0, 6, -6, 0), Qt::AlignRight | Qt::AlignTop, QStringLiteral("%1×").arg(zoom_, 0, 'f', 1));
+    }
 
     if (pts_.isEmpty()) {
         p.setPen(C(theme::MUTED));
@@ -170,7 +248,7 @@ void VfCurveWidget::mousePressEvent(QMouseEvent *e) {
 void VfCurveWidget::mouseMoveEvent(QMouseEvent *e) {
     const double y = toValue(e->position()).y();
     if (dragIndex_ >= 0) {
-        dragFreq_ = std::clamp(y, 0.0, yMax_);
+        dragFreq_ = std::clamp(y, 0.0, fullY1_);
         pts_[dragIndex_].setY(std::round(dragFreq_));  // local preview; model updates on release
         update();
     } else if (groupDrag_) {
@@ -184,6 +262,7 @@ void VfCurveWidget::mouseReleaseEvent(QMouseEvent *) {
     dragIndex_ = -1;
     groupDrag_ = false;
     unsetCursor();
+    if (zoom_ > 1.0001) applyView();
 }
 
 void VfCurveWidget::keyPressEvent(QKeyEvent *e) {
@@ -199,6 +278,9 @@ void VfCurveWidget::keyPressEvent(QKeyEvent *e) {
         Q_EMIT selectionChanged();
         break;
     case Qt::Key_Escape: clearSelection(); break;
+    case Qt::Key_Plus: case Qt::Key_Equal: setZoom(zoom_ * 1.25); break;
+    case Qt::Key_Minus: setZoom(zoom_ / 1.25); break;
+    case Qt::Key_0: fitAxes(); break;
     case Qt::Key_A:
         if (e->modifiers() & Qt::ControlModifier) { selectAll(); break; }
         [[fallthrough]];

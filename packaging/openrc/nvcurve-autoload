@@ -3,7 +3,7 @@
 # Set from the NVIDIA tab's ★ Default button (/etc/nvcurve/config.json).
 
 description="Apply the nvcurve auto-load GPU profile"
-command="/usr/bin/nvcurve"
+command="@BINDIR@/nvcurve"
 
 depend() {
 	need localmount

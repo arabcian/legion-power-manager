@@ -166,7 +166,10 @@ fn wrap(args: &[String]) -> i32 {
     let entered = match apply(Some(&pname), "game") { Ok(_) => true, Err(e) => { eprintln!("lpm-gamemode: {e}"); false } };
     prepare_run(&preset);
     // Forward termination so POST still runs when the launcher stops us.
-    for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] { unsafe { libc::signal(s, forward as libc::sighandler_t) }; }
+    // `as *const ()` first: casting a function item straight to an integer type is
+    // deprecated (function pointers aren't guaranteed integer-representable), even
+    // though it's always fine in practice on the platforms this runs on.
+    for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] { unsafe { libc::signal(s, forward as *const () as libc::sighandler_t) }; }
     let code = match Command::new(&cmd[0]).args(&cmd[1..]).spawn() {
         Ok(mut c) => {
             CHILD.store(c.id() as i32, Ordering::SeqCst);

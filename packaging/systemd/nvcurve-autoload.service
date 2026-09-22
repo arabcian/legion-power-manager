@@ -1,0 +1,34 @@
+# Applies the default ("auto-load") NVIDIA V/F curve profile at boot (systemd).
+# Counterpart of packaging/openrc/nvcurve-autoload. Set the profile with the
+# NVIDIA tab's ★ Default button (/etc/nvcurve/config.json).
+#
+#   systemctl enable --now nvcurve-autoload.service
+
+[Unit]
+Description=Apply the nvcurve auto-load GPU profile
+Documentation=file:///usr/share/doc/legion-power-manager/README.md
+ConditionPathExists=/etc/nvcurve/config.json
+After=local-fs.target systemd-modules-load.service systemd-udev-trigger.service nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=NVCURVE_LOG=info
+ExecStart=@BINDIR@/nvcurve autoload
+# The nvidia module / device nodes can appear after this unit on some boots.
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectHostname=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

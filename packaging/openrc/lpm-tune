@@ -9,7 +9,7 @@
 #   rc-update add lpm-tune boot
 
 description="Apply the Legion Power Manager boot tuning preset"
-HELPER="/usr/libexec/legion-power-manager/tune-helper"
+HELPER="@LIBEXEC@/tune-helper"
 
 depend() {
 	need localmount

@@ -2,8 +2,13 @@
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 PREFIX=${PREFIX:-/usr}
-rc-update del nvcurve-autoload default 2>/dev/null || true
-rc-update del lpm-tune boot 2>/dev/null || true
+UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
+if [[ -d /run/systemd/system ]]; then
+    systemctl disable nvcurve-autoload.service lpm-tune.service 2>/dev/null || true
+else
+    rc-update del nvcurve-autoload default 2>/dev/null || true
+    rc-update del lpm-tune boot 2>/dev/null || true
+fi
 # Put every tuned value back before the helper disappears.
 if [[ -x "$PREFIX/libexec/legion-power-manager/tune-helper" ]]; then
     printf '%s' '{"op":"restore"}' | "$PREFIX/libexec/legion-power-manager/tune-helper" >/dev/null || true
@@ -15,6 +20,8 @@ rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-
       "$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy" \
       /etc/xdg/autostart/legion-power-manager.desktop \
       /etc/polkit-1/rules.d/49-legion-power-manager.rules /etc/init.d/nvcurve-autoload
+rm -f "$UNITDIR/nvcurve-autoload.service" "$UNITDIR/lpm-tune.service"
+[[ -d /run/systemd/system ]] && systemctl daemon-reload 2>/dev/null || true
 rm -rf /run/legion-power-manager
 echo "Removed. Kept: /etc/nvcurve, /etc/legion-power-manager (boot preset),"
 echo "~/.config/ryzen-curve-optimizer and ~/.config/legion-power-manager (tuning presets)."

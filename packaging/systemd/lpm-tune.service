@@ -1,0 +1,45 @@
+# Legion Power Manager — boot-time system tuning preset (systemd).
+# Counterpart of packaging/openrc/lpm-tune.
+#
+# Applies /etc/legion-power-manager/tune-boot.json (Optimizations tab →
+# "⏻ Apply at boot"). Every changed value is recorded under
+# /run/legion-power-manager/tune; `systemctl stop lpm-tune` (or "Restore
+# originals" in the GUI) writes the originals back.
+#
+#   systemctl enable --now lpm-tune.service
+
+[Unit]
+Description=Legion Power Manager boot tuning preset
+Documentation=file:///usr/share/doc/legion-power-manager/README.md
+ConditionPathExists=/etc/legion-power-manager/tune-boot.json
+# After sysctl so our values win over /etc/sysctl.d; after module loading so
+# module parameters (snd_hda_intel, usbcore, amd_pstate) exist.
+After=local-fs.target systemd-modules-load.service systemd-sysctl.service systemd-udev-trigger.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The helper takes one JSON request on stdin (StandardInputText would feed the
+# same text to ExecStop too, hence the pipes). Its JSON reply goes to the
+# journal: journalctl -u lpm-tune
+ExecStart=/bin/sh -c "echo '{\"op\":\"boot\"}' | @LIBEXEC@/tune-helper"
+ExecStop=/bin/sh -c "echo '{\"op\":\"restore\"}' | @LIBEXEC@/tune-helper"
+# Writes /sys, /proc/sys, /proc/irq and PCI config space and may mount
+# debugfs, so kernel-tunable protections cannot be used; the rest is closed.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

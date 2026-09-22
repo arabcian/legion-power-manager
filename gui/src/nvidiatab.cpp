@@ -17,6 +17,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSlider>
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -174,7 +175,8 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     vf_ = new VfCurveWidget;
     vf_->setToolTip("Click a point to select it, drag a selected point to move it.\n"
                     "Ctrl+click adds to the selection; Ctrl+A selects all, then drag empty space to shift the whole curve.\n"
-                    "←/→ extend the selection, ↑/↓ nudge by 1 MHz (Shift: 15), Space toggles, Esc clears.");
+                    "←/→ extend the selection, ↑/↓ nudge by 1 MHz (Shift: 15), Space toggles, Esc clears.\n"
+                    "Wheel zooms at the cursor, Shift+wheel pans, +/− zoom, 0 fits.");
     connect(vf_, &VfCurveWidget::selectionChanged, this, &NvidiaTab::onSelectionChanged);
     connect(vf_, &VfCurveWidget::pointEdited, this, [this](int i, int f) {
         if (i < 0 || i >= base_.size()) return;
@@ -190,8 +192,45 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
         recompute();
     });
     cv->addWidget(vf_, 1);
+    // Compact zoom/pan bar (wheel = zoom at cursor, Shift+wheel = pan, +/−/0 keys).
     auto *gb = new QHBoxLayout;
-    gb->addWidget(lbl("Click a point to select, drag to move · Ctrl+A then drag empty space shifts the curve", theme::MUTED));
+    gb->setSpacing(6);
+    auto mini = [](int lo, int hi, int w) {
+        auto *sl = new QSlider(Qt::Horizontal);
+        sl->setObjectName("miniSlider");
+        sl->setRange(lo, hi);
+        sl->setFixedWidth(w);
+        sl->setFixedHeight(14);
+        return sl;
+    };
+    auto *zoomSl = mini(100, int(VfCurveWidget::MAX_ZOOM * 100), 104);
+    zoomSl->setToolTip("Zoom the voltage axis (mouse wheel over the graph zooms at the cursor)");
+    auto *zoomLbl = lbl("1.0×", theme::FG_DIM);
+    zoomLbl->setFixedWidth(34);
+    auto *panSl = mini(0, 1000, 180);
+    panSl->setToolTip("Move the zoomed window left/right (Shift+wheel over the graph)");
+    auto *bFit = new QPushButton("Fit");
+    bFit->setObjectName("btnMini");
+    bFit->setToolTip("Show the whole curve (key: 0)");
+    gb->addWidget(lbl("Zoom", theme::MUTED));
+    gb->addWidget(zoomSl);
+    gb->addWidget(zoomLbl);
+    gb->addSpacing(4);
+    gb->addWidget(lbl("◀", theme::MUTED));
+    gb->addWidget(panSl);
+    gb->addWidget(lbl("▶", theme::MUTED));
+    gb->addWidget(bFit);
+    connect(zoomSl, &QSlider::valueChanged, vf_, [this](int v) { vf_->setZoom(v / 100.0); });
+    connect(panSl, &QSlider::valueChanged, vf_, [this](int v) { vf_->setPan(v / 1000.0); });
+    connect(bFit, &QPushButton::clicked, vf_, &VfCurveWidget::fitAxes);
+    connect(vf_, &VfCurveWidget::viewChanged, this, [this, zoomSl, panSl, zoomLbl] {
+        const QSignalBlocker a(zoomSl), b(panSl);
+        zoomSl->setValue(int(std::lround(vf_->zoom() * 100)));
+        panSl->setValue(int(std::lround(vf_->pan() * 1000)));
+        panSl->setEnabled(vf_->zoom() > 1.0001);
+        zoomLbl->setText(QStringLiteral("%1×").arg(vf_->zoom(), 0, 'f', 1));
+    });
+    panSl->setEnabled(false);
     gb->addStretch();
     auto *bAll = new QPushButton("Select All");
     connect(bAll, &QPushButton::clicked, vf_, &VfCurveWidget::selectAll);
@@ -279,6 +318,11 @@ void NvidiaTab::showEvent(QShowEvent *e) {
         if (const QString fake = qEnvironmentVariable("LPM_NVCURVE_FAKE"); !fake.isEmpty()) {
             QFile f(fake);
             if (f.open(QIODevice::ReadOnly)) takeGpuPoints(QJsonDocument::fromJson(f.readAll()).object().value("vf_curve").toArray(), true);
+            // LPM_NVCURVE_VIEW="zoom,pan" (e.g. "4,0.3") for zoomed screenshots.
+            if (const QStringList v = qEnvironmentVariable("LPM_NVCURVE_VIEW").split(','); v.size() == 2) {
+                vf_->setZoom(v[0].toDouble());
+                vf_->setPan(v[1].toDouble());
+            }
         } else {
             QTimer::singleShot(0, this, &NvidiaTab::readCurve);
         }

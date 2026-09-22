@@ -3,7 +3,7 @@
 
 EAPI=8
 
-inherit cmake xdg
+inherit cmake systemd xdg
 
 DESCRIPTION="Power profile, firmware attribute and CPU/GPU curve tuning for Lenovo Legion laptops"
 HOMEPAGE="https://localhost/legion-power-manager"
@@ -62,8 +62,17 @@ src_install() {
 	doins packaging/polkit/com.legion-power-manager.policy
 	insinto /etc/polkit-1/rules.d
 	doins packaging/polkit/49-legion-power-manager.rules
-	newinitd packaging/openrc/nvcurve-autoload nvcurve-autoload
-	newinitd packaging/openrc/lpm-tune lpm-tune
+	local s
+	for s in nvcurve-autoload lpm-tune; do
+		sed -e "s|@BINDIR@|${EPREFIX}/usr/bin|g" \
+			-e "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" \
+			packaging/openrc/${s} > "${T}"/${s}.initd || die
+		newinitd "${T}"/${s}.initd ${s}
+		sed -e "s|@BINDIR@|${EPREFIX}/usr/bin|g" \
+			-e "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" \
+			packaging/systemd/${s}.service > "${T}"/${s}.service || die
+		systemd_dounit "${T}"/${s}.service
+	done
 	keepdir /etc/nvcurve/profiles
 
 	dodoc README.md
@@ -72,9 +81,11 @@ src_install() {
 pkg_postinst() {
 	xdg_pkg_postinst
 	elog "Boot-time GPU profile (set with ★ Default in the NVIDIA tab):"
-	elog "  rc-update add nvcurve-autoload default"
+	elog "  OpenRC:  rc-update add nvcurve-autoload default"
+	elog "  systemd: systemctl enable nvcurve-autoload.service"
 	elog "Optimizations boot preset (set with ⏻ Apply at boot):"
-	elog "  rc-update add lpm-tune boot"
+	elog "  OpenRC:  rc-update add lpm-tune boot"
+	elog "  systemd: systemctl enable lpm-tune.service"
 	elog "Lutris hooks: /usr/bin/lpm-gamemode PRE / POST / RUN (see the Game launch sub-tab)."
 	elog "The Ryzen tab needs a root-owned ryzenadj in /usr/bin, /usr/sbin,"
 	elog "/usr/local/{bin,sbin} or /opt/ryzenadj."

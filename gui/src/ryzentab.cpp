@@ -253,7 +253,7 @@ RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) 
         auto *g = new QGridLayout(card);
         g->setContentsMargins(12, 8, 12, 10);
         g->setHorizontalSpacing(14);
-        g->setVerticalSpacing(3);
+        g->setVerticalSpacing(1);
 
         // Row 0: title + quick fill
         auto *title = new QLabel(QStringLiteral("CCD%1").arg(ccd));
@@ -305,6 +305,8 @@ RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) 
             auto *e = new QLineEdit;
             e->setPlaceholderText("0");
             e->setFixedWidth(72);
+            e->setFixedHeight(20);
+            e->setStyleSheet("padding: 0 4px;");
             e->setAlignment(Qt::AlignCenter);
             e->setValidator(new QIntValidator(CO_MIN, CO_MAX, e));
             e->setToolTip(QStringLiteral("Curve Optimizer offset for this slot (%1..%2)").arg(CO_MIN).arg(CO_MAX));

@@ -499,6 +499,12 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
         r.key = o.value("key").toString();
         r.group = o.value("group").toString();
         r.label = o.value("label").toString();
+        // Per-CCD rows: name the die's role from the live topology.
+        if (const auto m = QRegularExpression(QStringLiteral("_ccd(\\d+)$")).match(r.key); m.hasMatch()) {
+            const int i = m.captured(1).toInt();
+            if (topology_.value("cache_ccd").toInt(-1) == i) r.label += "  (V-Cache)";
+            else if (topology_.value("frequency_ccd").toInt(-1) == i) r.label += "  (frequency)";
+        }
         r.help = o.value("help").toString();
         r.kind = o.value("kind").toString();
         r.debugfs = o.value("debugfs").toBool();
@@ -530,7 +536,11 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
             r.include = new QCheckBox;
             r.include->setToolTip("Include in Apply, Save and boot preset");
             r.name = new QLabel((r.caution ? QStringLiteral("⚠ ") : QString()) + r.label);
-            QString tip = QStringLiteral("<b>%1</b><br>%2").arg(r.key.toHtmlEscaped(), r.help.toHtmlEscaped());
+            // Fixed-width div: Qt wraps rich-text tooltips to the widget's width by
+            // default, which for a short label would squeeze a long explanation into
+            // a tall, narrow column. 420px reads as normal paragraphs instead.
+            QString tip = QStringLiteral("<div style='max-width:420px;'><b>%1</b><br>%2</div>")
+                              .arg(r.key.toHtmlEscaped(), r.help.toHtmlEscaped());
             if (r.debugfs) tip += "<br><i>debugfs: the live value is readable by root only.</i>";
             if (r.hotplug) tip += "<br><i>Hot-plugs CPUs: applied after every other row, restored first.</i>";
             if (r.caution) tip += QStringLiteral("<br><span style='color:%1'>Can cost stability, heat or idle power.</span>").arg(theme::WARN);

@@ -39,13 +39,13 @@ QWidget { background: @BG0; color: @FG; font-size: @FONTpt; }
 QToolTip { background: @BG2; color: @FG; border: 1px solid @BORDER; padding: 4px 6px; }
 QTabWidget::pane { border: 1px solid @BORDER_SOFT; border-radius: @RADpx; background: @BG0; top: -1px; }
 QTabBar { qproperty-drawBase: 0; }
-QTabBar::tab { background: transparent; color: @MUTED; padding: 6px 14px; margin-right: 2px;
+QTabBar::tab { background: transparent; color: @MUTED; padding: 5px 12px; margin-right: 2px;
   border: 1px solid transparent; border-top-left-radius: @RADpx; border-top-right-radius: @RADpx; }
 QTabBar::tab:hover:!selected { color: @FG_DIM; background: @BG1; }
 QTabBar::tab:selected { background: @BG1; color: @FG; border-color: @BORDER_SOFT;
   border-bottom: 2px solid @ACCENT; font-weight: 600; }
-QGroupBox { background: @BG1; border: 1px solid @BORDER_SOFT; border-radius: @RADpx; margin-top: 11px;
-  padding: 8px 8px 6px 8px; font-weight: 600; color: @FG_DIM; }
+QGroupBox { background: @BG1; border: 1px solid @BORDER_SOFT; border-radius: @RADpx; margin-top: 10px;
+  padding: 6px 7px 5px 7px; font-weight: 600; color: @FG_DIM; }
 QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 9px; padding: 0 5px; color: @ACCENT; }
 QGroupBox#box_blue::title { color: @INFO; } QGroupBox#box_purple::title { color: @PURPLE; }
 QGroupBox#box_yellow::title { color: @WARN; } QGroupBox#box_green::title { color: @OK; }
@@ -53,7 +53,7 @@ QGroupBox#box_grey::title { color: @MUTED; }
 QLabel { background: transparent; }
 QLabel[role="muted"] { color: @MUTED; font-size: 9pt; }
 QLabel[role="title"] { color: @FG; font-size: 13pt; font-weight: 600; }
-QPushButton { background: @BG3; color: @FG; border: 1px solid @BORDER; border-radius: 5px; padding: 4px 9px; font-weight: 600; }
+QPushButton { background: @BG3; color: @FG; border: 1px solid @BORDER; border-radius: 5px; padding: 3px 8px; font-weight: 600; min-height: 16px; }
 QPushButton:hover { background: @BG4; border-color: @ACCENT_SOFT; }
 QPushButton:pressed { background: @BG2; }
 QPushButton:disabled { background: @BG1; color: @MUTED; border-color: @BORDER_SOFT; }
@@ -62,8 +62,9 @@ QPushButton#btnAccent:hover { background: @ACCENT; }
 QPushButton#btnDanger { background: @BG2; border-color: @DANGER_SOFT; color: @DANGER; }
 QPushButton#btnDanger:hover { background: @DANGER_SOFT; color: @FG; }
 QPushButton#btnAccent:disabled, QPushButton#btnDanger:disabled { background: @BG1; color: @MUTED; border-color: @BORDER_SOFT; }
+QPushButton#btnMini { padding: 1px 7px; min-height: 12px; font-size: 9pt; }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @BG2; color: @FG; border: 1px solid @BORDER_SOFT;
-  border-radius: 4px; padding: 2px 6px; selection-background-color: @ACCENT_SOFT; }
+  border-radius: 4px; padding: 1px 6px; selection-background-color: @ACCENT_SOFT; }
 QPlainTextEdit, QTextEdit { background: @BG2; color: @FG; border: 1px solid @BORDER_SOFT; border-radius: 4px;
   padding: 4px 6px; selection-background-color: @ACCENT_SOFT; }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color: @ACCENT_SOFT; }
@@ -82,6 +83,10 @@ QSlider::sub-page:horizontal { background: @ACCENT_SOFT; border-radius: 2px; }
 QSlider::handle:horizontal { background: @FG_DIM; border: none; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px; }
 QSlider::handle:horizontal:hover { background: @ACCENT; }
 QSlider::handle:horizontal:disabled { background: @MUTED; }
+QSlider#miniSlider::groove:horizontal { height: 3px; border-radius: 1px; }
+QSlider#miniSlider::sub-page:horizontal { border-radius: 1px; }
+QSlider::sub-page:horizontal:disabled { background: @BG3; }
+QSlider#miniSlider::handle:horizontal { width: 10px; height: 10px; margin: -4px 0; border-radius: 5px; }
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QScrollBar:vertical { background: transparent; width: 9px; margin: 0; }

@@ -55,7 +55,7 @@ static QPushButton *profileButton(const QString &label, const QString &accent) {
     b->setCheckable(true);
     b->setCursor(Qt::PointingHandCursor);
     b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    b->setFixedHeight(30);
+    b->setFixedHeight(26);
     b->setStyleSheet(QStringLiteral(
         "QPushButton { background: %1; color: %2; border: 1px solid %3; border-left: 3px solid %4;"
         " border-radius: 5px; padding: 3px 10px; font-weight: 600; text-align: left; }"
