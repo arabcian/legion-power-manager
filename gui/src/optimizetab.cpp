@@ -51,6 +51,7 @@ static const Builtin BUILTINS[] = {
      "Full lutris-game-tune set plus X3D placement: game on the V-Cache CCD, IRQs and kernel work on the other one.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.epp_boost":"1",
+        "cpu.governor_ccd0":"powersave","cpu.governor_ccd1":"powersave","cpu.epp_ccd0":"performance","cpu.epp_ccd1":"balance_power",
         "cpu.boost":"1","cpu.min_freq":"lowest_nonlinear","cpu.x3d_mode":"cache",
         "thp.enabled":"madvise","thp.shmem_enabled":"advise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,
         "mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,"mm.ksm_run":0,"vm.max_map_count":2147483642,
@@ -68,6 +69,7 @@ static const Builtin BUILTINS[] = {
      "Gaming X3D taken to the limit: frequency CCD parked, deep C-states off. Maximum determinism, most heat.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.boost":"1",
+        "cpu.governor_ccd0":"powersave","cpu.governor_ccd1":"powersave","cpu.epp_ccd0":"performance","cpu.epp_ccd1":"balance_power",
         "cpu.min_freq":"lowest_nonlinear","cpu.x3d_mode":"cache","cpu.cstate_max":"1",
         "thp.enabled":"madvise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,"mm.lru_gen_min_ttl":1000,
         "mm.ksm_run":0,"vm.max_map_count":2147483642,"vm.swappiness":10,"vm.stat_interval":10,"vm.page_cluster":0,
@@ -554,10 +556,22 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
                 r.spin = new QSpinBox;
                 r.spin->setMinimumWidth(170);
                 r.spin->setAccelerated(true);
+                // Keyboard tracking off means valueChanged only fires on Enter/focus-out,
+                // not per keystroke - correct for the wheel/arrow case, but it left a gap
+                // while typing: the 4s poll could overwrite whatever partial number was
+                // on screen before a signal ever told us the row was touched. hasFocus()
+                // closes that gap without touching on every keystroke.
                 r.spin->setKeyboardTracking(false);
                 editor = r.spin;
                 connect(r.spin, &QSpinBox::valueChanged, this, [this, key] {
                     if (Row *x = row(key)) { x->touched = true; x->include->setChecked(true); markRow(*x); }
+                });
+                // valueChanged doesn't fire if focus is lost without the number actually
+                // changing (e.g. typed it, then re-typed the same value) - editingFinished
+                // still does, and touched must be true the moment focus leaves or the next
+                // poll's updateRow (midEdit now false) would treat it as never-edited.
+                connect(r.spin, &QSpinBox::editingFinished, this, [this, key] {
+                    if (Row *x = row(key)) x->touched = true;
                 });
             } else {
                 r.combo = new QComboBox;
@@ -622,8 +636,12 @@ void OptimizeTab::updateRow(Row &r, const QJsonObject &o) {
     r.cur->setStyleSheet(QStringLiteral("color:%1; background:transparent;").arg(r.available && !rootOnly ? theme::FG_DIM : theme::MUTED));
     r.cur->setToolTip(r.available ? QStringLiteral("%1 file(s)").arg(o.value("files").toInt()) : "Not present on this kernel/hardware");
 
-    // Keep a user edit; otherwise follow the live value.
-    const QString want = r.touched ? oldEditor : r.current;
+    // Keep a user edit; otherwise follow the live value. A spin box mid-edit
+    // (has focus, keyboard tracking off so no valueChanged yet) is left alone
+    // outright - re-syncing its range/value while someone is still typing a
+    // 7-digit kHz number is what let the periodic poll stomp on it before.
+    const bool midEdit = r.spin && r.spin->hasFocus();
+    const QString want = (r.touched || midEdit) ? oldEditor : r.current;
     if (r.combo) {
         bool same = r.options.size() == opts.size();
         for (int i = 0; same && i < opts.size(); ++i) same = r.options[i].value == opts[i].value;
@@ -638,9 +656,14 @@ void OptimizeTab::updateRow(Row &r, const QJsonObject &o) {
         }
         if (!setEditorValue(r, want)) setEditorValue(r, r.current);
     } else if (r.spin) {
-        const QSignalBlocker b(r.spin);
-        r.spin->setRange(int(std::clamp<qint64>(r.min, INT_MIN, INT_MAX)), int(std::clamp<qint64>(r.max, INT_MIN, INT_MAX)));
-        if (!setEditorValue(r, want)) setEditorValue(r, r.current);
+        if (midEdit) {
+            // Still typing: don't touch range or value, just let the row's
+            // "current" and availability update underneath for when they blur out.
+        } else {
+            const QSignalBlocker b(r.spin);
+            r.spin->setRange(int(std::clamp<qint64>(r.min, INT_MIN, INT_MAX)), int(std::clamp<qint64>(r.max, INT_MIN, INT_MAX)));
+            if (!setEditorValue(r, want)) setEditorValue(r, r.current);
+        }
     }
     const bool saved = state_.value("keys").toArray().contains(r.key);
     r.revert->setVisible(saved);

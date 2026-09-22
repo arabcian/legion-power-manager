@@ -106,10 +106,10 @@ pub const TUNABLES: &[Tunable] = &[
       "active = EPP/CPPC decides frequency (recommended on Zen 2+); guided = kernel sets a floor, firmware the rest; passive = legacy governor control. Leave on active unless you have a specific reason: guided/passive exist mainly for older firmware or debugging odd boost behaviour. Changing it resets every per-policy governor/EPP value underneath, which is why this row is always applied first and restored last of the non-hot-plug rows.",
       Kind::Choice, Options::Fixed(&["active", "guided", "passive"]), Target::File("/sys/devices/system/cpu/amd_pstate/status")),
     t("cpu.governor", "CPU", "Scaling governor",
-      "In amd-pstate active mode this mostly gates EPP: 'performance' pins EPP to 0 regardless of the EPP row below, 'powersave' lets EPP decide. For gaming keep 'powersave' here and control behaviour with EPP instead - EPP has finer steps (5 levels vs 2) and swaps faster. Set 'performance' only for a fixed worst-case floor (e.g. Competitive preset) or on kernels/firmware where EPP is ignored.",
+      "In amd-pstate active mode this mostly gates EPP: 'performance' pins EPP to 0 regardless of the EPP row below, 'powersave' lets EPP decide. For gaming keep 'powersave' here and control behaviour with EPP instead - EPP has finer steps (5 levels vs 2) and swaps faster. Set 'performance' only for a fixed worst-case floor (e.g. Competitive preset) or on kernels/firmware where EPP is ignored. On a 2+ CCD chip this row is hidden - set Governor · CCD0 and · CCD1 instead (to the same value, if you want one governor for the whole chip); a single-CCD chip has no CCD rows, so this is the only place to set it.",
       Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerPolicy("scaling_governor")),
     t("cpu.epp", "CPU", "Energy-performance preference",
-      "EPP hint to CPPC firmware (active mode), five steps from most aggressive to most efficient. Needs governor 'powersave' to take effect. Pick by scenario: competitive/latency-sensitive -> performance; general gaming on AC -> balance_performance (usually indistinguishable in fps, noticeably cooler/quieter); on battery or light desktop work -> balance_power; power -> power-priority, expect lower sustained clocks. If frame times feel spiky right after a load change, try balance_performance before touching anything else - that spikiness is often EPP being too cautious to boost.",
+      "EPP hint to CPPC firmware (active mode), five steps from most aggressive to most efficient. Needs governor 'powersave' to take effect. Pick by scenario: competitive/latency-sensitive -> performance; general gaming on AC -> balance_performance (usually indistinguishable in fps, noticeably cooler/quieter); on battery or light desktop work -> balance_power; power -> power-priority, expect lower sustained clocks. If frame times feel spiky right after a load change, try balance_performance before touching anything else - that spikiness is often EPP being too cautious to boost. On a 2+ CCD chip this row is hidden - set EPP · CCD0 and · CCD1 instead; a single-CCD chip has no CCD rows, so this is the only place to set it.",
       Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerPolicy("energy_performance_preference")),
     t("cpu.epp_boost", "CPU", "amd-pstate epp_boost",
       "EPP boost module parameter (global; the patch series has no per-policy knob). Only on kernels with the (not upstream) epp_boost patch. Leave off unless you specifically built a kernel with this patch and want EPP to react faster; harmless no-op otherwise, the row will show n/a.",
@@ -124,16 +124,16 @@ pub const TUNABLES: &[Tunable] = &[
     // set everything and then split the dies (e.g. V-Cache die performance,
     // frequency die balance_power while it only hosts IRQs and background work).
     t("cpu.governor_ccd0", "CPU", "Governor · CCD0",
-      "Scaling governor for CCD0's CPUs only; overrides the global 'Scaling governor' row for just these cores. Typical split for X3D chips: set powersave here on whichever CCD you name in EPP, and use the global row for the rest. Leave both CCD rows unchecked to keep one governor for the whole chip - the common case; only check these for deliberately asymmetric behaviour.",
+      "Scaling governor for CCD0's CPUs (the global 'Scaling governor' row is hidden on 2+ CCD chips - this and the CCD1 row are how you set it). Set both CCD rows the same for one governor across the whole chip, or split them for asymmetric behaviour: powersave on the CCD whose EPP row you are actually using, since 'performance' here pins EPP and makes the EPP row moot.",
       Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerCcdPolicy("scaling_governor", 0)),
     t("cpu.governor_ccd1", "CPU", "Governor · CCD1",
-      "Scaling governor for CCD1's CPUs only; overrides the global 'Scaling governor' row for just these cores. See the CCD0 row for the usual split.",
+      "Scaling governor for CCD1's CPUs (the global row is hidden on 2+ CCD chips). See the CCD0 row for how to set this.",
       Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerCcdPolicy("scaling_governor", 1)),
     t("cpu.epp_ccd0", "CPU", "EPP · CCD0",
-      "EPP for CCD0's CPUs only; overrides the global EPP row for just these cores. Needs governor 'powersave' on CCD0 - 'performance' pins EPP and this override becomes moot. Concrete split for a V-Cache part: CCD0 = V-Cache -> performance here (the game runs there); CCD1 = frequency die -> balance_power on its own row, since it is mostly idle plus background/IRQ work during a game. That is exactly what the Gaming X3D and Competitive presets set (wq/irq affinity also point at CCD1).",
+      "EPP for CCD0's CPUs (the global EPP row is hidden on 2+ CCD chips - this and the CCD1 row are how you set it). Needs governor 'powersave' on CCD0 (see the Governor · CCD0 row) - 'performance' pins EPP and this row becomes moot. Concrete split for a V-Cache part: CCD0 = V-Cache -> performance here (the game runs there); CCD1 = frequency die -> balance_power on its own row, since it is mostly idle plus background/IRQ work during a game. That is exactly what the Gaming X3D and Competitive presets set (wq/irq affinity also point at CCD1).",
       Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCcdPolicy("energy_performance_preference", 0)),
     t("cpu.epp_ccd1", "CPU", "EPP · CCD1",
-      "EPP for CCD1's CPUs only; overrides the global EPP row for just these cores. Needs governor 'powersave' on CCD1. See the CCD0 row for the usual split.",
+      "EPP for CCD1's CPUs (the global row is hidden on 2+ CCD chips). Needs governor 'powersave' on CCD1 (Governor · CCD1 row). See the CCD0 row for the usual split.",
       Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCcdPolicy("energy_performance_preference", 1)),
     t("cpu.boost_ccd0", "CPU", "Boost · CCD0",
       "Turbo for CCD0's CPUs only (needs kernel 6.11+ with per-policy boost; shows n/a otherwise, use the global Boost row instead). Use this to trade one die's headroom for the other's: turn boost off on the idle/background CCD so its heat and power budget go to the CCD doing the work.",
@@ -606,6 +606,13 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
         Target::File(p) if p.ends_with("/smt/control") =>
             if matches!(read(Path::new(p)).as_deref(), Some("on") | Some("off")) { vec![PathBuf::from(p)] } else { vec![] },
         Target::File(p) => existing(PathBuf::from(p)),
+        // scaling_governor / energy_performance_preference: on a 2+ CCD chip the
+        // per-CCD override rows below cover the same file set (and always run
+        // after this row, so leaving both visible just invites setting one and
+        // wondering why the other value stuck). Hide the global row there and
+        // point people at Governor/EPP · CCDn instead; a single-CCD chip has no
+        // such rows, so the global one is the only way to set this and stays.
+        Target::PerPolicy(f) if ccx_groups().len() > 1 => { let _ = f; vec![] }
         Target::PerPolicy(f) => policies().into_iter().map(|p| p.join(f)).filter(|p| p.is_file()).collect(),
         Target::MinFreq => policies().into_iter().map(|p| p.join("scaling_min_freq")).filter(|p| p.is_file()).collect(),
         Target::PerCcdPolicy(f, ccd) => ccd_policies(ccd).into_iter().map(|p| p.join(f)).filter(|p| p.is_file()).collect(),

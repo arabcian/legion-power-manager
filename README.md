@@ -270,10 +270,16 @@ Rows the machine does not have are shown greyed out ("n/a").
 **Per-CCD governor / EPP / boost / max frequency.** amd-pstate has one
 cpufreq policy per CPU, so `Governor · CCDn`, `EPP · CCDn`, `Boost · CCDn`
 (per-policy `boost`, 6.11+) and `Max frequency · CCDn` write only the
-policies whose CPUs sit on that L3 domain. They come after the global rows in
-the table and therefore override them (a unit test pins that order); the GUI
-names each die's role, e.g. "(V-Cache)". `epp_boost` stays global: the patch
-series has no per-policy file. EPP's read-only `custom` state is not offered.
+policies whose CPUs sit on that L3 domain; the GUI names each die's role,
+e.g. "(V-Cache)". The global `Scaling governor` and `Energy-performance
+preference` rows are **hidden on any 2+ CCD chip** — the CCD rows cover the
+same files and always apply after where the global row would, so showing
+both invited setting one and wondering why the other value stuck. Set both
+CCD rows the same for one governor/EPP across the chip, or split them (that's
+what Gaming X3D and Competitive do). A single-CCD chip has no CCD rows, so
+the global ones are the only way to set this there and stay visible.
+`epp_boost` stays global regardless: the patch series has no per-policy
+file. EPP's read-only `custom` state is not offered.
 
 **CCD roles instead of CPU lists.** Values like `cache`, `frequency`, `ccd1`
 are resolved against the live L3 topology (largest L3 = V-Cache die; highest
