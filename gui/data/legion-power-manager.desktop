@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Legion Power Manager
+Comment=Legion laptop power profile, firmware attribute, GPU and CPU curve tuning
+Comment[tr]=Legion dizüstü güç profili, firmware özniteliği, GPU ve CPU eğri ayarları
+Exec=legion-power-manager --window
+Icon=legion-power-manager
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Actions=Tray;
+
+[Desktop Action Tray]
+Name=Start in tray
+Name[tr]=Tepsiye başlat
+Exec=legion-power-manager

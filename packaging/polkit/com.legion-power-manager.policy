@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>legion-power-manager</vendor>
+  <!-- Four Rust root helpers, one per tab, each pinned by exec.path; installed
+       root:root 0755 (nvcurve-root-helper 0700) under /usr/libexec/legion-power-manager.
+       The authoritative grant is /etc/polkit-1/rules.d/49-legion-power-manager.rules. -->
+  <action id="com.legion-power-manager.fwattr.write">
+    <description>Write a firmware_attributes sysfs value</description>
+    <description xml:lang="tr">Bir firmware_attributes sysfs değerini yaz</description>
+    <message>Authentication is required to write a firmware attribute value</message>
+    <message xml:lang="tr">Bir firmware özniteliği değerini yazmak için kimlik doğrulama gerekiyor</message>
+    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/fwattr-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.legion-power-manager.nvcurve.set-params">
+    <description>Apply NVIDIA GPU V/F curve settings via Legion Power Manager</description>
+    <description xml:lang="tr">Legion Power Manager üzerinden NVIDIA GPU V/F eğrisi ayarlarını uygula</description>
+    <message>Administrator authentication required (NVIDIA curve optimizer)</message>
+    <message xml:lang="tr">Yönetici kimlik doğrulaması gerekiyor (NVIDIA eğri optimizasyonu)</message>
+    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/nvcurve-root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.legion-power-manager.ryzen.set-curve">
+    <description>Apply RyzenAdj Curve Optimizer values via Legion Power Manager</description>
+    <description xml:lang="tr">Legion Power Manager üzerinden RyzenAdj Curve Optimizer değerlerini uygula</description>
+    <message>Authentication is required to change the CPU Curve Optimizer voltage offsets</message>
+    <message xml:lang="tr">CPU Curve Optimizer voltaj offsetlerini değiştirmek için kimlik doğrulama gerekiyor</message>
+    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/ryzen-co-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.legion-power-manager.profile.set">
+    <description>Change the ACPI platform power profile</description>
+    <description xml:lang="tr">ACPI platform güç profilini değiştir</description>
+    <message>Authentication is required to change the laptop power profile</message>
+    <message xml:lang="tr">Dizüstü bilgisayarın güç profilini değiştirmek için kimlik doğrulama gerekiyor</message>
+    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/legion-profile-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

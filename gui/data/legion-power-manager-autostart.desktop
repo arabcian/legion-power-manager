@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Legion Power Manager
+Comment=Sit in the system tray for quick power and curve profile switching
+Comment[tr]=Hızlı güç ve eğri profili değişimi için sistem tepsisinde bekler
+Exec=legion-power-manager
+Icon=legion-power-manager
+Terminal=false
+X-GNOME-Autostart-enabled=true

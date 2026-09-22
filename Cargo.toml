@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/lpm-helpers", "crates/nvcurve"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

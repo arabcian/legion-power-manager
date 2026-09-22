@@ -1,0 +1,17 @@
+[package]
+name = "nvcurve"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "NVIDIA V/F curve management core (NvAPI + NVML via dlopen)"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "nvcurve"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+log = "0.4"

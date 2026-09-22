@@ -1,0 +1,61 @@
+/*
+ * 49-legion-power-manager.rules
+ *
+ * Grants every Legion Power Manager action without a password prompt.
+ *
+ * Why a .rules file rather than just <allow_active>yes</allow_active> in
+ * the .policy:
+ *
+ *   - The .policy defaults are only consulted when no rule matches, and
+ *     several distributions ship rules of their own (50-default.rules,
+ *     vendor packages, polkit-gnome integration) that match first and
+ *     force auth_admin_keep for anything running under
+ *     org.freedesktop.policykit.exec. A rules file in 49-* sorts ahead of
+ *     the 50-* defaults and settles the question.
+ *
+ *   - allow_active only applies to a session polkit considers *active*.
+ *     Under some Wayland compositors, greeters, or when the app is
+ *     started from a terminal multiplexer or a systemd user unit, the
+ *     calling process is not attached to an active local session, so
+ *     allow_active never fires and the user gets a password prompt they
+ *     were told they had turned off. Returning YES unconditionally is not
+ *     subject to that.
+ *
+ *   - It also covers the generic org.freedesktop.policykit.exec fallback,
+ *     which is what pkexec uses when it cannot match a helper to a
+ *     pinned action. That fallback is the usual reason the prompt "comes
+ *     back" after an install path changes.
+ *
+ * Scope: the second clause matches only programs living under
+ * /usr/libexec/legion-power-manager/, which install.sh and the ebuild create root:root,
+ * mode 0755 (0700 for the nvcurve helper). A non-root user cannot put a
+ * new file there or alter an existing one, so this cannot be widened by
+ * dropping a script into the directory. The helpers themselves still
+ * re-validate every request server-side -- fixed target paths, an
+ * allowlisted sysfs path shape, realpath containment, and ranges re-read
+ * live from the kernel -- so the prompt was never the thing keeping a bad
+ * value out; it was a duplicate of checks that happen anyway.
+ *
+ * Tightening it: to require the caller to be sitting at the machine,
+ * replace `return polkit.Result.YES;` in both clauses with
+ *
+ *     if (subject.local && subject.active) { return polkit.Result.YES; }
+ *     return polkit.Result.AUTH_ADMIN;
+ *
+ * which keeps the prompt for SSH and fast-user-switched sessions. To
+ * limit it to one group instead, guard on
+ * `subject.isInGroup("wheel")` (Arch/Fedora) or `"sudo"` (Debian/Ubuntu).
+ */
+
+polkit.addRule(function (action, subject) {
+    if (action.id.indexOf("com.legion-power-manager.") === 0) {
+        return polkit.Result.YES;
+    }
+
+    if (action.id === "org.freedesktop.policykit.exec") {
+        var program = action.lookup("program");
+        if (program && program.indexOf("/usr/libexec/legion-power-manager/") === 0) {
+            return polkit.Result.YES;
+        }
+    }
+});

@@ -1,0 +1,12 @@
+[package]
+name = "lpm-helpers"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Legion Power Manager privileged root helpers (pkexec targets)"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde_json = "1"
+libc = "0.2"
+
