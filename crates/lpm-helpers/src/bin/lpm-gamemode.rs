@@ -8,11 +8,17 @@
 //!   lpm-gamemode RUN  [preset] [--] cmd…  nice/autogroup boost + CCD affinity, then exec
 //!   lpm-gamemode WRAP [preset] [--] cmd…  PRE + RUN + POST around one command (Steam: %command%)
 //!   lpm-gamemode APPLY preset             apply as a manual (non-refcounted) change
+//!   lpm-gamemode UNDERVOLT                apply the "GAMING" CPU/GPU curve presets now
 //!   lpm-gamemode RESTORE                  restore everything now
 //!   lpm-gamemode STATUS                   live values and game-mode state
 //!
 //! Without a preset name, the game preset chosen in the GUI is used
 //! (~/.config/legion-power-manager/tune.json).
+//!
+//! PRE and WRAP also undervolt when tune.json has "undervolt_cpu" /
+//! "undervolt_gpu" set (Optimizations → Game launch): the Ryzen Curve
+//! Optimizer profile "GAMING" goes first, then — 2 s later — the NVIDIA
+//! curve profile "GAMING". A missing profile is skipped with a note.
 
 use lpm_helpers::tune;
 use serde_json::{json, Value};
@@ -26,14 +32,22 @@ const HELPER_DIR: &str = match option_env!("LPM_HELPER_DIR") { Some(d) => d, Non
 const PKEXEC: &[&str] = &["/usr/bin/pkexec", "/bin/pkexec"];
 const MAX_PRESET_BYTES: u64 = 256 * 1024;
 
+/// Exact, case-sensitive profile name looked up in both curve tools.
+const UNDERVOLT_PROFILE: &str = "GAMING";
+const UNDERVOLT_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+/// Same directory nvcurve-root-helper applies from.
+const NVCURVE_PROFILES: &str = "/etc/nvcurve/profiles";
+
 fn helper() -> String { format!("{HELPER_DIR}/tune-helper") }
 
-fn config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute())
+fn xdg_config() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
-    base.join("legion-power-manager")
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"))
 }
+fn config_dir() -> PathBuf { xdg_config().join("legion-power-manager") }
+/// QStandardPaths::GenericConfigLocation + the Ryzen tab's profile folder.
+fn ryzen_profiles_dir() -> PathBuf { xdg_config().join("ryzen-curve-optimizer/profiles") }
 fn presets_dir() -> PathBuf { config_dir().join("tune-presets") }
 
 fn valid_name(n: &str) -> bool {
@@ -65,9 +79,12 @@ fn load_preset(name: Option<&str>) -> Result<(String, Value), String> {
 
 fn preset_exists(name: &str) -> bool { valid_name(name) && presets_dir().join(format!("{name}.json")).is_file() }
 
-fn pkexec(req: &Value) -> Result<Value, String> {
+fn pkexec(req: &Value) -> Result<Value, String> { pkexec_helper(&helper(), req) }
+
+fn pkexec_helper(helper: &str, req: &Value) -> Result<Value, String> {
+    let short = helper.rsplit('/').next().unwrap_or(helper);
     let pk = PKEXEC.iter().find(|p| Path::new(p).is_file()).ok_or("pkexec not found (install sys-auth/polkit)")?;
-    let mut child = Command::new(pk).arg(helper())
+    let mut child = Command::new(pk).arg(helper)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("pkexec: {e}"))?;
     child.stdin.take().unwrap().write_all(req.to_string().as_bytes()).map_err(|e| format!("pkexec stdin: {e}"))?;
@@ -77,8 +94,8 @@ fn pkexec(req: &Value) -> Result<Value, String> {
         Some(v) => Ok(v),
         None => Err(match out.status.code() {
             Some(126) => "authorization dismissed".into(),
-            Some(127) => format!("polkit did not authorize tune-helper: {}", String::from_utf8_lossy(&out.stderr).trim()),
-            _ => format!("tune-helper failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            Some(127) => format!("polkit did not authorize {short}: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            _ => format!("{short} failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
         }),
     }
 }
@@ -104,6 +121,81 @@ fn apply(name: Option<&str>, mode: &str) -> Result<bool, String> {
 }
 
 fn post() -> Result<bool, String> { Ok(report("POST", &pkexec(&json!({"op": "release"}))?)) }
+
+/// PRE: game-mode preset first, then the optional undervolt.
+fn pre(name: Option<&str>) -> i32 {
+    let code = apply(name, "game").map_or_else(|e| { eprintln!("lpm-gamemode: {e}"); 1 }, |ok| (!ok) as i32);
+    undervolt(false);
+    code
+}
+
+// ── undervolt ("GAMING" curve presets) ──────────────────────────────────────
+
+/// Ryzen Curve Optimizer profile → ryzen-co-helper, the same order the GUI
+/// uses: all-core offset first, per-core offsets only after it succeeded.
+fn apply_ryzen(path: &Path) -> Result<(), String> {
+    let p = read_json(path).ok_or_else(|| format!("cannot read {}", path.display()))?;
+    let helper = format!("{HELPER_DIR}/ryzen-co-helper");
+    let call = |op: &str, params: Value| -> Result<(), String> {
+        let v = pkexec_helper(&helper, &json!({"op": op, "params": params}))?;
+        for r in v["results"].as_array().into_iter().flatten().filter(|r| r["ok"] != true) {
+            eprintln!("  CCD{}/S{}: {}", r["ccd"], r["core"], r["message"].as_str().unwrap_or("failed"));
+        }
+        if v["ok"] == true { Ok(()) } else {
+            Err(v["error"].as_str().or(v["message"].as_str()).unwrap_or("failed").to_owned())
+        }
+    };
+    // Slots on a CCD that is not there (profile from another topology) are skipped, like the GUI does.
+    let ccds = tune::ccx_groups().len() as i64;
+    let entries: Vec<Value> = p["cores"].as_array().into_iter().flatten()
+        .filter(|c| c["disabled"] != true && c["coper"].is_i64() && c["ccx"].as_i64().unwrap_or(0) == 0)
+        .filter_map(|c| {
+            let ccd = c["ccd"].as_i64()?;
+            let core = c["slot"].as_i64().or_else(|| c["core"].as_i64())?;
+            (ccds == 0 || ccd < ccds).then(|| json!({"ccd": ccd, "ccx": 0, "core": core, "coper": c["coper"]}))
+        })
+        .collect();
+    let coall = p["coall"].as_i64();
+    if coall.is_none() && entries.is_empty() { return Err("profile contains no offsets".into()); }
+    if let Some(v) = coall { call("set_coall", json!({"value": v}))?; }
+    if !entries.is_empty() { call("set_coper_batch", json!({"entries": entries}))?; }
+    Ok(())
+}
+
+fn apply_nvidia() -> Result<(), String> {
+    let v = pkexec_helper(&format!("{HELPER_DIR}/nvcurve-root-helper"),
+        &json!({"op": "apply_named_profile", "name": UNDERVOLT_PROFILE}))?;
+    if v["ok"] == true { Ok(()) } else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) }
+}
+
+/// Applies the "GAMING" curve presets enabled in tune.json: CPU first, then
+/// GPU UNDERVOLT_GAP later. `forced` (the UNDERVOLT verb) ignores the switches.
+fn undervolt(forced: bool) -> bool {
+    let cfg = read_json(&config_dir().join("tune.json")).unwrap_or(Value::Null);
+    let want_cpu = forced || cfg["undervolt_cpu"] == true;
+    let want_gpu = forced || cfg["undervolt_gpu"] == true;
+    let ryzen = ryzen_profiles_dir().join(format!("{UNDERVOLT_PROFILE}.json"));
+    let nvidia = Path::new(NVCURVE_PROFILES).join(format!("{UNDERVOLT_PROFILE}.json"));
+
+    let mut steps: Vec<(&str, Box<dyn Fn() -> Result<(), String>>)> = Vec::new();
+    if want_cpu {
+        if ryzen.is_file() { let r = ryzen.clone(); steps.push(("CPU", Box::new(move || apply_ryzen(&r)))); }
+        else { eprintln!("lpm-gamemode: undervolt CPU skipped — no Ryzen profile \"{UNDERVOLT_PROFILE}\" ({})", ryzen.display()); }
+    }
+    if want_gpu {
+        if nvidia.is_file() { steps.push(("GPU", Box::new(apply_nvidia))); }
+        else { eprintln!("lpm-gamemode: undervolt GPU skipped — no NVIDIA profile \"{UNDERVOLT_PROFILE}\" ({})", nvidia.display()); }
+    }
+    let mut all_ok = true;
+    for (i, (what, step)) in steps.iter().enumerate() {
+        if i > 0 { std::thread::sleep(UNDERVOLT_GAP); }
+        match step() {
+            Ok(()) => eprintln!("lpm-gamemode: undervolt {what}: \"{UNDERVOLT_PROFILE}\" applied"),
+            Err(e) => { all_ok = false; eprintln!("lpm-gamemode: undervolt {what} failed: {e}"); }
+        }
+    }
+    all_ok && (!forced || !steps.is_empty())
+}
 
 // ── launch boost ──────────────────────────────────────────────────────────
 
@@ -164,6 +256,7 @@ fn wrap(args: &[String]) -> i32 {
     let (pname, preset) = match load_preset(name.as_deref()) { Ok(p) => p, Err(e) => { eprintln!("lpm-gamemode: {e}"); return 2 } };
     // The refcount is taken as soon as the helper was reached, even if a knob failed.
     let entered = match apply(Some(&pname), "game") { Ok(_) => true, Err(e) => { eprintln!("lpm-gamemode: {e}"); false } };
+    undervolt(false);
     prepare_run(&preset);
     // Forward termination so POST still runs when the launcher stops us.
     // `as *const ()` first: casting a function item straight to an integer type is
@@ -228,7 +321,7 @@ fn status() -> i32 {
 
 fn usage() -> i32 {
     eprintln!("usage: lpm-gamemode PRE [preset] | POST | RUN [preset] [--] cmd… | WRAP [preset] [--] cmd…\n\
-               \x20                   | APPLY preset | RESTORE | STATUS");
+               \x20                   | APPLY preset | UNDERVOLT | RESTORE | STATUS");
     2
 }
 
@@ -236,10 +329,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fail = |e: String| { eprintln!("lpm-gamemode: {e}"); 1 };
     let code = match args.first().map(|s| s.to_ascii_uppercase()).as_deref() {
-        Some("PRE") => apply(args.get(1).map(String::as_str), "game").map_or_else(fail, |ok| (!ok) as i32),
+        Some("PRE") => pre(args.get(1).map(String::as_str)),
         Some("POST") => post().map_or_else(fail, |ok| (!ok) as i32),
         Some("APPLY") if args.len() == 2 => apply(Some(&args[1]), "manual").map_or_else(fail, |ok| (!ok) as i32),
         Some("RESTORE") => pkexec(&json!({"op": "restore"})).map_or_else(fail, |v| (!report("RESTORE", &v)) as i32),
+        Some("UNDERVOLT") => (!undervolt(true)) as i32,
         Some("STATUS") => status(),
         Some("RUN") => run_exec(&args[1..]),
         Some("WRAP") => wrap(&args[1..]),

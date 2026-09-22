@@ -68,6 +68,7 @@ private:
     void updateRow(Row &r, const QJsonObject &o);
     void updateStateBanner();
     void updateLaunchPreview();
+    void saveUndervolt();
 
     static bool validFor(const Row &r, const QString &v);
     QString editorValue(const Row &r) const;
@@ -105,7 +106,8 @@ private:
     QPushButton *restoreBtn_ = nullptr, *applyBtn_ = nullptr, *gameBtn_ = nullptr, *bootBtn_ = nullptr, *bootClear_ = nullptr;
     QComboBox *presetCombo_ = nullptr, *affinity_ = nullptr;
     QSpinBox *nice_ = nullptr;
-    QCheckBox *autogroup_ = nullptr;
+    QCheckBox *autogroup_ = nullptr, *uvCpu_ = nullptr, *uvGpu_ = nullptr;
+    QLabel *uvInfo_ = nullptr;
     QLineEdit *lutrisPre_ = nullptr, *lutrisPost_ = nullptr, *lutrisPrefix_ = nullptr, *steam_ = nullptr;
     QLabel *topoLabel_ = nullptr;
     QTabWidget *groups_ = nullptr;

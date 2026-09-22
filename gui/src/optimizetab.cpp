@@ -1,5 +1,6 @@
 #include "optimizetab.h"
 #include "privileged.h"
+#include "ryzentab.h"
 #include "theme.h"
 
 #include <QApplication>
@@ -38,6 +39,9 @@ static constexpr int POLL_MS = 4000, DESCRIBE_TIMEOUT_MS = 8000, PKEXEC_TIMEOUT_
 static constexpr qint64 MAX_PRESET_BYTES = 256 * 1024;
 static const char *GROUPS[] = {"CPU", "Memory", "Scheduler", "Storage", "Devices", "Stability"};
 static const QString GAMEMODE = QStringLiteral("/usr/bin/lpm-gamemode");
+// lpm-gamemode PRE/WRAP apply these curve profiles (exact name) when enabled.
+static const QString UNDERVOLT_PROFILE = QStringLiteral("GAMING");
+static const QString NVCURVE_PROFILES = QStringLiteral("/etc/nvcurve/profiles");
 
 static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-helper")); }
 
@@ -319,6 +323,28 @@ QWidget *OptimizeTab::buildLaunchPage() {
     g->setColumnStretch(2, 1);
     v->addWidget(runBox);
 
+    // Global (tune.json), not per preset: takes effect on the next game start.
+    auto *uvBox = box(QStringLiteral("Undervolt at game start  (curve presets named \"%1\")").arg(UNDERVOLT_PROFILE), "box_purple");
+    auto *ug = new QGridLayout(uvBox);
+    ug->setHorizontalSpacing(10);
+    const QJsonObject cfg = readJsonFile(configFile());
+    uvCpu_ = new QCheckBox("Undervolt CPU");
+    uvCpu_->setChecked(cfg.value("undervolt_cpu").toBool());
+    uvCpu_->setToolTip(QStringLiteral("Applies the Ryzen Curve Optimizer profile \"%1\" (all-core, then per-core).").arg(UNDERVOLT_PROFILE));
+    uvGpu_ = new QCheckBox("Undervolt GPU");
+    uvGpu_->setChecked(cfg.value("undervolt_gpu").toBool());
+    uvGpu_->setToolTip(QStringLiteral("Applies the NVIDIA curve profile \"%1\".").arg(UNDERVOLT_PROFILE));
+    ug->addWidget(uvCpu_, 0, 0);
+    ug->addWidget(uvGpu_, 0, 1);
+    uvInfo_ = new QLabel;
+    uvInfo_->setTextFormat(Qt::RichText);
+    uvInfo_->setWordWrap(true);
+    ug->addWidget(uvInfo_, 0, 2);
+    ug->addWidget(muted(QStringLiteral("Run by lpm-gamemode PRE / WRAP: CPU first, GPU 2 s later. A missing \"%1\" "
+                                       "profile is skipped. Test now: lpm-gamemode UNDERVOLT").arg(UNDERVOLT_PROFILE)), 1, 0, 1, 3);
+    ug->setColumnStretch(2, 1);
+    v->addWidget(uvBox);
+
     auto *topo = box("CPU topology", "box_blue");
     auto *tl = new QVBoxLayout(topo);
     topoLabel_ = new QLabel;
@@ -359,7 +385,24 @@ QWidget *OptimizeTab::buildLaunchPage() {
     auto onRun = [this] { updateLaunchPreview(); };
     connect(nice_, &QSpinBox::valueChanged, this, onRun);
     connect(affinity_, &QComboBox::currentIndexChanged, this, onRun);
+    connect(uvCpu_, &QCheckBox::toggled, this, &OptimizeTab::saveUndervolt);
+    connect(uvGpu_, &QCheckBox::toggled, this, &OptimizeTab::saveUndervolt);
     return scroll;
+}
+
+void OptimizeTab::saveUndervolt() {
+    if (!uvCpu_) return;
+    QJsonObject cfg = readJsonFile(configFile());
+    cfg["undervolt_cpu"] = uvCpu_->isChecked();
+    cfg["undervolt_gpu"] = uvGpu_->isChecked();
+    QString err;
+    if (!writeJsonFile(configFile(), cfg, &err)) { showStatus("Could not save undervolt setting: " + err, theme::DANGER); return; }
+    updateLaunchPreview();
+    QStringList on;
+    if (uvCpu_->isChecked()) on << "CPU";
+    if (uvGpu_->isChecked()) on << "GPU";
+    showStatus(on.isEmpty() ? QStringLiteral("Undervolt at game start: off")
+                            : QStringLiteral("Undervolt at game start: %1 (\"%2\")").arg(on.join(" + "), UNDERVOLT_PROFILE), theme::OK, 4000);
 }
 
 void OptimizeTab::updateLaunchPreview() {
@@ -373,6 +416,16 @@ void OptimizeTab::updateLaunchPreview() {
                                      : QStringLiteral("uses ★ \"%1\"").arg(gp);
     for (QLineEdit *e : {lutrisPre_, lutrisPrefix_, steam_}) e->setToolTip(who);
     autogroup_->setEnabled(nice_->value() < 0);
+
+    if (uvInfo_) {
+        const bool cpu = QFileInfo(ryzen::profilesDir() + '/' + UNDERVOLT_PROFILE + ".json").isFile();
+        const bool gpu = QFileInfo(NVCURVE_PROFILES + '/' + UNDERVOLT_PROFILE + ".json").isFile();
+        auto tag = [](const char *what, bool found, bool on) {
+            const char *c = !on ? theme::MUTED : found ? theme::OK : theme::WARN;
+            return QStringLiteral("<span style='color:%1'>%2 %3</span>").arg(c, what, found ? "✓ found" : "✗ missing");
+        };
+        uvInfo_->setText(tag("Ryzen", cpu, uvCpu_->isChecked()) + " &nbsp;·&nbsp; " + tag("NVIDIA", gpu, uvGpu_->isChecked()));
+    }
 }
 
 // ── describe ────────────────────────────────────────────────────────────────
@@ -493,6 +546,7 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
     while (groups_->count()) { QWidget *w = groups_->widget(0); groups_->removeTab(0); w->deleteLater(); }
     rows_.clear();
     nice_ = nullptr; affinity_ = nullptr; autogroup_ = nullptr; topoLabel_ = nullptr;
+    uvCpu_ = uvGpu_ = nullptr; uvInfo_ = nullptr;
     lutrisPre_ = lutrisPost_ = lutrisPrefix_ = steam_ = nullptr;
 
     for (const auto &v : rows) {
