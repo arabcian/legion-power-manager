@@ -52,6 +52,7 @@ protected:
     void paintEvent(QPaintEvent *) override;
     void mousePressEvent(QMouseEvent *) override;
     void mouseMoveEvent(QMouseEvent *) override;
+    void leaveEvent(QEvent *) override;
     void mouseReleaseEvent(QMouseEvent *) override;
     void keyPressEvent(QKeyEvent *) override;
     void wheelEvent(QWheelEvent *) override;
@@ -70,6 +71,7 @@ private:
     double fullX0_ = 600, fullX1_ = 1200, fullY1_ = 3000;
     double zoom_ = 1.0, pan_ = 0.5;
     int dragIndex_ = -1;
+    int hover_ = -1;  // point under the cursor (no button held)
     bool groupDrag_ = false;
     double groupStartY_ = 0;
     int groupApplied_ = 0;

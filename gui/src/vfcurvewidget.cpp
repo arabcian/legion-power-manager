@@ -13,7 +13,7 @@ VfCurveWidget::VfCurveWidget(QWidget *parent) : QWidget(parent) {
     setFocusPolicy(Qt::StrongFocus);
     setMinimumHeight(200);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    setMouseTracking(false);
+    setMouseTracking(true);  // hover highlight
 }
 
 static double niceStep(double range, int targetTicks) {
@@ -137,7 +137,7 @@ QPointF VfCurveWidget::toValue(QPointF px) const {
 
 int VfCurveWidget::hitTest(QPointF px) const {
     int best = -1;
-    double bestD = 12 * 12;  // px radius
+    double bestD = 16 * 16;  // px radius
     for (int i = 0; i < pts_.size(); ++i) {
         const QPointF d = toPixel(pts_[i]) - px;
         const double dd = d.x() * d.x() + d.y() * d.y();
@@ -208,14 +208,19 @@ void VfCurveWidget::paintEvent(QPaintEvent *) {
 
     p.setPen(QPen(C(theme::BG0), 1.2));
     p.setBrush(C(theme::INFO));
-    for (const QPointF &v : pts_) p.drawEllipse(toPixel(v), 2.6, 2.6);
+    for (const QPointF &v : pts_) p.drawEllipse(toPixel(v), 4.2, 4.2);
     p.setPen(QPen(C(theme::DANGER), 2));
     p.setBrush(C(theme::WARN));
-    for (int i : sel_) if (i < pts_.size()) p.drawEllipse(toPixel(pts_[i]), 5.5, 5.5);
+    for (int i : sel_) if (i < pts_.size()) p.drawEllipse(toPixel(pts_[i]), 6.5, 6.5);
+    if (hover_ >= 0 && hover_ < pts_.size() && dragIndex_ < 0) {
+        p.setPen(QPen(C(theme::FG), 2));
+        p.setBrush(sel_.contains(hover_) ? C(theme::WARN) : C(theme::ACCENT));
+        p.drawEllipse(toPixel(pts_[hover_]), 7.5, 7.5);
+    }
     if (hasFocus() && cur_ < pts_.size()) {
         p.setPen(QPen(C(theme::FG), 1, Qt::DotLine));
         p.setBrush(Qt::NoBrush);
-        p.drawEllipse(toPixel(pts_[cur_]), 8, 8);
+        p.drawEllipse(toPixel(pts_[cur_]), 10, 10);
     }
 }
 
@@ -246,6 +251,15 @@ void VfCurveWidget::mousePressEvent(QMouseEvent *e) {
 }
 
 void VfCurveWidget::mouseMoveEvent(QMouseEvent *e) {
+    if (e->buttons() == Qt::NoButton) {
+        const int h = hitTest(e->position());
+        if (h != hover_) {
+            hover_ = h;
+            if (h >= 0) setCursor(Qt::PointingHandCursor); else unsetCursor();
+            update();
+        }
+        return;
+    }
     const double y = toValue(e->position()).y();
     if (dragIndex_ >= 0) {
         dragFreq_ = std::clamp(y, 0.0, fullY1_);
@@ -255,6 +269,11 @@ void VfCurveWidget::mouseMoveEvent(QMouseEvent *e) {
         const int total = int(std::lround(y - groupStartY_));
         if (total != groupApplied_) { Q_EMIT selectionShifted(total - groupApplied_); groupApplied_ = total; }
     }
+}
+
+void VfCurveWidget::leaveEvent(QEvent *e) {
+    QWidget::leaveEvent(e);
+    if (hover_ >= 0) { hover_ = -1; unsetCursor(); update(); }
 }
 
 void VfCurveWidget::mouseReleaseEvent(QMouseEvent *) {
