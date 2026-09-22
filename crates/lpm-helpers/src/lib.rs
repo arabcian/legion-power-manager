@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+pub mod tune;
+
 /// Reads at most `max` bytes from stdin. Returns Err with a ready-made
 /// JSON error payload if the input is too large, not UTF-8, or not JSON.
 pub fn read_request(max: usize) -> Result<Value, Value> {

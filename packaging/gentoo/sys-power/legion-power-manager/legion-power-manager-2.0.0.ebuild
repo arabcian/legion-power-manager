@@ -51,10 +51,10 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
-	dobin "${r}"/nvcurve
+	dobin "${r}"/{nvcurve,lpm-gamemode}
 
 	cmake_src_install
 
@@ -63,6 +63,7 @@ src_install() {
 	insinto /etc/polkit-1/rules.d
 	doins packaging/polkit/49-legion-power-manager.rules
 	newinitd packaging/openrc/nvcurve-autoload nvcurve-autoload
+	newinitd packaging/openrc/lpm-tune lpm-tune
 	keepdir /etc/nvcurve/profiles
 
 	dodoc README.md
@@ -72,6 +73,9 @@ pkg_postinst() {
 	xdg_pkg_postinst
 	elog "Boot-time GPU profile (set with ★ Default in the NVIDIA tab):"
 	elog "  rc-update add nvcurve-autoload default"
+	elog "Optimizations boot preset (set with ⏻ Apply at boot):"
+	elog "  rc-update add lpm-tune boot"
+	elog "Lutris hooks: /usr/bin/lpm-gamemode PRE / POST / RUN (see the Game launch sub-tab)."
 	elog "The Ryzen tab needs a root-owned ryzenadj in /usr/bin, /usr/sbin,"
 	elog "/usr/local/{bin,sbin} or /opt/ryzenadj."
 }

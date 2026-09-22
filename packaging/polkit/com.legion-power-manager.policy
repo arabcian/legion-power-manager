@@ -3,7 +3,7 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>legion-power-manager</vendor>
-  <!-- Four Rust root helpers, one per tab, each pinned by exec.path; installed
+  <!-- Five Rust root helpers, one per tab, each pinned by exec.path; installed
        root:root 0755 (nvcurve-root-helper 0700) under /usr/libexec/legion-power-manager.
        The authoritative grant is /etc/polkit-1/rules.d/49-legion-power-manager.rules. -->
   <action id="com.legion-power-manager.fwattr.write">
@@ -40,6 +40,15 @@
     <message xml:lang="tr">Dizüstü bilgisayarın güç profilini değiştirmek için kimlik doğrulama gerekiyor</message>
     <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/legion-profile-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.legion-power-manager.tune.apply">
+    <description>Apply or restore system tuning values via Legion Power Manager</description>
+    <description xml:lang="tr">Legion Power Manager üzerinden sistem optimizasyon değerlerini uygula veya geri yükle</description>
+    <message>Authentication is required to change kernel tuning settings</message>
+    <message xml:lang="tr">Çekirdek optimizasyon ayarlarını değiştirmek için kimlik doğrulama gerekiyor</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/tune-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

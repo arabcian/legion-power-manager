@@ -8,10 +8,12 @@
 # Layout:
 #   /usr/bin/legion-power-manager                   GUI (Qt6)
 #   /usr/bin/nvcurve                                nvcurve CLI (Rust)
+#   /usr/bin/lpm-gamemode                           Lutris/Steam game-mode hook (runs as the user)
 #   /usr/libexec/legion-power-manager/*-helper      pkexec targets (root:root)
 #   /usr/share/polkit-1/actions/com.legion-power-manager.policy
 #   /etc/polkit-1/rules.d/49-legion-power-manager.rules
 #   /etc/init.d/nvcurve-autoload                    OpenRC boot-time GPU profile
+#   /etc/init.d/lpm-tune                            OpenRC boot-time tuning preset
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -40,16 +42,17 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$DESTDIR$LIBEXEC/"
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" \
+    "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
-install "${own[@]}" -m 0755 "$T/nvcurve" "$DESTDIR$PREFIX/bin/"
+install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$DESTDIR$PREFIX/bin/"
 DESTDIR="$DESTDIR" cmake --install gui/build
 
 install -d "${own[@]}" -m 0755 "$DESTDIR$PREFIX/share/polkit-1/actions" "$DESTDIR/etc/polkit-1/rules.d" \
     "$DESTDIR/etc/init.d" "$DESTDIR/etc/nvcurve/profiles"
 install "${own[@]}" -m 0644 packaging/polkit/com.legion-power-manager.policy "$DESTDIR$PREFIX/share/polkit-1/actions/"
 install "${own[@]}" -m 0644 packaging/polkit/49-legion-power-manager.rules "$DESTDIR/etc/polkit-1/rules.d/"
-install "${own[@]}" -m 0755 packaging/openrc/nvcurve-autoload "$DESTDIR/etc/init.d/"
+install "${own[@]}" -m 0755 packaging/openrc/nvcurve-autoload packaging/openrc/lpm-tune "$DESTDIR/etc/init.d/"
 
 if (( LEGACY )) && [[ -z "$DESTDIR" ]]; then
     # Old Python layout (and the step-1/2 drop-in binaries that replaced its .py helpers).
@@ -62,6 +65,12 @@ fi
 if [[ -z "$DESTDIR" ]]; then
     command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$PREFIX/share/icons/hicolor" || true
     echo
-    echo "Installed. Enable the boot-time GPU profile with:"
-    echo "  rc-update add nvcurve-autoload default"
+    echo "Installed. Optional boot services:"
+    echo "  rc-update add nvcurve-autoload default   # GPU V/F profile"
+    echo "  rc-update add lpm-tune boot              # Optimizations boot preset"
+    if [[ -x /usr/local/bin/lutris-game-tune-wrapper ]]; then
+        echo
+        echo "Note: lutris-game-tune is still installed (setuid wrapper). lpm-gamemode replaces it;"
+        echo "switch the Lutris hooks (Optimizations → Game launch) before running its uninstall.sh."
+    fi
 fi

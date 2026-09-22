@@ -1,10 +1,3 @@
-                        -------------------------------------SCREENSHOTS-----------------------------------------
-<img width="1220" height="690" alt="Screenshot_20260922_034609" src="https://github.com/user-attachments/assets/6b400444-672b-42dc-a9ff-a414b326f935" />
-<img width="1220" height="690" alt="Screenshot_20260922_034625" src="https://github.com/user-attachments/assets/8b0541e2-ac3b-4b36-9b87-652164f3641a" />
-<img width="1220" height="701" alt="Screenshot_20260922_034737" src="https://github.com/user-attachments/assets/8bfbd291-ba1c-4b4b-958a-82979f1416ed" />
-<img width="1220" height="844" alt="Screenshot_20260922_034800" src="https://github.com/user-attachments/assets/d61bdcf6-6e61-4c0c-9901-6b079ce9f9fd" />
-
-
 # Legion Power Manager 2 — Rust + C++/Qt6
 
 Port of the PySide6 Legion Power Manager: privileged work in Rust, GUI in Qt6.
@@ -26,16 +19,22 @@ Runtime: NVIDIA proprietary driver (NVIDIA tab), root-owned `ryzenadj` (Ryzen ta
 
     /usr/bin/legion-power-manager                    GUI + tray
     /usr/bin/nvcurve                                 nvcurve CLI
+    /usr/bin/lpm-gamemode                            Lutris/Steam game-mode hook (user, no setuid)
     /usr/libexec/legion-power-manager/
-        legion-profile-helper  fwattr-helper  ryzen-co-helper   (root:root 0755)
+        legion-profile-helper  fwattr-helper  ryzen-co-helper
+        tune-helper                                             (root:root 0755)
         nvcurve-root-helper                                     (root:root 0700)
     /usr/share/polkit-1/actions/com.legion-power-manager.policy
     /etc/polkit-1/rules.d/49-legion-power-manager.rules
     /etc/xdg/autostart/legion-power-manager.desktop  starts in the tray on login
-    /etc/init.d/nvcurve-autoload                     OpenRC
+    /etc/init.d/nvcurve-autoload                     OpenRC (GPU profile)
+    /etc/init.d/lpm-tune                             OpenRC (tuning boot preset, runlevel boot)
 
 Unchanged data locations: `/etc/nvcurve/{config.json,profiles/}` (GPU),
-`~/.config/ryzen-curve-optimizer/profiles/` (CPU).
+`~/.config/ryzen-curve-optimizer/profiles/` (CPU). New: `~/.config/legion-power-manager/
+{tune-presets/,tune.json}` (tuning presets, ★ game preset),
+`/etc/legion-power-manager/tune-boot.json` (root-owned boot preset),
+`/run/legion-power-manager/tune/state.json` (saved originals; tmpfs).
 
 ## Tray & app behaviour (step 4)
 
@@ -197,3 +196,86 @@ Port of `nvcurve_gui.py` (embedded mode), same nvcurve-root-helper ops and
   selecting a profile in the combo only loads it into the editor, as before.
 - Ctrl+click extends the selection, Ctrl+A selects all, Shift+↑/↓ steps 15 MHz.
 - `LPM_NVCURVE_FAKE=/path/read.json` renders a canned curve (dev only).
+
+## Optimizations tab (step 5) — lutris-game-tune, integrated
+
+Everything `lutris-game-tune.sh` does at PRE/POST, plus the tuning knobs that
+came up during the sysfs review, as one tab backed by a Rust root helper.
+
+    crates/lpm-helpers/src/tune.rs          allowlist table + sysfs logic (shared)
+    crates/lpm-helpers/src/bin/tune-helper  pkexec target: apply / restore / boost / boot
+    crates/lpm-helpers/src/bin/lpm-gamemode Lutris/Steam front end (user process)
+    gui/src/optimizetab.{h,cpp}             the tab
+    packaging/openrc/lpm-tune               boot preset service
+
+**Rows** (51, grouped CPU · Memory · Scheduler · Storage · Devices · Stability):
+all lutris-game-tune parameters (governor/EPP, epp_boost, X3D mode, ASPM, deep
+C-states, VM set, MGLRU, THP ×3, split-lock, watchdog, autogroup, CFS slice,
+debugfs scheduler knobs, HDA power save, PCI latency timers) and new ones:
+amd-pstate mode, boost, min freq = lowest_nonlinear, **SMT**, **CCD parking**
+(hot-plug), khugepaged defrag, MGLRU min_ttl_ms, KSM, `vm.max_map_count`,
+`numa_balancing`, `timer_migration`, preemption model, **unbound workqueue
+cpumask** and **IRQ affinity** by CCD role, I/O scheduler / WBT / read-ahead
+per disk, USB autosuspend, amdgpu iGPU DPM level, MCE poll interval.
+Rows the machine does not have are shown greyed out ("n/a").
+
+**CCD roles instead of CPU lists.** Values like `cache`, `frequency`, `ccd1`
+are resolved against the live L3 topology (largest L3 = V-Cache die; highest
+`cpuinfo_max_freq`, or the smaller-L3 die on a tie = frequency die), so one
+preset works on any X3D part. Symmetric parts only offer `ccdN`; single-CCD
+parts hide these rows. cpu0's CCD is never offered for parking.
+
+**Reversibility.** The first write to each concrete file records its
+original value (before the write, so a crash mid-batch is still restorable).
+"Restore originals", the per-row ↺, the last POST and `rc-service lpm-tune
+stop` write them back. Order matters and is fixed by the table: amd-pstate
+mode first (it resets per-policy files); SMT and CCD parking last on apply
+(an offline CPU's cpufreq policy returns EBUSY) and **first** on restore.
+
+**Presets.** Six built-ins — Gaming X3D, Competitive, Low latency desktop,
+Compile throughput, CO validation, Quiet battery — plus your own (Save as…).
+A preset stores the checked rows and a `run` block (nice, autogroup,
+CCD affinity). Loading skips values the machine does not offer and says which.
+★ *Use for games* makes it lpm-gamemode's default; ⏻ *Apply at boot* stores the
+checked rows (validated by root) in `/etc/legion-power-manager/tune-boot.json`.
+
+**Lutris** (the Game launch sub-tab has copy buttons):
+
+| Field | Value |
+|---|---|
+| Pre-game script | `/usr/bin/lpm-gamemode PRE` |
+| Post-game script | `/usr/bin/lpm-gamemode POST` |
+| Command prefix | `/usr/bin/lpm-gamemode RUN` |
+| Steam launch options | `lpm-gamemode WRAP -- %command%` |
+
+Append a preset name to pin one per game (`PRE "Competitive"`). Game mode is
+reference counted like lutris-game-tune; WRAP forwards SIGINT/TERM/HUP to the
+game so POST still runs when Steam stops it.
+
+Differences from lutris-game-tune, all deliberate:
+- **No setuid wrapper.** lpm-gamemode runs as the user; root work goes through
+  `pkexec tune-helper`. The RUN boost renices only the process that called
+  pkexec, and only if its real uid is the authenticated user (`PKEXEC_UID`).
+- **CCD isolation uses affinity + kernel steering, not cgroup moves.** The v4
+  cgroup constrain/move logic (and its session watcher) is replaced by
+  `sched_setaffinity` inherited by the game tree, unbound workqueue and IRQ
+  steering to the other CCD, and optionally parking that CCD. No process is
+  ever moved between cgroups, so the elogind/D-Bus incident class cannot recur.
+- The X3D `_DSM` write keeps lutris-game-tune's 3 s timeout (thread + abandon).
+- PCI latency timers are written natively (one byte at config offset 0x0D via
+  pwrite; never a full config write) instead of via `setpci`; per-device
+  refusals are skipped like `setpci … || true`.
+- THP / shmem / defrag are ordinary rows again (v3 forced `always`).
+- State lives on tmpfs: a reboot is a full restore, as before.
+
+Security: the tune-helper request carries only keys and values. Every path is
+derived from the table and re-checked before writing (realpath inside /sys,
+fixed `/proc/sys` files from the table, `/proc/irq/<n>/smp_affinity_list`);
+values are revalidated against live option lists and ranges. The polkit rule
+grants it without a prompt like the other helpers — any process running as
+the active user can therefore retune the kernel; tighten
+`49-legion-power-manager.rules` as described in that file if that matters.
+
+Dev aids: `LPM_TUNE_FAKE=/path/describe.json` renders canned data,
+`LPM_OPT_SUBTAB=N` and `LPM_OPT_LOAD=<preset>` pick the sub-tab and preset
+for `LPM_SCREENSHOT`.

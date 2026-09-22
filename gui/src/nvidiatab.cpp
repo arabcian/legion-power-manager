@@ -345,30 +345,33 @@ bool NvidiaTab::loadCurveFile(const QString &file, qint64 notBeforeMs, QJsonArra
     const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
     if (!o.contains("vf_curve")) { log("❌ 'vf_curve' missing in " + file); return false; }
     *out = o.value("vf_curve").toArray();
+    applyMemOffset(o);
     return true;
 }
 
-/// GPU-domain points become the base curve; memory points feed the mem spin.
+/// Mem spin ← NVML memory offset (effective MHz) reported next to the curve.
+/// Absent (older helper, NVML unavailable) → the spin is left untouched.
+void NvidiaTab::applyMemOffset(const QJsonObject &result) {
+    const QJsonValue m = result.value("mem_offset_mhz");
+    if (!m.isDouble()) return;
+    const QSignalBlocker b(memSpin_);
+    memSpin_->setValue(m.toInt());
+}
+
+/// GPU-domain points become the base curve. Memory-domain points are skipped:
+/// their ClockBoostTable deltas are not the NVML memory offset (different unit,
+/// driver-clamped), so they must never feed the mem spin — see applyMemOffset().
 void NvidiaTab::takeGpuPoints(const QJsonArray &pts, bool keepOffsets) {
     QVector<QPointF> base;
     QHash<int, int> offs;
-    QList<int> memOffs;
     for (const auto &v : pts) {
         const QJsonObject p = v.toObject();
-        const int off = floorDiv(qint64(p.value("freq_offset_kHz").toDouble()), 1000);
-        if (p.value("domain").toString() == "memory") { memOffs << off; continue; }
         if (p.value("domain").toString() != "gpu") continue;
+        const int off = floorDiv(qint64(p.value("freq_offset_kHz").toDouble()), 1000);
         const int cur = floorDiv(qint64(p.value("freq_kHz").toDouble()), 1000);
         const int mv = floorDiv(qint64(p.value("volt_uV").toDouble()), 1000);
         offs[base.size()] = off;
         base.append(QPointF(mv, cur - off));
-    }
-    if (!memOffs.isEmpty()) {
-        double avg = 0;
-        for (int o : memOffs) avg += o;
-        memSpin_->blockSignals(true);
-        memSpin_->setValue(int(std::lround(avg / memOffs.size() / 2.0)));
-        memSpin_->blockSignals(false);
     }
     if (base.isEmpty()) { log("❌ No GPU points found in vf_curve."); return; }
     base_ = base;
@@ -574,8 +577,10 @@ void NvidiaTab::onProfileSelected() {
 void NvidiaTab::applyProfileToUi(const QJsonObject &data, const QString &name) {
     if (base_.isEmpty()) { log("⚠️ Read the curve first, then load a profile onto it."); return; }
     const QJsonObject deltas = data.value("curve_deltas").toObject();
-    int mem = data.value("mem_offset_mhz").toInt();
-    if (!mem) for (const char *k : {"131", "132"}) if (deltas.contains(k)) { mem = floorDiv(qint64(deltas.value(k).toDouble()), 1000); break; }
+    // Exactly what profiles::native loads and apply writes through NVML (incl. the legacy key).
+    // Never derived from memory-domain curve_deltas: apply doesn't use them as the mem offset.
+    const int mem = (data.contains("mem_offset_mhz") ? data.value("mem_offset_mhz")
+                                                     : data.value("vram_p0_offset_mhz")).toInt();
 
     QHash<int, int> offs;
     QSet<int> uniq;

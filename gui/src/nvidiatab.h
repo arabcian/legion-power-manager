@@ -52,6 +52,7 @@ private:
     void onSelectionChanged();
     void resetGraphToLastRead();
     bool loadCurveFile(const QString &file, qint64 notBeforeMs, QJsonArray *out);
+    void applyMemOffset(const QJsonObject &result);
     void takeGpuPoints(const QJsonArray &pts, bool keepOffsets);
 
     // actions

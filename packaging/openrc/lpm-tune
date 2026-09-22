@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+# Legion Power Manager — boot-time system tuning preset.
+#
+# Applies /etc/legion-power-manager/tune-boot.json (written by the
+# Optimizations tab → "Apply at boot"). Every changed value is recorded under
+# /run/legion-power-manager/tune, so `rc-service lpm-tune stop` (or
+# "Restore originals" in the GUI) puts the kernel defaults back.
+#
+#   rc-update add lpm-tune boot
+
+description="Apply the Legion Power Manager boot tuning preset"
+HELPER="/usr/libexec/legion-power-manager/tune-helper"
+
+depend() {
+	need localmount
+	after modules sysctl
+	before xdm display-manager
+}
+
+start() {
+	[ -f /etc/legion-power-manager/tune-boot.json ] || { einfo "No boot preset set"; return 0; }
+	ebegin "Applying Legion Power Manager boot tuning"
+	printf '%s' '{"op":"boot"}' | "${HELPER}" >/dev/null
+	eend $? "Some settings could not be applied (see: lpm-gamemode STATUS)"
+}
+
+stop() {
+	ebegin "Restoring original tuning values"
+	printf '%s' '{"op":"restore"}' | "${HELPER}" >/dev/null
+	eend $?
+}

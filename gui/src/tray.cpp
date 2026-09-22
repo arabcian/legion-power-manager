@@ -2,6 +2,7 @@
 #include "hometab.h"
 #include "mainwindow.h"
 #include "nvidiatab.h"
+#include "optimizetab.h"
 #include "ryzentab.h"
 #include "theme.h"
 #include <QApplication>
@@ -115,6 +116,26 @@ void Tray::rebuild() {
         if (claimCooldown()) nv->resetCurve();
     });
     nm->setEnabled(!nv->busy());  // greyed while an NVIDIA helper call is in flight
+
+    // Optimizations
+    QMenu *om = menu_->addMenu("Optimizations");
+    OptimizeTab *opt = win_->optimize();
+    const QString game = opt->gamePreset();
+    for (const QString &n : opt->presetNames())
+        connect(om->addAction(n == game ? n + "  ★" : n), &QAction::triggered, this, [this, opt, n] {
+            if (!claimCooldown()) return;
+            if (opt->applyNamedPreset(n)) notify("Optimizations", "Applying preset '" + n + "'…");
+            else notify("Optimizations", "Preset '" + n + "' has nothing applicable here.");
+        });
+    om->addSeparator();
+    QAction *restore = om->addAction("Restore originals");
+    restore->setEnabled(opt->tuningActive());
+    connect(restore, &QAction::triggered, this, [this, opt] {
+        if (!claimCooldown()) return;
+        opt->restoreAll(false);
+        notify("Optimizations", "Restoring original values…");
+    });
+    om->setEnabled(!opt->busy());
 
     menu_->addSeparator();
     connect(menu_->addAction(win_->isVisible() ? "Hide window" : "Show window"), &QAction::triggered, this, &Tray::toggleWindow);

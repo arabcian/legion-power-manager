@@ -61,6 +61,7 @@ QPushButton#btnAccent { background: @ACCENT_SOFT; border-color: @ACCENT; color: 
 QPushButton#btnAccent:hover { background: @ACCENT; }
 QPushButton#btnDanger { background: @BG2; border-color: @DANGER_SOFT; color: @DANGER; }
 QPushButton#btnDanger:hover { background: @DANGER_SOFT; color: @FG; }
+QPushButton#btnAccent:disabled, QPushButton#btnDanger:disabled { background: @BG1; color: @MUTED; border-color: @BORDER_SOFT; }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @BG2; color: @FG; border: 1px solid @BORDER_SOFT;
   border-radius: 4px; padding: 2px 6px; selection-background-color: @ACCENT_SOFT; }
 QPlainTextEdit, QTextEdit { background: @BG2; color: @FG; border: 1px solid @BORDER_SOFT; border-radius: 4px;

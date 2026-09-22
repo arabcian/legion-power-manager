@@ -2,6 +2,7 @@
 #include "fwattrtab.h"
 #include "hometab.h"
 #include "nvidiatab.h"
+#include "optimizetab.h"
 #include "ryzentab.h"
 #include "tray.h"
 #include <QCloseEvent>
@@ -28,6 +29,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     tabs_->addTab(nvidia_, "NVIDIA Curve Optimizer");
     ryzen_ = new RyzenTab;
     tabs_->addTab(ryzen_, "Ryzen Curve Optimizer");
+    optimize_ = new OptimizeTab;
+    tabs_->addTab(optimize_, "Optimizations");
 
     statusBar()->showMessage("Legion Power Manager " LPM_VERSION, 4000);
 }

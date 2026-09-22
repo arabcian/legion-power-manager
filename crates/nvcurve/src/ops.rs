@@ -2,7 +2,7 @@
 
 use crate::atomicio::{ensure_dir, write_json};
 use crate::config::{Config, PERSISTENT_CONFIG_FILE};
-use crate::hal::{gpu, monitoring, vfcurve};
+use crate::hal::{gpu, limits, monitoring, vfcurve};
 use crate::profiles::apply::apply_profile;
 use crate::profiles::native::{load_profile, profile_path};
 use crate::types::CurveState;
@@ -26,7 +26,16 @@ pub fn read_curve_retry(gpu_index: usize, retries: u32) -> Result<Value, String>
     for attempt in 0..=retries {
         let (g, name) = gpu::get_gpu(gpu_index).map_err(|e| e.to_string())?;
         match vfcurve::read_curve(g, &name) {
-            Ok(s) => return Ok(curve_json(&name, &s, monitoring::read_voltage(g).ok())),
+            Ok(s) => {
+                let mut v = curve_json(&name, &s, monitoring::read_voltage(g).ok());
+                // The memory offset the GUI shows must come from where it is written
+                // (NVML, effective MHz) — the ClockBoostTable's memory-domain points
+                // use another unit and are clamped by the driver.
+                let offs = limits::get_clock_offsets(gpu_index as u32);
+                v["mem_offset_mhz"] = json!(offs.mem_offset_mhz);
+                v["gpc_offset_mhz"] = json!(offs.gpc_offset_mhz);
+                return Ok(v);
+            }
             Err(e) => last = e,
         }
         if attempt < retries { std::thread::sleep(Duration::from_millis(150)); }

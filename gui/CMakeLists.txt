@@ -22,6 +22,7 @@ add_executable(legion-power-manager
     src/ryzentab.cpp     src/ryzentab.h
     src/vfcurvewidget.cpp src/vfcurvewidget.h
     src/nvidiatab.cpp    src/nvidiatab.h
+    src/optimizetab.cpp  src/optimizetab.h
     src/tray.cpp         src/tray.h
 )
 target_compile_definitions(legion-power-manager PRIVATE
