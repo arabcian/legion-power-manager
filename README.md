@@ -1,3 +1,15 @@
+                                                   Screenshots
+<img width="1388" height="913" alt="Screenshot_20260922_092311" src="https://github.com/user-attachments/assets/7f934240-6965-4d5a-9b5e-a8a1af04b7f7" />
+<img width="1419" height="944" alt="Screenshot_20260922_092335" src="https://github.com/user-attachments/assets/d61ccdf1-3468-422a-bde3-efcdecec3edb" />
+<img width="1419" height="944" alt="Screenshot_20260922_092346" src="https://github.com/user-attachments/assets/5496acc4-e20b-44bd-9bbf-9e6029268810" />
+<img width="1419" height="944" alt="Screenshot_20260922_092403" src="https://github.com/user-attachments/assets/0226c791-089c-4f7f-bd56-d09f7abb22d7" />
+<img width="1419" height="944" alt="Screenshot_20260922_092420" src="https://github.com/user-attachments/assets/7065451a-2228-4ddc-ae52-8e2c6b597c7a" />
+<img width="1265" height="789" alt="Screenshot_20260921_065400" src="https://github.com/user-attachments/assets/f84c3824-5372-4343-b24b-f16fa04f438b" />
+<img width="1265" height="789" alt="Screenshot_20260921_065412" src="https://github.com/user-attachments/assets/e919c2db-b50d-4848-b3d7-b353815bd043" />
+<img width="1265" height="789" alt="Screenshot_20260921_065431" src="https://github.com/user-attachments/assets/c7539f4a-e734-45d9-aadc-8881ebe0bde4" />
+<img width="1265" height="789" alt="Screenshot_20260921_065442" src="https://github.com/user-attachments/assets/30315e48-c752-4b1e-9169-c9a4e4fb9bf3" />
+                                                   
+
 # Legion Power Manager 2 — Rust + C++/Qt6
 
 Port of the PySide6 Legion Power Manager: privileged work in Rust, GUI in Qt6.
