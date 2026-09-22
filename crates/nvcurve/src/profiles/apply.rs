@@ -61,7 +61,7 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
 
     if p.curve_deltas.is_empty() {
         let (rc, d) = vfcurve::reset_offsets(g, false);
-        if rc != 0 { out.warnings.push(format!("Curve reset failed ({rc}): {d}")); }
+        if rc != 0 { out.errors.push(format!("Curve reset failed ({rc}): {d}")); }
         return Ok(out);
     }
     let deltas = match p.deltas() {
@@ -153,6 +153,7 @@ pub fn run_autoload(cfg: &Config) -> i32 {
     };
     if gpus.is_empty() { warn!("No GPUs discovered."); }
     let key_to_idx: BTreeMap<String, usize> = gpus.iter().map(|g| (g.stable_key(), g.index)).collect();
+    let mut failed = 0usize;
     for (key, prof) in &cfg.auto_load_profiles {
         if prof.is_empty() { continue; }
         let Some(&idx) = key_to_idx.get(key) else {
@@ -160,8 +161,8 @@ pub fn run_autoload(cfg: &Config) -> i32 {
             continue;
         };
         info!("Auto-loading profile {prof:?} on GPU {idx} ({key})");
-        apply_with_retry(idx, prof, cfg, 3);
+        if !apply_with_retry(idx, prof, cfg, 3) { failed += 1; }
     }
     monitoring::shutdown_nvml();
-    0
+    if failed > 0 { error!("Auto-load: {failed} profile(s) failed"); 1 } else { 0 }
 }

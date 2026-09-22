@@ -21,7 +21,10 @@ pub enum RunError {
 fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut v = Vec::new();
-        if let Some(r) = r { let _ = r.take(MAX_OUTPUT).read_to_end(&mut v); }
+        if let Some(mut r) = r {
+            let _ = (&mut r).take(MAX_OUTPUT).read_to_end(&mut v);
+            let _ = std::io::copy(&mut r, &mut std::io::sink()); // keep the pipe drained
+        }
         String::from_utf8_lossy(&v).trim().to_owned()
     })
 }
@@ -67,7 +70,7 @@ pub fn find_trusted(candidates: &[&'static str]) -> Option<&'static str> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     candidates.iter().copied().find(|p| {
         let Ok(md) = std::fs::metadata(p) else { return false };
-        md.is_file() && md.uid() == 0 && md.permissions().mode() & 0o022 == 0
+        md.is_file() && md.uid() == 0 && md.permissions().mode() & 0o6022 == 0
             && md.permissions().mode() & 0o111 != 0
     })
 }

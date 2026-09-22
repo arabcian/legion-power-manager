@@ -55,12 +55,40 @@ pub fn write_json(path: &Path, v: &serde_json::Value, mode: u32) -> io::Result<(
     write_bytes(path, s.as_bytes(), mode)
 }
 
-/// create_dir_all + explicit chmod (umask-independent).
+/// create_dir_all + explicit chmod (umask-independent). The final
+/// component must be a real directory (not a symlink); when running as
+/// root it must also be root-owned.
 pub fn ensure_dir(dir: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     std::fs::create_dir_all(dir)?;
+    let md = std::fs::symlink_metadata(dir)?;
+    if !md.is_dir() {
+        return Err(io::Error::other(format!("{} is not a directory", dir.display())));
+    }
+    if unsafe { libc::geteuid() } == 0 && md.uid() != 0 {
+        return Err(io::Error::other(format!("{} is not owned by root", dir.display())));
+    }
     let c = CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
-    unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) };
+    if unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
+}
+
+/// Reads a regular file without following a final symlink, refusing
+/// anything that is not a plain file or is larger than `max` bytes.
+pub fn read_regular(path: &Path, max: u64) -> io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path)?;
+    let md = f.metadata()?;
+    if !md.is_file() { return Err(io::Error::other("not a regular file")); }
+    if md.len() > max { return Err(io::Error::other(format!("exceeds {max} bytes"))); }
+    let mut s = String::new();
+    f.take(max + 1).read_to_string(&mut s)?;
+    if s.len() as u64 > max { return Err(io::Error::other(format!("exceeds {max} bytes"))); }
+    Ok(s)
 }
 
 #[cfg(test)]

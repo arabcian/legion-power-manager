@@ -8,6 +8,7 @@ use crate::types::SnapshotInfo;
 use log::{error, info};
 use serde_json::json;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 fn offsets(raw: &[u8]) -> Vec<i32> {
@@ -67,6 +68,7 @@ fn prune(dir: &Path, max: usize) {
     let bins = bins_sorted(dir);
     if bins.len() <= max { return; }
     for name in &bins[..bins.len() - max] {
+        if name.len() <= 4 { continue; }
         let stem = &name[..name.len() - 4];
         for ext in [".bin", ".json"] { let _ = std::fs::remove_file(dir.join(format!("{stem}{ext}"))); }
     }
@@ -102,7 +104,8 @@ pub fn restore(gpu: Gpu, dir: &str, filepath: Option<&str>) -> Result<(), String
     let path = resolve_restore_path(dir, filepath)?;
     if !path.is_file() { return Err(format!("Snapshot file not found: {}", path.display())); }
     let mut raw = Vec::with_capacity(CT_SIZE + 1);
-    std::fs::File::open(&path).and_then(|f| f.take(CT_SIZE as u64 + 1).read_to_end(&mut raw))
+    std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path).and_then(|f| f.take(CT_SIZE as u64 + 1).read_to_end(&mut raw))
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if raw.len() != CT_SIZE {
         return Err(format!("Snapshot size mismatch: expected {CT_SIZE}, got {}", raw.len()));
@@ -129,8 +132,7 @@ pub fn list_snapshots(dir: &str) -> Vec<SnapshotInfo> {
     names.sort_by(|a, b| b.cmp(a));
     names.into_iter().filter_map(|n| {
         let p = d.join(&n);
-        if std::fs::metadata(&p).ok()?.len() > 64 * 1024 { return None; }
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&crate::atomicio::read_regular(&p, 64 * 1024).ok()?).ok()?;
         let default_bin = p.with_extension("bin").to_string_lossy().into_owned();
         Some(SnapshotInfo {
             filepath: v["file"].as_str().map(str::to_owned).unwrap_or(default_bin),

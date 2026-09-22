@@ -168,8 +168,14 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             let fresh = !st.has(&f);
             if fresh {
                 if st.baseline.len() >= MAX_BASELINE { errs.push("baseline full".into()); break; }
-                // Recorded *before* the write: a crash mid-batch still restores it.
+                // Recorded and persisted *before* the write, so a crash or
+                // kill mid-batch still leaves the original restorable.
                 st.baseline.push((t.key.to_owned(), f.clone(), orig));
+                if let Err(e) = st.save() {
+                    st.baseline.pop();
+                    errs.push(format!("state not saved, write skipped: {e}"));
+                    break;
+                }
             }
             match tune::write_checked(&f, &data) {
                 Ok(()) => written += 1,
@@ -295,7 +301,8 @@ fn op_boost(req: &Value) -> Value {
     let Some(nice) = req["nice"].as_i64().filter(|n| (-20..=-1).contains(n)) else {
         return json!({"ok": false, "error": "nice must be an integer in -20..-1"});
     };
-    // pkexec execs us in place, so our parent is the program that ran pkexec.
+    // pkexec execs us in place (polkit >= 0.106; it also sets PKEXEC_UID
+    // after clearing the environment, so the caller cannot forge it), so our parent is the program that ran pkexec.
     // Only that process is boosted, and only if it belongs to the user pkexec
     // authenticated (PKEXEC_UID is set by pkexec itself, not by the caller).
     let ppid = unsafe { libc::getppid() };

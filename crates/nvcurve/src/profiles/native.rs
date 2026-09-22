@@ -119,11 +119,8 @@ pub fn save_profile(dir: &str, data: &ProfileData) -> std::io::Result<PathBuf> {
 }
 
 pub fn load_profile(path: &Path) -> Result<ProfileData, String> {
-    let md = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if md.len() > MAX_PROFILE_BYTES {
-        return Err(format!("profile {} exceeds {MAX_PROFILE_BYTES} bytes", path.display()));
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = crate::atomicio::read_regular(path, MAX_PROFILE_BYTES as u64)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     ProfileData::from_value(v, &path.display().to_string())
 }

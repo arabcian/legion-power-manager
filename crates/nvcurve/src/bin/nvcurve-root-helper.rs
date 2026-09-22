@@ -25,7 +25,7 @@ const RESET_RESULT: &str = "nvcurve_reset_result.json";
 
 const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
-const MAX_CURVE_POINTS: i64 = 512;
+const MAX_CURVE_POINTS: i64 = 255; // == CT_POINTS
 
 type Obj = Map<String, Value>;
 type OpResult = Result<String, String>;
@@ -73,7 +73,9 @@ fn validate_profile_data(d: &Obj) -> Result<(), String> {
     for (k, v) in d {
         if v.is_null() { continue; }
         match k.as_str() {
-            "name" | "gpu_name" => if !v.is_string() { return Err(format!("field {k:?} must be str")); },
+            "name" | "gpu_name" => if !v.as_str().is_some_and(|s| s.len() <= 256) {
+                return Err(format!("field {k:?} must be a str of at most 256 bytes"));
+            },
             "curve_deltas" => if !v.is_object() { return Err(format!("field {k:?} must be dict")); },
             _ => match BOUNDS.iter().find(|b| b.0 == k) {
                 Some(&(_, lo, hi)) => {
@@ -191,7 +193,7 @@ fn op_write_nvcurve_profile(p: &Obj) -> OpResult {
     validate_profile_data(obj).map_err(|e| format!("Invalid profile content: {e}"))?;
     ensure_dir(Path::new(PROFILES_DIR), 0o755).map_err(|e| format!("Could not prepare {PROFILES_DIR}: {e}"))?;
     let target = profile_file(name);
-    write_bytes(&target, content.as_bytes(), 0o644).map_err(|e| format!("Could not write profile: {e}"))?;
+    write_bytes(&target, &serde_json::to_vec_pretty(&parsed).map_err(|e| e.to_string())?, 0o644).map_err(|e| format!("Could not write profile: {e}"))?;
     Ok(format!("Profile written: {}", target.display()))
 }
 

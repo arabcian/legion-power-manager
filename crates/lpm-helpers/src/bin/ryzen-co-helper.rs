@@ -57,7 +57,7 @@ fn require_int(v: Option<&Value>, name: &str, lo: i64, hi: i64) -> Result<i64, I
 fn is_safe_executable(path: &str) -> bool {
     let Ok(md) = std::fs::metadata(path) else { return false };
     if !md.is_file() || md.uid() != 0 { return false; }
-    if md.permissions().mode() & 0o022 != 0 { return false; }
+    if md.permissions().mode() & 0o6022 != 0 { return false; }
     let Ok(c) = CString::new(path) else { return false };
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
@@ -69,7 +69,10 @@ fn find_ryzenadj() -> Option<&'static str> {
 fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut s = Vec::new();
-        if let Some(r) = r { let _ = r.take(MAX_OUTPUT).read_to_end(&mut s); }
+        if let Some(mut r) = r {
+            let _ = (&mut r).take(MAX_OUTPUT).read_to_end(&mut s);
+            let _ = std::io::copy(&mut r, &mut std::io::sink()); // keep the pipe drained
+        }
         String::from_utf8_lossy(&s).trim().to_owned()
     })
 }

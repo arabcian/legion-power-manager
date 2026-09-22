@@ -11,8 +11,8 @@
     <description xml:lang="tr">Bir firmware_attributes sysfs değerini yaz</description>
     <message>Authentication is required to write a firmware attribute value</message>
     <message xml:lang="tr">Bir firmware özniteliği değerini yazmak için kimlik doğrulama gerekiyor</message>
-    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/fwattr-helper</annotate>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/fwattr-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
   <action id="com.legion-power-manager.nvcurve.set-params">
@@ -20,8 +20,8 @@
     <description xml:lang="tr">Legion Power Manager üzerinden NVIDIA GPU V/F eğrisi ayarlarını uygula</description>
     <message>Administrator authentication required (NVIDIA curve optimizer)</message>
     <message xml:lang="tr">Yönetici kimlik doğrulaması gerekiyor (NVIDIA eğri optimizasyonu)</message>
-    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/nvcurve-root-helper</annotate>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/nvcurve-root-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
   <action id="com.legion-power-manager.ryzen.set-curve">
@@ -29,8 +29,8 @@
     <description xml:lang="tr">Legion Power Manager üzerinden RyzenAdj Curve Optimizer değerlerini uygula</description>
     <message>Authentication is required to change the CPU Curve Optimizer voltage offsets</message>
     <message xml:lang="tr">CPU Curve Optimizer voltaj offsetlerini değiştirmek için kimlik doğrulama gerekiyor</message>
-    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/ryzen-co-helper</annotate>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/ryzen-co-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
   <action id="com.legion-power-manager.profile.set">
@@ -38,8 +38,8 @@
     <description xml:lang="tr">ACPI platform güç profilini değiştir</description>
     <message>Authentication is required to change the laptop power profile</message>
     <message xml:lang="tr">Dizüstü bilgisayarın güç profilini değiştirmek için kimlik doğrulama gerekiyor</message>
-    <defaults><allow_any>yes</allow_any><allow_inactive>yes</allow_inactive><allow_active>yes</allow_active></defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/legion-profile-helper</annotate>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/legion-profile-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
   <action id="com.legion-power-manager.tune.apply">
@@ -48,7 +48,7 @@
     <message>Authentication is required to change kernel tuning settings</message>
     <message xml:lang="tr">Çekirdek optimizasyon ayarlarını değiştirmek için kimlik doğrulama gerekiyor</message>
     <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/legion-power-manager/tune-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/tune-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

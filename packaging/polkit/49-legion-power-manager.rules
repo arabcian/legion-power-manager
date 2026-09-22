@@ -47,15 +47,20 @@
  * `subject.isInGroup("wheel")` (Arch/Fedora) or `"sudo"` (Debian/Ubuntu).
  */
 
+// Only a local, active session of a wheel member is granted silently;
+// everyone else (SSH, other seats, service accounts) gets auth_admin.
+var HELPERS = ["fwattr-helper", "legion-profile-helper", "ryzen-co-helper",
+               "tune-helper", "nvcurve-root-helper"].map(function (h) {
+    return "@LIBEXEC@/" + h;
+});
+
 polkit.addRule(function (action, subject) {
-    if (action.id.indexOf("com.legion-power-manager.") === 0) {
+    var ours = action.id.indexOf("com.legion-power-manager.") === 0 ||
+        (action.id === "org.freedesktop.policykit.exec" &&
+         HELPERS.indexOf(action.lookup("program")) >= 0);
+    if (!ours) { return; }
+    if (subject.local && subject.active && subject.isInGroup("wheel")) {
         return polkit.Result.YES;
     }
-
-    if (action.id === "org.freedesktop.policykit.exec") {
-        var program = action.lookup("program");
-        if (program && program.indexOf("/usr/libexec/legion-power-manager/") === 0) {
-            return polkit.Result.YES;
-        }
-    }
+    return polkit.Result.AUTH_ADMIN;
 });

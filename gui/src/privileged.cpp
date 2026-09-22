@@ -29,7 +29,10 @@ void run(const QString &helper, const QByteArray &payload, QObject *ctx, Callbac
         Result r; r.error = msg;
         QTimer::singleShot(0, ctx, [cb, r] { cb(r); });
     };
-    const QString pkexec = QStandardPaths::findExecutable(QStringLiteral("pkexec"));
+    // Fixed locations, like the Rust side: never resolve pkexec through $PATH.
+    QString pkexec;
+    for (const char *c : {"/usr/bin/pkexec", "/bin/pkexec"})
+        if (QFileInfo(QString::fromLatin1(c)).isFile()) { pkexec = QString::fromLatin1(c); break; }
     if (pkexec.isEmpty()) return fail(QStringLiteral("pkexec was not found. Install polkit (sys-auth/polkit)."));
     if (!QFileInfo(helper).isFile()) return fail(QStringLiteral("helper not found: ") + helper);
 

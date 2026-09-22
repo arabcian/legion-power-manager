@@ -11,7 +11,12 @@ else
 fi
 # Put every tuned value back before the helper disappears.
 if [[ -x "$PREFIX/libexec/legion-power-manager/tune-helper" ]]; then
-    printf '%s' '{"op":"restore"}' | "$PREFIX/libexec/legion-power-manager/tune-helper" >/dev/null || true
+    th="$PREFIX/libexec/legion-power-manager/tune-helper"
+    if [[ ! -L $th && $(stat -c '%u' "$th") == 0 && $(( 0$(stat -c '%a' "$th") & 022 )) == 0 ]]; then
+        printf '%s' '{"op":"restore"}' | "$th" >/dev/null || echo "warning: tune restore failed; some knobs may stay changed until reboot" >&2
+    else
+        echo "warning: $th is not root-owned/safe — skipping restore" >&2
+    fi
 fi
 rm -rf "$PREFIX/libexec/legion-power-manager"
 rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-gamemode" /etc/init.d/lpm-tune \
@@ -22,6 +27,6 @@ rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-
       /etc/polkit-1/rules.d/49-legion-power-manager.rules /etc/init.d/nvcurve-autoload
 rm -f "$UNITDIR/nvcurve-autoload.service" "$UNITDIR/lpm-tune.service"
 [[ -d /run/systemd/system ]] && systemctl daemon-reload 2>/dev/null || true
-rm -rf /run/legion-power-manager
+[[ -L /run/legion-power-manager ]] && rm -f /run/legion-power-manager || rm -rf /run/legion-power-manager
 echo "Removed. Kept: /etc/nvcurve, /etc/legion-power-manager (boot preset),"
 echo "~/.config/ryzen-curve-optimizer and ~/.config/legion-power-manager (tuning presets)."

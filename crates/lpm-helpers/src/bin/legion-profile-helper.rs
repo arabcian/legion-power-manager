@@ -62,10 +62,9 @@ fn set_profile(node: Option<&str>, profile: &str) -> Value {
                 return json!({"ok": false, "error": format!("no such platform-profile handler: {node}")});
             }
             match canonical_in_sysfs(&target) {
-                Some(real) if real.file_name().map_or(false, |n| n == "profile") => {}
+                Some(real) if real.file_name().map_or(false, |n| n == "profile") => real,
                 _ => return json!({"ok": false, "error": "handler path resolves outside sysfs"}),
             }
-            target
         }
         None => {
             if profile == "custom" {

@@ -43,12 +43,17 @@ impl Config {
     /// field-by-field: one bad field doesn't discard the rest.
     pub fn load(path: &Path) -> Config {
         let mut cfg = Config::default();
-        let Ok(md) = std::fs::metadata(path) else { return cfg };
+        use std::os::unix::fs::MetadataExt;
+        let Ok(md) = std::fs::symlink_metadata(path) else { return cfg };
+        if !md.is_file() || md.uid() != 0 || md.mode() & 0o022 != 0 {
+            log::warn!("{} is not a root-owned, non-writable regular file — using defaults", path.display());
+            return cfg;
+        }
         if md.len() > MAX_CONFIG_BYTES {
             log::warn!("{} exceeds {MAX_CONFIG_BYTES} bytes — using defaults", path.display());
             return cfg;
         }
-        let Ok(text) = std::fs::read_to_string(path) else { return cfg };
+        let Ok(text) = crate::atomicio::read_regular(path, MAX_CONFIG_BYTES) else { return cfg };
         let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(&text) else {
             log::warn!("{} is not a JSON object — using defaults", path.display());
             return cfg;

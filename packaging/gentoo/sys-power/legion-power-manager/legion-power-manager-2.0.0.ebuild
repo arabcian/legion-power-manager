@@ -59,6 +59,7 @@ src_install() {
 	cmake_src_install
 
 	insinto /usr/share/polkit-1/actions
+	sed -i "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" packaging/polkit/* || die
 	doins packaging/polkit/com.legion-power-manager.policy
 	insinto /etc/polkit-1/rules.d
 	doins packaging/polkit/49-legion-power-manager.rules

@@ -137,10 +137,12 @@ void HomeTab::runNvidiaSmi(const QStringList &args, std::function<void(const QBy
     connect(p, &QProcess::errorOccurred, this, [p, onOk](QProcess::ProcessError e) {
         if (e == QProcess::FailedToStart) { onOk({}); p->deleteLater(); }
     });
-    p->start(exe, args);
-    t->start(SMI_TIMEOUT_MS);
+    // Mark before start(): a synchronous FailedToStart runs onOk (which
+    // clears smiLive_) inside start(), and must not be overwritten after.
     if (args.contains("--query-gpu=temperature.gpu,power.draw,clocks.current.graphics,utilization.gpu"))
         smiLive_ = p;
+    p->start(exe, args);
+    t->start(SMI_TIMEOUT_MS);
 }
 
 // ── Hardware box ────────────────────────────────────────────────────────────

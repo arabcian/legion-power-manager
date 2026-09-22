@@ -53,8 +53,10 @@ DESTDIR="$DESTDIR" cmake --install gui/build
 
 install -d "${own[@]}" -m 0755 "$DESTDIR$PREFIX/share/polkit-1/actions" "$DESTDIR/etc/polkit-1/rules.d" \
     "$DESTDIR/etc/init.d" "$DESTDIR/etc/nvcurve/profiles"
-install "${own[@]}" -m 0644 packaging/polkit/com.legion-power-manager.policy "$DESTDIR$PREFIX/share/polkit-1/actions/"
-install "${own[@]}" -m 0644 packaging/polkit/49-legion-power-manager.rules "$DESTDIR/etc/polkit-1/rules.d/"
+sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/com.legion-power-manager.policy > "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"
+[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"; chmod 0644 "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"
+sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/49-legion-power-manager.rules > "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
+[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"; chmod 0644 "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 # Service files carry @BINDIR@/@LIBEXEC@ so a non-/usr PREFIX points at the right binaries.
 subst() { sed -e "s|@BINDIR@|$PREFIX/bin|g" -e "s|@LIBEXEC@|$LIBEXEC|g" "$1"; }
 for s in nvcurve-autoload lpm-tune; do

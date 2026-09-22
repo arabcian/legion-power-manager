@@ -51,19 +51,8 @@ pub fn sysfs_write(path: &Path, data: &[u8]) -> io::Result<()> {
         .write(true)
         .truncate(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .or_else(|e| {
-            // O_NOFOLLOW is only meant to protect the last component; sysfs
-            // class entries may legitimately be symlinks at that level on some
-            // drivers. Retry without it -- the caller has already verified the
-            // canonical target lives under /sys.
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                std::fs::OpenOptions::new().write(true).truncate(true)
-                    .custom_flags(libc::O_CLOEXEC).open(path)
-            } else {
-                Err(e)
-            }
-        })?;
+        .open(path)?; // callers pass the canonical path; a symlink here is refused
+
     let n = f.write(data)?;
     if n != data.len() {
         return Err(io::Error::new(io::ErrorKind::WriteZero, "short write to sysfs"));

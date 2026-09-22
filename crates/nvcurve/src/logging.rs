@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 struct Logger { level: Level, capture: bool }
 
+const MAX_CAPTURE_LINES: usize = 1024;
 static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 impl Log for Logger {
@@ -14,7 +15,8 @@ impl Log for Logger {
         if !self.enabled(r.metadata()) { return; }
         let line = format!("{} {}: {}", r.level(), r.target(), r.args());
         if self.capture {
-            CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).push(line);
+            let mut c = CAPTURED.lock().unwrap_or_else(|p| p.into_inner());
+            if c.len() < MAX_CAPTURE_LINES { c.push(line); }
         } else {
             eprintln!("{line}");
         }
@@ -38,5 +40,6 @@ pub fn take_captured() -> Vec<String> {
 /// Level from $NVCURVE_LOG (error|warn|info|debug), default `default`.
 /// Only used by unprivileged binaries; the root helper ignores the env.
 pub fn level_from_env(default: Level) -> Level {
+    if unsafe { libc::geteuid() } == 0 { return default; }
     std::env::var("NVCURVE_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
