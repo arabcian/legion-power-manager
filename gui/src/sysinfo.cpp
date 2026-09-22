@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QSet>
+#include <fstream>
 #include <sys/utsname.h>
 
 namespace sysinfo {
@@ -27,15 +28,20 @@ Opt dmiClean(const QString &f) {
     return v->trimmed();
 }
 
+/// First line starting with `prefix` (case-insensitive). `field < 0` → the part
+/// after ':', otherwise the whitespace-separated field index.
+///
+/// Read with std::ifstream, not QFile: procfs files report size 0, and
+/// QFile::atEnd() trusts the size, so a `while (!f.atEnd())` loop never ran
+/// and /proc/cpuinfo looked empty ("unknown CPU", no Memory row).
 static Opt grepFile(const QString &path, const QString &prefix, int field) {
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return std::nullopt;
-    while (!f.atEnd()) {
-        const QString line = QString::fromUtf8(f.readLine());
-        if (line.startsWith(prefix, Qt::CaseInsensitive)) {
-            if (field < 0) return line.section(':', 1).trimmed();
-            return line.simplified().section(' ', field, field);
-        }
+    std::ifstream in(path.toStdString());
+    std::string raw;
+    while (std::getline(in, raw)) {
+        const QString line = QString::fromStdString(raw);
+        if (!line.startsWith(prefix, Qt::CaseInsensitive)) continue;
+        if (field < 0) return line.section(':', 1).trimmed();
+        return line.simplified().section(' ', field, field);
     }
     return std::nullopt;
 }
