@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub mod intel_uv;
 pub mod intel_uv_daemon;
+pub mod legion_wmi;
 pub mod tune;
 
 /// Reads at most `max` bytes from stdin. Returns Err with a ready-made

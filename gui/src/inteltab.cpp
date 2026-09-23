@@ -26,6 +26,7 @@
 #include <QSpinBox>
 #include <QStandardItemModel>
 #include <cmath>
+#include <utility>
 #include <QStandardPaths>
 #include <QTime>
 #include <QVBoxLayout>
@@ -130,6 +131,7 @@ IntelTab::IntelTab(QWidget *parent) : QWidget(parent) {
     connect(monTimer_, &QTimer::timeout, this, &IntelTab::pollMonitor);
     connect(monOn_, &QCheckBox::toggled, this, [this](bool on) {
         monPrev_ = {};
+        if (limRun_) limRun_->setText(on ? "Stop counting" : "Start counting");
         if (on && isVisible()) { monTimer_->start(); pollMonitor(); } else { monTimer_->stop(); monLbl_->clear(); }
     });
 
@@ -213,6 +215,61 @@ IntelTab::IntelTab(QWidget *parent) : QWidget(parent) {
     xg->addWidget(bTs, 4, 0, 1, 2);
     xg->setColumnStretch(1, 1);
     left->addWidget(xBox);
+
+    // ── limit reasons ──
+    auto *rBox = box("Limit reasons  (MSR 0x64F / 0x6B0 / 0x6B1)", "box_blue");
+    auto *rg = new QGridLayout(rBox);
+    rg->setVerticalSpacing(2);
+    rg->setHorizontalSpacing(14);
+    rg->addWidget(muted("Reason"), 0, 0);
+    const char *doms[] = {"core", "gpu", "ring"}, *domLabels[] = {"Core", "iGPU", "Ring"};
+    for (int d = 0; d < 3; ++d) rg->addWidget(muted(QString::fromLatin1(domLabels[d])), 0, d + 1, Qt::AlignRight);
+    // (bit, label, domains mask core|gpu|ring, tooltip) — SDM client definitions; a
+    // domain without that bit shows "–".
+    struct Reason { int bit; const char *label; int mask; const char *tip; };
+    static const Reason reasons[] = {
+        {0, "PROCHOT", 7, "External PROCHOT# (EC, charger, VRM) forced the minimum frequency."},
+        {1, "Thermal", 7, "Die temperature reached the TCC target (TjMax − TCC offset)."},
+        {5, "Avg thermal (RATL)", 7, "Running-average thermal limit."},
+        {6, "VR thermal alert", 7, "Voltage regulator over-temperature."},
+        {7, "VR TDC", 7, "VR thermal design current limit."},
+        {8, "EDP / IccMax", 7, "Electrical design point: the IccMax current limit (or other electrical limit) was hit."},
+        {10, "PL1", 7, "Package long-term power limit."},
+        {11, "PL2", 7, "Package short-term power limit."},
+        {12, "Max turbo / inefficient", 3, "Core: multi-core turbo ratio limit. iGPU: inefficient-operation limit."},
+        {13, "Turbo attenuation", 1, "Turbo transition attenuation (frequent turbo changes damped)."},
+        {4, "Residency regulation", 1, "Residency state regulation (C-state based)."},
+    };
+    int rr = 1;
+    for (const Reason &r : reasons) {
+        auto *name = new QLabel(QString::fromLatin1(r.label));
+        name->setToolTip(QString::fromLatin1(r.tip));
+        rg->addWidget(name, rr, 0);
+        for (int d = 0; d < 3; ++d) {
+            auto *c = new QLabel(r.mask & (1 << d) ? QStringLiteral("·") : QStringLiteral("–"));
+            c->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            c->setMinimumWidth(52);
+            c->setTextFormat(Qt::RichText);
+            rg->addWidget(c, rr, d + 1);
+            if (r.mask & (1 << d)) limCells_.insert(QStringLiteral("%1:%2").arg(QString::fromLatin1(doms[d])).arg(r.bit), c);
+        }
+        ++rr;
+    }
+    limInfo_ = muted("Counts samples (every 2 s) in which each reason limited the frequency. "
+                     "Red = limiting now, amber = happened (sticky log bit or counted).");
+    rg->addWidget(limInfo_, rr++, 0, 1, 4);
+    auto *lr2 = new QHBoxLayout;
+    limRun_ = new QPushButton("Start counting");
+    connect(limRun_, &QPushButton::clicked, this, [this] { monOn_->setChecked(!monOn_->isChecked()); });
+    auto *bLimReset = new QPushButton("Reset");
+    bLimReset->setToolTip("Zero the counters and clear the CPU's sticky log bits.");
+    connect(bLimReset, &QPushButton::clicked, this, &IntelTab::resetLimits);
+    lr2->addWidget(limRun_);
+    lr2->addWidget(bLimReset);
+    lr2->addStretch();
+    rg->addLayout(lr2, rr, 0, 1, 4);
+    rg->setColumnStretch(0, 1);
+    left->addWidget(rBox);
     left->addStretch();
 
     // ── limits ──
@@ -611,7 +668,8 @@ void IntelTab::saveBoot() {
 void IntelTab::pollMonitor() {
     if (busy_ || monInFlight_ || !isVisible()) return;
     monInFlight_ = true;
-    privileged::run(helperPath(), QJsonObject{{"op", "monitor"}}, this, [this](const privileged::Result &r) {
+    const bool clear = std::exchange(clearLogsNext_, false);
+    privileged::run(helperPath(), QJsonObject{{"op", "monitor"}, {"clear_logs", clear}}, this, [this](const privileged::Result &r) {
         monInFlight_ = false;
         if (!r.ok()) { monLbl_->setText(QStringLiteral("<span style='color:%1'>%2</span>").arg(theme::DANGER, r.message().toHtmlEscaped())); return; }
         showMonitor(r.json);
@@ -640,6 +698,37 @@ void IntelTab::showMonitor(const QJsonObject &s) {
     }
     monPrev_ = s;
     monLbl_->setText(parts.join(" · "));
+    updateLimits(s.value("limits").toObject());
+}
+
+void IntelTab::updateLimits(const QJsonObject &limits) {
+    if (limits.isEmpty()) {
+        limInfo_->setText("This CPU returned none of the limit-reason registers.");
+        return;
+    }
+    ++limSamples_;
+    for (auto it = limCells_.cbegin(); it != limCells_.cend(); ++it) {
+        const QString dom = it.key().section(':', 0, 0);
+        const int bit = it.key().section(':', 1).toInt();
+        if (!limits.contains(dom)) { it.value()->setText("n/a"); continue; }
+        const quint64 v = quint64(limits.value(dom).toDouble());
+        const bool now = (v >> bit) & 1, logged = (v >> (bit + 16)) & 1;
+        int &n = limCounts_[it.key()];
+        if (now) ++n;
+        const QString color = now ? theme::DANGER : (logged || n) ? theme::WARN : theme::MUTED;
+        it.value()->setText(QStringLiteral("<span style='color:%1'>● %2</span>").arg(color).arg(n));
+        it.value()->setToolTip(now ? "limiting now" : logged ? "happened since the last reset (sticky log bit)" : QString());
+    }
+    limInfo_->setText(QStringLiteral("%1 samples (~%2 s). Red = limiting now, amber = happened since reset.")
+                          .arg(limSamples_).arg(limSamples_ * MONITOR_MS / 1000));
+}
+
+void IntelTab::resetLimits() {
+    limCounts_.clear();
+    limSamples_ = 0;
+    clearLogsNext_ = true;  // the next monitor sample clears the sticky log bits
+    for (QLabel *c : std::as_const(limCells_)) { c->setText(QStringLiteral("·")); c->setToolTip({}); }
+    limInfo_->setText(monOn_->isChecked() ? QStringLiteral("Counters reset.") : QStringLiteral("Counters reset; press Start counting."));
 }
 
 // ── helper calls ────────────────────────────────────────────────────────────

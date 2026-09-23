@@ -49,6 +49,12 @@ create your config directories.
   and runs hwphint EPP switching by load or RAPL power.
   Without the GUI: `sudo lpm-intel-uv read | apply … | reset | monitor | measure |
   throttlestop FILE | turbo on|off | daemon`.
+- **GPU power limits without a firmware range (Firmware Attributes tab).**
+  `gpu_nv_ctgp`, `gpu_nv_ppab` and `gpu_nv_cpu_boost` are listed by
+  lenovo-wmi-other with min = max = 0, so the kernel rejects sysfs writes. The
+  tab writes these three through the Lenovo WMI method (\_SB.GZFD.WMAE) with
+  acpi_call instead and reads them back from it (boost limits 0–25 W, cTGP
+  unclamped for testing). Needs the acpi_call module.
 - **System tuning (Optimizations tab).** Pick a built-in preset (top dropdown),
   *Load*, review the checked rows, *Apply checked*. ★ *Use for games* wires it
   into Lutris/Steam (see the Game launch sub-tab for the exact hooks); ⏻ *Apply

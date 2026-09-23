@@ -29,6 +29,18 @@ static const QString BASE = qEnvironmentVariableIsSet("LPM_FWATTR_BASE")
 static constexpr int PROFILE_POLL_MS = 2000;
 
 static QString helperPath() { return privileged::helperPath(QStringLiteral("fwattr-helper")); }
+static QString gpuHelperPath() { return privileged::helperPath(QStringLiteral("legion-gpu-helper")); }
+
+// Attributes lenovo-wmi-other lists with min=max=step=0: the kernel rejects any
+// sysfs write to them (EINVAL). They are written through \_SB.GZFD.WMAE instead.
+// Ranges: Dynamic Boost ceiling/floor 0..25 W (as Legion Space shows them);
+// cTGP deliberately left wide (0..250 sanity cap) for testing.
+struct WmiKnob { const char *attr, *key; int lo, hi; };
+static const WmiKnob WMI_KNOBS[] = {
+    {"gpu_nv_ctgp", "ctgp", 0, 250},
+    {"gpu_nv_ppab", "boost_up", 0, 25},
+    {"gpu_nv_cpu_boost", "boost_down", 0, 25},
+};
 
 static std::optional<int> readInt(const QString &p) {
     auto s = pp::readText(p);
@@ -53,6 +65,9 @@ QList<FwAttr> FwattrTab::discover() {
             f.current = *cur; f.def = *def; f.min = *mn; f.max = *mx; f.step = std::max(*st, 1);
             // Some BIOS revisions report min=max=step=0 (gpu_nv_ctgp etc.): no usable range.
             f.ranged = !(*mn == 0 && *mx == 0 && *st == 0);
+            if (!f.ranged)
+                for (const WmiKnob &k : WMI_KNOBS)
+                    if (name == QLatin1String(k.attr)) { f.wmiKey = QString::fromLatin1(k.key); f.wmiMin = k.lo; f.wmiMax = k.hi; }
             out.append(f);
         }
     }
@@ -179,17 +194,20 @@ void FwattrTab::rebuild() {
                 auto *label = new QLabel(a.displayName);
                 QString tip = QStringLiteral("%1\nmin=%2  max=%3  step=%4  default=%5")
                                   .arg(a.name).arg(a.min).arg(a.max).arg(a.step).arg(a.def);
-                if (!a.ranged) tip += QStringLiteral("\n⚠ firmware reports no valid range for this attribute");
+                if (a.viaWmi()) tip += QStringLiteral("\n⚙ no firmware range — written via Lenovo WMI (acpi_call), range %1–%2").arg(a.wmiMin).arg(a.wmiMax);
+                else if (!a.ranged) tip += QStringLiteral("\n⚠ firmware reports no valid range for this attribute");
                 label->setToolTip(tip);
                 g->addWidget(label, r, 0);
 
                 QSlider *slider = nullptr;
-                if (a.ranged) {
+                const int lo = a.viaWmi() ? a.wmiMin : a.min, hi = a.viaWmi() ? a.wmiMax : a.max;
+                if (a.ranged || a.viaWmi()) {
                     slider = new QSlider(Qt::Horizontal);
-                    slider->setRange(a.min, a.max);
-                    slider->setSingleStep(a.step);
-                    slider->setPageStep(a.step);
+                    slider->setRange(lo, hi);
+                    slider->setSingleStep(a.viaWmi() ? 1 : a.step);
+                    slider->setPageStep(a.viaWmi() ? 1 : a.step);
                     slider->setValue(a.current);
+                    if (a.viaWmi()) slider->setStyleSheet(QStringLiteral("QSlider::sub-page:horizontal { background: %1; }").arg(theme::PURPLE));
                     g->addWidget(slider, r, 1);
                 } else {
                     auto *w = new QLabel(QStringLiteral("⚠ no range"));
@@ -198,7 +216,8 @@ void FwattrTab::rebuild() {
                 }
                 auto *spin = new QSpinBox;
                 spin->setFixedWidth(70);
-                if (a.ranged) { spin->setRange(a.min, a.max); spin->setSingleStep(a.step); }
+                if (a.viaWmi()) spin->setRange(a.wmiMin, a.wmiMax);
+                else if (a.ranged) { spin->setRange(a.min, a.max); spin->setSingleStep(a.step); }
                 else spin->setRange(0, std::max(a.current, a.def));
                 spin->setValue(a.current);
                 g->addWidget(spin, r, 2);
@@ -215,9 +234,26 @@ void FwattrTab::rebuild() {
                 connect(def, &QPushButton::clicked, spin, [spin, d = a.def] { spin->setValue(d); });
                 g->addWidget(def, r, 4);
                 // No authoritative range → nothing safe to offer: whole row disabled.
-                if (!a.ranged) { spin->setEnabled(false); apply->setEnabled(false); def->setEnabled(false); }
-                rows_.append({a, slider, spin});
+                if (!a.ranged && !a.viaWmi()) { spin->setEnabled(false); apply->setEnabled(false); def->setEnabled(false); }
+                if (a.viaWmi()) { spin->setEnabled(false); if (slider) slider->setEnabled(false); apply->setEnabled(false); }  // until readWmi confirms acpi_call
+                rows_.append({a, slider, spin, apply, def});
                 ++r;
+            }
+            // Explain the WMI rows right under the box that contains them.
+            bool anyWmi = false;
+            for (const FwAttr &a : items) anyWmi |= a.viaWmi();
+            if (anyWmi) {
+                auto *note = new QLabel(QStringLiteral(
+                    "<span style='color:%1'>⚙</span> <b>cTGP</b>, <b>power performance aware boost</b> and <b>GPU to CPU dynamic "
+                    "boost</b> are reported by the firmware without a valid range (min = max = 0), so the kernel refuses "
+                    "to write them through sysfs. These three are written directly through the Lenovo WMI method "
+                    "(<tt>\\_SB.GZFD.WMAE</tt>) with <tt>acpi_call</tt> and read back from it. Boost limits use 0–25 W; "
+                    "cTGP is left unclamped for testing — the GPU itself caps it (150 W on this model). "
+                    "Needs the <tt>acpi_call</tt> module.").arg(theme::PURPLE));
+                note->setTextFormat(Qt::RichText);
+                note->setWordWrap(true);
+                note->setProperty("role", "muted");
+                g->addWidget(note, r++, 0, 1, 5);
             }
             pl->addWidget(box);
         }
@@ -226,6 +262,7 @@ void FwattrTab::rebuild() {
         tabs_->addTab(scroll, it.key());
     }
     setBusy(false);
+    readWmi();
 }
 
 /// Value snapped onto the driver's min + k·step grid (the helper checks the
@@ -233,13 +270,15 @@ void FwattrTab::rebuild() {
 /// in firmware-specific ways, so it's never sent).
 int FwattrTab::snapped(const Row &r) const {
     const int v = r.spin->value();
-    if (!r.info.ranged || r.info.step <= 1) return v;
+    if (r.info.viaWmi() || !r.info.ranged || r.info.step <= 1) return v;
     const int k = qRound(double(v - r.info.min) / r.info.step);
     return std::clamp(r.info.min + k * r.info.step, r.info.min, r.info.max);
 }
 
 void FwattrTab::applyRow(int index) {
-    if (busy_ || locked_ || index < 0 || index >= rows_.size() || !rows_[index].info.ranged) return;
+    if (busy_ || locked_ || index < 0 || index >= rows_.size()) return;
+    if (rows_[index].info.viaWmi()) { applyWmi({index}); return; }
+    if (!rows_[index].info.ranged) return;
     const int value = snapped(rows_[index]);
     rows_[index].spin->setValue(value);
     const QString name = rows_[index].info.name, path = rows_[index].info.path;
@@ -259,10 +298,11 @@ void FwattrTab::applyRow(int index) {
 
 void FwattrTab::applyAll() {
     if (busy_ || locked_) return;
-    QList<int> changed;
+    QList<int> changed, wmiChanged;
     QJsonArray items;
     for (int i = 0; i < rows_.size(); ++i) {
         Row &r = rows_[i];
+        if (r.info.viaWmi()) { if (wmiReady_ && r.spin->value() != r.info.current) wmiChanged << i; continue; }
         if (!r.info.ranged) continue;
         const int v = snapped(r);
         r.spin->setValue(v);
@@ -270,11 +310,12 @@ void FwattrTab::applyAll() {
         changed << i;
         items.append(QJsonObject{{"path", r.info.path}, {"value", v}});
     }
-    if (changed.isEmpty()) { QMessageBox::information(this, "Apply All", "No changes to apply."); return; }
+    if (changed.isEmpty() && wmiChanged.isEmpty()) { QMessageBox::information(this, "Apply All", "No changes to apply."); return; }
+    if (changed.isEmpty()) { applyWmi(wmiChanged); return; }
 
     setBusy(true);
     privileged::run(helperPath(), QJsonDocument(items).toJson(QJsonDocument::Compact), this,
-        [this, changed](const privileged::Result &r) {
+        [this, changed, wmiChanged](const privileged::Result &r) {
             setBusy(false);
             if (!r.reached) { QMessageBox::critical(this, "Authorization failed", r.error); return; }
             const QJsonArray results = r.json.value("results").toArray();
@@ -289,5 +330,59 @@ void FwattrTab::applyAll() {
             if (failures.isEmpty()) showStatus(QStringLiteral("Applied %1 attribute(s)").arg(applied));
             else QMessageBox::warning(this, "Some writes failed",
                 QStringLiteral("%1/%2 attribute(s) applied.\n\nFailures:\n").arg(applied).arg(changed.size()) + failures.join('\n'));
+            if (!wmiChanged.isEmpty()) applyWmi(wmiChanged);
         });
+}
+
+void FwattrTab::applyWmi(const QList<int> &indices) {
+    if (busy_ || locked_ || indices.isEmpty()) return;
+    if (!wmiReady_) {
+        QMessageBox::warning(this, "acpi_call needed", "These attributes are written through acpi_call, which is not available.\n"
+                             "Load it with: modprobe acpi_call (Gentoo: emerge sys-power/acpi_call).");
+        return;
+    }
+    QJsonObject vals;
+    for (int i : indices) vals[rows_[i].info.wmiKey] = rows_[i].spin->value();
+    setBusy(true);
+    privileged::run(gpuHelperPath(), QJsonObject{{"op", "apply"}, {"values", vals}}, this,
+        [this, indices](const privileged::Result &r) {
+            setBusy(false);
+            if (!r.reached) { QMessageBox::critical(this, "Authorization failed", r.error); return; }
+            QStringList fails, oks;
+            for (const auto &x : r.json.value("results").toArray()) {
+                const QJsonObject o = x.toObject();
+                (o.value("ok").toBool() ? oks : fails) << o.value("message").toString();
+            }
+            if (!fails.isEmpty()) QMessageBox::warning(this, "WMI write failed", fails.join('\n'));
+            if (!oks.isEmpty()) showStatus(oks.join(" · "), 5000);
+            readWmi();  // show what the EC holds now
+        });
+}
+
+void FwattrTab::readWmi() {
+    bool any = false;
+    for (const Row &r : std::as_const(rows_)) any |= r.info.viaWmi();
+    if (!any || busy_) return;
+    privileged::run(gpuHelperPath(), QJsonObject{{"op", "status"}}, this, [this](const privileged::Result &r) {
+        wmiReady_ = r.reached && r.json.value("acpi").toBool();
+        const QJsonObject vals = r.json.value("values").toObject();
+        for (Row &row : rows_) {
+            if (!row.info.viaWmi()) continue;
+            const QJsonObject o = vals.value(row.info.wmiKey).toObject();
+            const bool have = wmiReady_ && o.contains("value");
+            if (have) {
+                const int v = o.value("value").toInt();
+                row.info.current = v;
+                // cTGP can hold values above its (test) range; widen rather than clip the display.
+                if (v > row.spin->maximum()) { row.spin->setMaximum(v); if (row.slider) row.slider->setMaximum(v); }
+                row.spin->setValue(v);
+            }
+            row.spin->setEnabled(have);
+            if (row.slider) row.slider->setEnabled(have);
+            if (row.apply) row.apply->setEnabled(have);
+            if (row.def) row.def->setEnabled(have);
+            if (!have) row.spin->setToolTip(wmiReady_ ? o.value("error").toString() : QStringLiteral("acpi_call not loaded"));
+        }
+        if (!wmiReady_ && r.reached) showStatus("acpi_call not loaded — the three WMI-handled GPU attributes are read-only (modprobe acpi_call).", 8000);
+    });
 }

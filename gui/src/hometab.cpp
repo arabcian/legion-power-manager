@@ -18,6 +18,7 @@
 #include <QHBoxLayout>
 #include <QJsonObject>
 #include <QLabel>
+#include <QFrame>
 #include <QMessageBox>
 #include <QProcess>
 #include <QPushButton>
@@ -321,6 +322,8 @@ QGroupBox *HomeTab::buildDeviceBox() {
         if (!toggles_.isEmpty()) g->addLayout(h, row++, 0, 1, 5);
     }
 
+    int bannerRow = -1;
+    if (!fanHwmon_.isEmpty()) bannerRow = row++;  // banner sits above the fan rows
     if (!fanHwmon_.isEmpty()) {
         const QDir d(fanHwmon_);
         for (const QString &f : d.entryList({"fan*_target"}, QDir::Files | QDir::System, QDir::Name)) {
@@ -336,7 +339,8 @@ QGroupBox *HomeTab::buildDeviceBox() {
                                             "the RPM column shows what it really runs at.\n"
                                             "Fan targets are usually honoured only in the Custom profile.").arg(top).arg(lo));
             auto *autoBox = new QCheckBox("Auto");
-            autoBox->setToolTip("Hand the fan back to the EC (writes 0).");
+            autoBox->setToolTip("Hand the fan back to the EC (writes 0). The EC resumes its own curve only when\n"
+                                "every fan is on Auto; while another fan is manual this one keeps its last speed.");
             auto *set = new QPushButton("Set");
             set->setFixedWidth(46);
             auto *rpm = muted(QString());
@@ -361,14 +365,13 @@ QGroupBox *HomeTab::buildDeviceBox() {
                 // Leaving Max: back to Auto (the safe state), user can untick Auto to type.
                 // If the EC's own Full Speed flag is what keeps it at max, clear that too.
                 autoBox->setChecked(true);
-                clearFullSpeed();
-                setDevice(key, "0");
+                setFanAuto(key);
             });
             connect(autoBox, &QCheckBox::clicked, this, [this, key, edit, set, maxBox, lo](bool on) {
                 maxBox->setChecked(false);
                 edit->setEnabled(!on);
                 set->setEnabled(!on);
-                if (on) { clearFullSpeed(); setDevice(key, "0"); return; }
+                if (on) { setFanAuto(key); return; }
                 // Leaving Auto: start from something sane and let the user adjust.
                 if (edit->text().isEmpty()) edit->setText(QString::number(lo > 0 ? lo : 2000));
                 edit->setFocus();
@@ -407,6 +410,37 @@ QGroupBox *HomeTab::buildDeviceBox() {
         connect(fullSpeed_, &QCheckBox::clicked, this, [this](bool on) { setDevice("fan_fullspeed", on ? "1" : "0"); });
         g->addWidget(muted("Fans"), row, 0);
         g->addWidget(fullSpeed_, row++, 1, 1, 4);
+    }
+    if (bannerRow >= 0 && !fans_.isEmpty()) {
+        maxBanner_ = new QFrame;
+        maxBanner_->setObjectName("maxBanner");
+        maxBanner_->setStyleSheet(QStringLiteral("#maxBanner { border: 1px solid %1; border-radius: 6px; background: rgba(230,160,60,0.10); }")
+                                      .arg(theme::WARN));
+        auto *bl = new QHBoxLayout(maxBanner_);
+        bl->setContentsMargins(10, 6, 8, 6);
+        maxBannerText_ = new QLabel;
+        maxBannerText_->setTextFormat(Qt::RichText);
+        maxBannerText_->setWordWrap(true);
+        maxBannerBtn_ = new QPushButton("Disable max fans");
+        maxBannerBtn_->setObjectName("btnAccent");
+        maxBannerBtn_->setToolTip("Return every fan to Auto (the EC only resumes its curve when all targets are 0).");
+        connect(maxBannerBtn_, &QPushButton::clicked, this, &HomeTab::exitMaxMode);
+        bl->addWidget(maxBannerText_, 1);
+        bl->addWidget(maxBannerBtn_);
+        maxBanner_->hide();
+        g->addWidget(maxBanner_, bannerRow, 0, 1, 5);
+
+        // Entry point: one click puts every fan at max (and so into the mode above).
+        maxAllBtn_ = new QPushButton("Max all fans");
+        maxAllBtn_->setToolTip("Set every fan to its maximum RPM. Controls lock until you press Disable max fans.");
+        connect(maxAllBtn_, &QPushButton::clicked, this, [this] {
+            for (const FanRow &f : std::as_const(fans_)) setDevice(f.key, QString::number(f.max));
+            setMaxMode(true, false);
+        });
+        auto *mh = new QHBoxLayout;
+        mh->addStretch(1);
+        mh->addWidget(maxAllBtn_);
+        g->addLayout(mh, row++, 0, 1, 5);
     }
     if (!fans_.isEmpty() || fullSpeed_) {
         fanWarn_ = new QLabel;
@@ -453,7 +487,9 @@ void HomeTab::refreshDevice() {
             looks &= tgt == 0 && f.max > 0 && f.max < 9999 && in >= f.max * 92 / 100;
         }
         fullSpeedGuess_ = looks ? fullSpeedGuess_ + 1 : 0;
-        suspect = fullSpeedGuess_ >= 2;
+        if (!fanTouched_ && fullSpeedGuess_ >= 2) fullSpeedAtStart_ = true;
+        if (!looks) fullSpeedAtStart_ = false;  // fans slowed down: whatever held them is gone
+        suspect = fullSpeedAtStart_;
         fullSpeedOn_ = suspect;
     }
     if (fullSpeed_) { QSignalBlocker b(fullSpeed_); fullSpeed_->setChecked(fs.value_or(false)); }
@@ -471,11 +507,22 @@ void HomeTab::refreshDevice() {
         fanWarn_->setVisible((fs && *fs) || suspect);
     }
 
+    bool allMax = !fans_.isEmpty();
+    for (const FanRow &f : std::as_const(fans_)) {
+        const int t = rdText(fanHwmon_ + '/' + f.key).toInt();
+        allMax &= f.max > 0 && t >= f.max;
+    }
+    const bool ecFs = fs && *fs;
+    setMaxMode(allMax || ecFs, ecFs && !allMax);
+
     for (const FanRow &f : fans_) {
         const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
         f.rpm->setText(rdText(fanHwmon_ + "/fan" + n + "_input") + " RPM");
         const int target = rdText(fanHwmon_ + '/' + f.key).toInt();
-        if (!f.target->hasFocus() && fullSpeedOn_) {
+        if (maxMode_) { f.maxBox->setChecked(true); f.autoBox->setChecked(false); continue; }
+        // Force the Max display only for a real (read) Full Speed, or an inferred one
+        // the user has not overridden yet; after a click the user's choice is shown.
+        if (!f.target->hasFocus() && ((fs && *fs) || (suspect && !fanTouched_))) {
             // target 0 would otherwise be shown as "Auto" while the EC holds the fans at max.
             f.maxBox->setChecked(true);
             f.autoBox->setChecked(false);
@@ -503,6 +550,76 @@ void HomeTab::refreshDevice() {
     }
 }
 
+void HomeTab::setMaxMode(bool on, bool ecFullSpeed) {
+    maxMode_ = on;
+    if (!maxBanner_) return;
+    maxBanner_->setVisible(on);
+    if (maxAllBtn_) maxAllBtn_->setVisible(!on);
+    if (on) {
+        maxBannerText_->setText(ecFullSpeed
+            ? QStringLiteral("<b>EC Full Speed is on</b> — all fans run at maximum. Fan controls are locked.")
+            : QStringLiteral("<b>Max fans</b> — every fan runs at its maximum. Fan controls are locked."));
+        maxBannerBtn_->setText(ecFullSpeed ? "Disable full speed" : "Disable max fans");
+    }
+    // Grey out every per-fan control (the RPM readout stays live).
+    for (const FanRow &f : std::as_const(fans_)) {
+        f.autoBox->setEnabled(!on);
+        f.maxBox->setEnabled(!on);
+        if (on) { f.target->setEnabled(false); f.set->setEnabled(false); }
+    }
+    if (fullSpeed_) fullSpeed_->setEnabled(!on || ecFullSpeed);
+}
+
+void HomeTab::exitMaxMode() {
+    clearFullSpeed();
+    // All targets to 0 together: the only state in which the EC takes the fans back.
+    for (const FanRow &f : std::as_const(fans_)) {
+        f.maxBox->setChecked(false);
+        f.autoBox->setChecked(true);
+        setDevice(f.key, "0");
+    }
+    setMaxMode(false, false);
+    showStatus("All fans back to Auto — the EC curve takes over as they spin down.", 6000);
+}
+
+void HomeTab::setFanAuto(const QString &key) {
+    QStringList manual;
+    for (const FanRow &f : std::as_const(fans_))
+        if (f.key != key && rdText(fanHwmon_ + '/' + f.key).toInt() > 0) manual << f.key;
+    int choice = manual.isEmpty() ? 2 : autoAllChoice_;
+    if (choice == 0) {
+        QMessageBox mb(QMessageBox::Question, "Fan to Auto",
+            "The EC hands the fans back to its own curve only when ALL fan targets are Auto.\n\n"
+            "While another fan stays manual, this fan keeps running at its current speed (e.g. max) "
+            "instead of slowing down. To slow only this fan, set a fixed RPM instead.",
+            QMessageBox::NoButton, this);
+        auto *all = mb.addButton("All fans to Auto", QMessageBox::AcceptRole);
+        auto *one = mb.addButton("Only this fan", QMessageBox::ActionRole);
+        mb.addButton(QMessageBox::Cancel);
+        auto *remember = new QCheckBox("Remember for this session");
+        mb.setCheckBox(remember);
+        mb.setDefaultButton(all);
+        mb.exec();
+        choice = mb.clickedButton() == all ? 1 : mb.clickedButton() == one ? 2 : 0;
+        if (choice && remember->isChecked()) autoAllChoice_ = choice;
+        if (!choice) { refreshDevice(); return; }  // cancelled: show the real state again
+    }
+    clearFullSpeed();
+    if (choice == 1) {
+        for (const FanRow &f : std::as_const(fans_)) {
+            f.autoBox->setChecked(true);
+            f.maxBox->setChecked(false);
+            f.target->setEnabled(false);
+            f.set->setEnabled(false);
+            setDevice(f.key, "0");
+        }
+        return;
+    }
+    setDevice(key, "0");
+    if (!manual.isEmpty())
+        showStatus("Fan set to Auto, but it keeps its last speed until every fan is on Auto (EC behaviour).", 8000);
+}
+
 std::optional<bool> HomeTab::readFullSpeed() const {
     if (fullSpeedFile_.isEmpty()) return std::nullopt;
     const QString v = rdText(fullSpeedFile_);
@@ -517,6 +634,7 @@ void HomeTab::clearFullSpeed() {
 }
 
 void HomeTab::setDevice(const QString &key, const QString &value) {
+    if (key.startsWith(QLatin1String("fan"))) fanTouched_ = true;  // also for queued writes
     // One pkexec at a time: rapid clicks would otherwise stack polkit dialogs
     // and race on the same sysfs file. Later clicks on a key replace earlier ones.
     if (devicePending_ > 0) {

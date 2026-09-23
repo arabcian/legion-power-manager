@@ -3,6 +3,7 @@
 // TCC offset and package power limits, via intel-uv-helper (pkexec).
 // Created only when the CPU vendor is GenuineIntel (see MainWindow).
 #include <QJsonArray>
+#include <QHash>
 #include <QJsonObject>
 #include <QWidget>
 #include <functional>
@@ -50,6 +51,8 @@ private:
     void saveBoot();
     void pollMonitor();
     void showMonitor(const QJsonObject &s);
+    void updateLimits(const QJsonObject &limits);
+    void resetLimits();
     QJsonArray hwpRules() const;
     void log(const QString &msg, const QString &level = "info");
 
@@ -80,5 +83,12 @@ private:
     QLabel *monLbl_ = nullptr;
     QTimer *monTimer_ = nullptr;
     QJsonObject monPrev_;
+    // perf-limit-reason counters (MSR 0x64F / 0x6B0 / 0x6B1)
+    QHash<QString, QLabel *> limCells_;   // "core:10" → cell
+    QHash<QString, int> limCounts_;       // samples in which the reason was active
+    QLabel *limInfo_ = nullptr;
+    QPushButton *limRun_ = nullptr;
+    int limSamples_ = 0;
+    bool clearLogsNext_ = false;
     bool busy_ = false, readOnce_ = false, monInFlight_ = false;
 };

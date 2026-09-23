@@ -51,7 +51,7 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper,legion-gpu-helper}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
 	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv}
@@ -97,6 +97,8 @@ pkg_postinst() {
 	elog "  systemd: systemctl enable lpm-intel-uv.service"
 	elog "  or the daemon (AC/battery switch, periodic re-apply, hwphint):"
 	elog "  OpenRC:  rc-update add lpm-intel-uv-daemon default / systemd: lpm-intel-uv-daemon.service"
+	elog "Experimental GPU power (Optimizations \u2192 Experimental, NVIDIA laptops) needs sys-power/acpi_call"
+	elog "  and the Custom platform profile; values are written via Lenovo WMI (\\WS-free)."
 	elog "Lutris hooks: /usr/bin/lpm-gamemode PRE / POST / RUN (see the Game launch sub-tab)."
 	elog "The Ryzen tab needs a root-owned ryzenadj in /usr/bin, /usr/sbin,"
 	elog "/usr/local/{bin,sbin} or /opt/ryzenadj."

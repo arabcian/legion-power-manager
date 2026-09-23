@@ -11,6 +11,7 @@
 #include <QComboBox>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QFrame>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -29,6 +30,7 @@
 #include <QScrollArea>
 #include <QSet>
 #include <QSpacerItem>
+#include <QSpinBox>
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QTabWidget>
@@ -419,6 +421,7 @@ QWidget *OptimizeTab::buildLaunchPage() {
                                        "profile is skipped. Test now: lpm-gamemode UNDERVOLT").arg(UNDERVOLT_PROFILE)), 1, 0, 1, 3);
     ug->setColumnStretch(2, 1);
     v->addWidget(uvBox);
+
 
     auto *topo = box("CPU topology", "box_blue");
     auto *tl = new QVBoxLayout(topo);

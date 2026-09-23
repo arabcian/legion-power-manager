@@ -42,6 +42,15 @@
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/intel-uv-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
+  <action id="com.legion-power-manager.gpu.power">
+    <description>Set experimental GPU power limits via Legion Power Manager</description>
+    <description xml:lang="tr">Legion Power Manager ile deneysel GPU güç limitlerini ayarla</description>
+    <message>Authentication is required to change the GPU power ceiling (EC table)</message>
+    <message xml:lang="tr">GPU güç tavanını değiştirmek için kimlik doğrulama gerekiyor (EC tablosu)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/legion-gpu-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
   <action id="com.legion-power-manager.profile.set">
     <description>Change the ACPI platform power profile</description>
     <description xml:lang="tr">ACPI platform güç profilini değiştir</description>

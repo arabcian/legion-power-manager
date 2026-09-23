@@ -13,6 +13,7 @@ class QComboBox;
 class QLineEdit;
 class QGridLayout;
 class QGroupBox;
+class QFrame;
 class QLabel;
 class QProcess;
 class QPushButton;
@@ -78,8 +79,26 @@ private:
     QLabel *fanWarn_ = nullptr;
     bool fullSpeedOn_ = false;           // last known / suspected state
     int fullSpeedGuess_ = 0;             // consecutive polls that look like Full Speed
+    // The RPM heuristic only means "firmware Full Speed" before this session has
+    // written any fan target: after our own Max → Auto the EC resets the
+    // targets to 0 while the fans are still spinning down, which looks the same.
+    bool fanTouched_ = false;
+    bool fullSpeedAtStart_ = false;      // detected before any write; sticky until the fans actually slow
     std::optional<bool> readFullSpeed() const;
     void clearFullSpeed();
+    // The Legion EC only returns fans to its own curve when every fan target is
+    // 0: with any fan still manual, a fan set to 0 just keeps its last speed.
+    void setFanAuto(const QString &key);
+    int autoAllChoice_ = 0;
+    // "Max fans" mode: every fan at its maximum (or EC Full Speed on). The per-fan
+    // controls are greyed out behind a banner; one button returns all to Auto.
+    QFrame *maxBanner_ = nullptr;
+    QLabel *maxBannerText_ = nullptr;
+    QPushButton *maxBannerBtn_ = nullptr;
+    QPushButton *maxAllBtn_ = nullptr;
+    bool maxMode_ = false;
+    void setMaxMode(bool on, bool ecFullSpeed);
+    void exitMaxMode();              // session memory: 0 ask, 1 all fans, 2 only this one
     int devicePending_ = 0;
     QList<QPair<QString, QString>> deviceQueue_;  // writes clicked while one is in flight
 };

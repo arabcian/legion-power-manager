@@ -40,6 +40,11 @@ pub const MSR_DRAM_ENERGY_STATUS: u64 = 0x619;
 pub const MSR_PP0_ENERGY_STATUS: u64 = 0x639;
 pub const MSR_PP1_ENERGY_STATUS: u64 = 0x641;
 pub const MSR_CONFIG_TDP_CONTROL: u64 = 0x64B;
+/// Frequency-limit reasons (SDM, client parts since Skylake): bits 15:0 are
+/// "limited now", bits 31:16 the matching sticky log (write 0 to clear).
+pub const MSR_CORE_PERF_LIMIT_REASONS: u64 = 0x64F;
+pub const MSR_GRAPHICS_PERF_LIMIT_REASONS: u64 = 0x6B0;
+pub const MSR_RING_PERF_LIMIT_REASONS: u64 = 0x6B1;
 /// undervolt.py --force allows any positive offset; capped here (overvolting
 /// beyond this has no stability use and only adds heat/wear).
 pub const UV_MAX_POSITIVE_MV: f64 = 250.0;
@@ -784,6 +789,17 @@ pub fn monitor_sample(msr: &Msr, clear_logs: bool) -> Value {
         }
         Err(e) => out["throttle"] = json!({"error": err_str(&e)}),
     }
+    // Raw low 32 bits per domain; the GUI decodes (status 15:0, log 31:16).
+    // An unimplemented register simply does not appear in the object.
+    let mut lim = Map::new();
+    for (name, addr) in [("core", MSR_CORE_PERF_LIMIT_REASONS), ("gpu", MSR_GRAPHICS_PERF_LIMIT_REASONS),
+                         ("ring", MSR_RING_PERF_LIMIT_REASONS)] {
+        if let Ok(v) = msr.read(addr) {
+            lim.insert(name.into(), json!(v & 0xFFFF_FFFF));
+            if clear_logs { let _ = msr.write(addr, 0); }
+        }
+    }
+    out["limits"] = Value::Object(lim);
     if let Ok(v) = msr.read(IA32_PERF_STATUS) {
         out["vcore_mv"] = json!((((v >> 32) & 0xFFFF) as f64 / 8192.0 * 1000.0).round());
     }

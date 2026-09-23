@@ -15,6 +15,11 @@ struct FwAttr {
     QString device, name, path, displayName;
     int current = 0, def = 0, min = 0, max = 0, step = 1;
     bool ranged = true;
+    // Unranged attributes the kernel refuses to write through sysfs, handled
+    // instead through the Lenovo WMI method via acpi_call (legion-gpu-helper).
+    QString wmiKey;              // helper knob key; empty = normal sysfs attribute
+    int wmiMin = 0, wmiMax = 0;  // range used for these (none from firmware)
+    bool viaWmi() const { return !wmiKey.isEmpty(); }
 };
 
 class FwattrTab : public QWidget {
@@ -28,9 +33,11 @@ public Q_SLOTS:
     void rebuild();
 
 private:
-    struct Row { FwAttr info; QSlider *slider; QSpinBox *spin; };
+    struct Row { FwAttr info; QSlider *slider; QSpinBox *spin; QPushButton *apply = nullptr; QPushButton *def = nullptr; };
     void applyRow(int index);
     void applyAll();
+    void applyWmi(const QList<int> &indices);  // write WMI-handled rows via legion-gpu-helper
+    void readWmi();                            // refresh their true values (WMAE get)
     void setBusy(bool busy);
     void showStatus(const QString &msg, int timeoutMs = 3000);
     int snapped(const Row &r) const;
@@ -40,5 +47,5 @@ private:
     QPushButton *applyAll_, *rescan_;
     QTabWidget *tabs_;
     QTimer *statusTimer_;
-    bool locked_ = false, busy_ = false;
+    bool locked_ = false, busy_ = false, wmiReady_ = false;
 };
