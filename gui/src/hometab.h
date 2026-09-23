@@ -8,6 +8,9 @@
 #include <optional>
 
 class QButtonGroup;
+class QCheckBox;
+class QComboBox;
+class QLineEdit;
 class QGridLayout;
 class QGroupBox;
 class QLabel;
@@ -40,6 +43,9 @@ private:
     void updateDescription(const std::optional<QString> &profile);
     QGroupBox *buildHardwareBox();
     QGroupBox *buildLiveBox();
+    QGroupBox *buildDeviceBox();  // nullptr when the machine exposes none of it
+    void refreshDevice();
+    void setDevice(const QString &key, const QString &value);
     void runNvidiaSmi(const QStringList &args, std::function<void(const QByteArray &)> onOk);
 
     std::optional<pp::Handler> handler_;
@@ -56,4 +62,12 @@ private:
     QLabel *gpuLiveKey_ = nullptr, *gpuLiveValue_ = nullptr;
     QLabel *gpuHwKey_ = nullptr, *gpuHwValue_ = nullptr;
     QProcess *smiLive_ = nullptr;
+
+    // Device box (battery charge mode, ideapad toggles, fan targets)
+    QString chargeFile_, ideapadDir_, fanHwmon_;
+    QComboBox *charge_ = nullptr;
+    QHash<QString, QCheckBox *> toggles_;
+    struct FanRow { QString key; QLabel *rpm; QLineEdit *target; QCheckBox *autoBox; QCheckBox *maxBox; QPushButton *set; int max; };
+    QList<FanRow> fans_;
+    int devicePending_ = 0;
 };

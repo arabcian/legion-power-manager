@@ -28,6 +28,9 @@ Opt storage();
 Opt power();
 Opt igpu();
 Opt battery();
+Opt cpuPackagePower();  // powercap RAPL energy delta between calls
+Opt usbcInputs();       // UCSI power-delivery sources that are online
+Opt gpuMode();          // "Hybrid" / "dGPU only (MUX)"
 
 // nvidia-smi output parsers (the process itself is run by the caller)
 Opt parseGpuName(const QByteArray &out);

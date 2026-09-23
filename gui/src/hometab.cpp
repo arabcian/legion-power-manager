@@ -5,7 +5,16 @@
 
 #include <QButtonGroup>
 #include <QGridLayout>
+#include <QAbstractItemView>
+#include <QCheckBox>
+#include <QFileInfo>
+#include <QComboBox>
+#include <QDir>
 #include <QGroupBox>
+#include <QIntValidator>
+#include <QJsonObject>
+#include <QLineEdit>
+#include <QSignalBlocker>
 #include <QHBoxLayout>
 #include <QJsonObject>
 #include <QLabel>
@@ -85,18 +94,27 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
     grid_->setHorizontalSpacing(8);
     grid_->setVerticalSpacing(4);
 
-    auto *columns = new QHBoxLayout;
-    columns->setSpacing(10);
-    auto *left = new QVBoxLayout;
-    left->setSpacing(10);
-    left->addWidget(buildHardwareBox(), 1);
-    left->addWidget(profileBox, 1);
-    columns->addLayout(left, 1);
-    columns->addWidget(buildLiveBox(), 1);
-    root->addLayout(columns, 1);
-
+    // One line, fixed height, elided: messages never push the boxes around.
     status_ = muted(QString());
-    root->addWidget(status_);
+    status_->setFixedHeight(status_->fontMetrics().height() + 2);
+    status_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+
+    // 2×2 grid, every cell the same size.
+    auto *cells = new QGridLayout;
+    cells->setSpacing(10);
+    QGroupBox *dev = buildDeviceBox();  // hosts status_ when present
+    const QList<QWidget *> boxes{buildHardwareBox(), buildLiveBox(), profileBox, dev};
+    for (int i = 0; i < boxes.size(); ++i) {
+        if (!boxes[i]) continue;
+        boxes[i]->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        cells->addWidget(boxes[i], i / 2, i % 2);
+    }
+    cells->setRowStretch(0, 1);
+    cells->setRowStretch(1, 1);
+    cells->setColumnStretch(0, 1);
+    cells->setColumnStretch(1, 1);
+    root->addLayout(cells, 1);
+    if (!dev) root->addWidget(status_);
     statusTimer_ = new QTimer(this);
     statusTimer_->setSingleShot(true);
     connect(statusTimer_, &QTimer::timeout, status_, [this] { status_->clear(); });
@@ -172,6 +190,7 @@ QGroupBox *HomeTab::buildHardwareBox() {
     add("CPU", sysinfo::cpuModel());
     add("GPU", QStringLiteral("…"), &gpuHwKey_, &gpuHwValue_);
     add("Memory", sysinfo::ramTotal());
+    add("GPU mode", sysinfo::gpuMode());
     add("BIOS", sysinfo::biosInfo());
     add("EC Firmware", sysinfo::dmiClean("ec_firmware_release"));
     g->setColumnStretch(1, 1);
@@ -197,6 +216,7 @@ QGroupBox *HomeTab::buildLiveBox() {
     const QList<QPair<QString, std::function<std::optional<QString>()>>> spec{
         {"CPU Temp", sysinfo::cpuTemp}, {"GPU", nullptr}, {"iGPU", sysinfo::igpu},
         {"Fans", sysinfo::fans}, {"Storage", sysinfo::storage}, {"Power", sysinfo::power},
+        {"CPU Power", sysinfo::cpuPackagePower}, {"USB-C in", sysinfo::usbcInputs},
         {"Battery", sysinfo::battery}};
     int row = 0;
     for (const auto &[name, getter] : spec) {
@@ -230,6 +250,7 @@ void HomeTab::refreshLive() {
     // particular wakes the dGPU out of D3cold.
     if (!isVisible()) return;
     for (const LiveRow &r : liveRows_) r.value->setText(r.getter().value_or(QStringLiteral("—")));
+    refreshDevice();
     if (smiLive_) return;  // previous query still running — never stack them
     runNvidiaSmi({"--query-gpu=temperature.gpu,power.draw,clocks.current.graphics,utilization.gpu",
                   "--format=csv,noheader,nounits"},
@@ -245,10 +266,184 @@ void HomeTab::refreshLive() {
                  });
 }
 
+// ── Device box ──────────────────────────────────────────────────────────────
+
+static QString rdText(const QString &p) { return pp::readText(p).value_or(QString()); }
+
+static QString findDir(const QString &base, const std::function<bool(const QString &)> &pred) {
+    const QDir d(base);
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name))
+        if (pred(d.filePath(e))) return d.filePath(e);
+    return {};
+}
+
+QGroupBox *HomeTab::buildDeviceBox() {
+    const QString bat = findDir("/sys/class/power_supply", [](const QString &p) {
+        return rdText(p + "/type") == "Battery" && QFileInfo(p + "/charge_types").isFile(); });
+    if (!bat.isEmpty()) chargeFile_ = bat + "/charge_types";
+    ideapadDir_ = findDir("/sys/bus/platform/drivers/ideapad_acpi", [](const QString &p) {
+        return QFileInfo(p).fileName().startsWith("VPC"); });
+    fanHwmon_ = findDir("/sys/class/hwmon", [](const QString &p) { return rdText(p + "/name") == "lenovo_wmi_other"; });
+
+    auto *box = new QGroupBox("Device");
+    auto *g = new QGridLayout(box);
+    g->setContentsMargins(8, 4, 8, 6);
+    g->setHorizontalSpacing(8);
+    g->setVerticalSpacing(4);
+    int row = 0;
+
+    if (!chargeFile_.isEmpty()) {
+        charge_ = new QComboBox;
+        charge_->setToolTip("Battery charge mode.\nLong_Life = stop around 80% (conservation), best while mostly plugged in.\n"
+                            "Standard = full charge.  Fast = rapid charge, more heat and wear.");
+        for (const QString &w : rdText(chargeFile_).split(' ', Qt::SkipEmptyParts)) {
+            const QString o = QString(w).remove('[').remove(']');
+            charge_->addItem(QString(o).replace('_', ' '), o);
+        }
+        connect(charge_, &QComboBox::activated, this, [this](int i) { setDevice("charge_type", charge_->itemData(i).toString()); });
+        g->addWidget(muted("Battery charge"), row, 0);
+        g->addWidget(charge_, row++, 1, 1, 4);
+    }
+
+    if (!ideapadDir_.isEmpty()) {
+        const QList<QPair<QString, QString>> spec{
+            {"fn_lock", "Fn lock"}, {"camera_power", "Camera"}, {"usb_charging", "USB charging when off"}};
+        auto *h = new QHBoxLayout;
+        h->setSpacing(12);
+        for (const auto &[key, label] : spec) {
+            if (!QFileInfo(ideapadDir_ + '/' + key).isFile()) continue;
+            auto *cb = new QCheckBox(label);
+            connect(cb, &QCheckBox::clicked, this, [this, key](bool on) { setDevice(key, on ? "1" : "0"); });
+            toggles_.insert(key, cb);
+            h->addWidget(cb);
+        }
+        h->addStretch(1);
+        if (!toggles_.isEmpty()) g->addLayout(h, row++, 0, 1, 5);
+    }
+
+    if (!fanHwmon_.isEmpty()) {
+        const QDir d(fanHwmon_);
+        for (const QString &f : d.entryList({"fan*_target"}, QDir::Files | QDir::System, QDir::Name)) {
+            const QString n = f.mid(3, f.indexOf('_') - 3);
+            const int lo = rdText(d.filePath("fan" + n + "_min")).toInt(), hi = rdText(d.filePath("fan" + n + "_max")).toInt();
+            const int top = hi > 0 ? hi : 9999;
+            auto *edit = new QLineEdit;
+            edit->setValidator(new QIntValidator(1, top, edit));
+            edit->setPlaceholderText(QStringLiteral("RPM"));
+            edit->setMaximumWidth(80);
+            edit->setToolTip(QStringLiteral("Type a target RPM (1–%1) and press Enter or Set.\n"
+                                            "Firmware-reported range is %2–%1; below %2 the EC may clamp it —\n"
+                                            "the RPM column shows what it really runs at.\n"
+                                            "Fan targets are usually honoured only in the Custom profile.").arg(top).arg(lo));
+            auto *autoBox = new QCheckBox("Auto");
+            autoBox->setToolTip("Hand the fan back to the EC (writes 0).");
+            auto *set = new QPushButton("Set");
+            set->setFixedWidth(46);
+            auto *rpm = muted(QString());
+            const QString key = f;
+            auto apply = [this, key, edit] {
+                if (!edit->hasAcceptableInput()) { showStatus("Enter an RPM value first", 4000); return; }
+                setDevice(key, QString::number(edit->text().toInt()));
+                edit->clearFocus();
+            };
+            connect(set, &QPushButton::clicked, this, apply);
+            connect(edit, &QLineEdit::returnPressed, this, apply);
+            auto *maxBox = new QCheckBox("Max");
+            maxBox->setToolTip(QStringLiteral("Run this fan at its maximum, %1 RPM.").arg(top));
+            connect(maxBox, &QCheckBox::clicked, this, [this, key, edit, set, autoBox, top](bool on) {
+                if (on) {
+                    autoBox->setChecked(false);
+                    edit->setEnabled(false);
+                    set->setEnabled(false);
+                    setDevice(key, QString::number(top));
+                    return;
+                }
+                // Leaving Max: back to Auto (the safe state), user can untick Auto to type.
+                autoBox->setChecked(true);
+                setDevice(key, "0");
+            });
+            connect(autoBox, &QCheckBox::clicked, this, [this, key, edit, set, maxBox, lo](bool on) {
+                maxBox->setChecked(false);
+                edit->setEnabled(!on);
+                set->setEnabled(!on);
+                if (on) { setDevice(key, "0"); return; }
+                // Leaving Auto: start from something sane and let the user adjust.
+                if (edit->text().isEmpty()) edit->setText(QString::number(lo > 0 ? lo : 2000));
+                edit->setFocus();
+                edit->selectAll();
+            });
+            g->addWidget(muted("Fan " + n), row, 0);
+            g->addWidget(rpm, row, 1);
+            auto *modes = new QHBoxLayout;
+            modes->setSpacing(8);
+            modes->addWidget(autoBox);
+            modes->addWidget(maxBox);
+            g->addLayout(modes, row, 2);
+            g->addWidget(edit, row, 3);
+            g->addWidget(set, row++, 4);
+            fans_.append({key, rpm, edit, autoBox, maxBox, set, top});
+        }
+    }
+
+    if (row == 0) { delete box; return nullptr; }
+    g->setRowStretch(row++, 1);
+    g->addWidget(status_, row++, 0, 1, 5);
+    g->setColumnStretch(1, 1);
+    refreshDevice();
+    return box;
+}
+
+void HomeTab::refreshDevice() {
+    if (devicePending_ > 0) return;  // a write is in flight; its callback refreshes
+    if (charge_ && !charge_->view()->isVisible()) {
+        const QString raw = rdText(chargeFile_);
+        const int a = raw.indexOf('['), b = raw.indexOf(']');
+        if (a >= 0 && b > a) {
+            QSignalBlocker blk(charge_);
+            charge_->setCurrentIndex(charge_->findData(raw.mid(a + 1, b - a - 1)));
+        }
+    }
+    for (auto it = toggles_.cbegin(); it != toggles_.cend(); ++it) {
+        QSignalBlocker blk(it.value());
+        it.value()->setChecked(rdText(ideapadDir_ + '/' + it.key()) == "1");
+    }
+    for (const FanRow &f : fans_) {
+        const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
+        f.rpm->setText(rdText(fanHwmon_ + "/fan" + n + "_input") + " RPM");
+        const int target = rdText(fanHwmon_ + '/' + f.key).toInt();
+        if (!f.target->hasFocus()) {
+            // Auto only reflects the hardware while the user is not mid-edit
+            // (unticked Auto + empty box = about to type a value).
+            f.maxBox->setChecked(target > 0 && target >= f.max);
+            if (target > 0) {
+                f.autoBox->setChecked(false);
+                f.target->setText(QString::number(target));
+            } else if (f.autoBox->isChecked() || f.target->text().isEmpty() || f.target->isEnabled() == false) {
+                f.autoBox->setChecked(true);
+            }
+            const bool locked = f.autoBox->isChecked() || f.maxBox->isChecked();
+            f.target->setEnabled(!locked);
+            f.set->setEnabled(!locked);
+        }
+    }
+}
+
+void HomeTab::setDevice(const QString &key, const QString &value) {
+    ++devicePending_;
+    const QJsonObject req{{"device", key}, {"value", value}};
+    privileged::run(helperPath(), req, this, [this, key](const privileged::Result &r) {
+        --devicePending_;
+        if (r.ok()) showStatus(QStringLiteral("%1 → %2").arg(key, r.json.value("effective").toString()));
+        else showStatus(QStringLiteral("%1 failed: %2").arg(key, r.message()), 8000);
+        refreshDevice();  // shows what the hardware actually holds, success or not
+    });
+}
+
 // ── Profile buttons ─────────────────────────────────────────────────────────
 
 void HomeTab::showStatus(const QString &msg, int timeoutMs) {
-    status_->setText(msg);
+    status_->setText(status_->fontMetrics().elidedText(msg, Qt::ElideRight, qMax(50, status_->width())));
+    status_->setToolTip(msg);
     if (timeoutMs) statusTimer_->start(timeoutMs);
 }
 

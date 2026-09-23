@@ -1,4 +1,6 @@
 #include "sysinfo.h"
+#include <QElapsedTimer>
+#include <QHash>
 #include "platformprofile.h"
 #include <QDir>
 #include <QFile>
@@ -199,6 +201,69 @@ Opt battery() {
         if (auto uv = rdInt(p + "/voltage_now")) b << QStringLiteral("%1V").arg(*uv / 1e6, 0, 'f', 2);
         return joined(b);
     }
+    return std::nullopt;
+}
+
+Opt cpuPackagePower() {
+    // energy_uj is a free-running counter: power = Δenergy / Δt between two polls.
+    struct Sample { long long uj = -1; qint64 ms = 0; };
+    static QHash<QString, Sample> last;
+    static QElapsedTimer clock;
+    if (!clock.isValid()) clock.start();
+    const QDir d(QStringLiteral("/sys/class/powercap"));
+    QStringList l;
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
+        if (e.count(':') < 1 || e.count(':') > 2) continue;  // intel-rapl:0 (package), intel-rapl:0:0 (core)
+        const QString p = d.filePath(e);
+        const auto uj = rdInt(p + "/energy_uj");
+        const auto name = rd(p + "/name");
+        if (!uj || !name) continue;
+        Sample &s = last[p];
+        const qint64 now = clock.elapsed();
+        if (s.uj >= 0 && now > s.ms && *uj >= s.uj) {
+            const double w = double(*uj - s.uj) / double(now - s.ms) / 1000.0;
+            l << QStringLiteral("%1 %2 W").arg(name->section('-', 0, 0), QString::number(w, 'f', 1));
+        } else if (s.uj < 0) {
+            l << QStringLiteral("%1 …").arg(name->section('-', 0, 0));
+        }
+        s = {*uj, now};
+    }
+    return joined(l);
+}
+
+Opt usbcInputs() {
+    const QDir d(QStringLiteral("/sys/class/power_supply"));
+    QStringList l;
+    bool any = false;
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
+        if (!e.startsWith(QStringLiteral("ucsi-source-psy"))) continue;
+        any = true;
+        const QString p = d.filePath(e);
+        if (rdInt(p + "/online").value_or(0) != 1) continue;
+        const auto uv = rdInt(p + "/voltage_now"), ua = rdInt(p + "/current_now");
+        const QString port = QStringLiteral("Port %1").arg(e.section(':', -1).toInt());
+        if (uv && ua && *uv > 0 && *ua > 0)
+            l << QStringLiteral("%1 %2 W (%3 V)").arg(port).arg(*uv / 1e6 * (*ua / 1e6), 0, 'f', 1).arg(*uv / 1e6, 0, 'f', 0);
+        else
+            l << port + QStringLiteral(" connected");
+    }
+    if (!any) return std::nullopt;  // no UCSI at all: row hidden
+    return l.isEmpty() ? Opt(QStringLiteral("none")) : joined(l);
+}
+
+Opt gpuMode() {
+    // Display-class PCI functions: an AMD one next to the NVIDIA one = hybrid.
+    const QDir d(QStringLiteral("/sys/bus/pci/devices"));
+    bool amd = false, nv = false;
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System)) {
+        const QString p = d.filePath(e);
+        if (!rd(p + "/class").value_or(QString()).startsWith(QStringLiteral("0x03"))) continue;
+        const QString v = rd(p + "/vendor").value_or(QString());
+        amd |= v == QStringLiteral("0x1002");
+        nv |= v == QStringLiteral("0x10de");
+    }
+    if (amd && nv) return QStringLiteral("Hybrid (iGPU + dGPU)");
+    if (nv) return QStringLiteral("dGPU only (MUX) — iGPU disabled in firmware");
     return std::nullopt;
 }
 
