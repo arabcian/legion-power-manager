@@ -429,12 +429,24 @@ void HomeTab::refreshDevice() {
 }
 
 void HomeTab::setDevice(const QString &key, const QString &value) {
+    // One pkexec at a time: rapid clicks would otherwise stack polkit dialogs
+    // and race on the same sysfs file. Later clicks on a key replace earlier ones.
+    if (devicePending_ > 0) {
+        for (auto &q : deviceQueue_) if (q.first == key) { q.second = value; return; }
+        deviceQueue_.append({key, value});
+        return;
+    }
     ++devicePending_;
     const QJsonObject req{{"device", key}, {"value", value}};
     privileged::run(helperPath(), req, this, [this, key](const privileged::Result &r) {
         --devicePending_;
         if (r.ok()) showStatus(QStringLiteral("%1 → %2").arg(key, r.json.value("effective").toString()));
         else showStatus(QStringLiteral("%1 failed: %2").arg(key, r.message()), 8000);
+        if (!deviceQueue_.isEmpty()) {
+            const auto next = deviceQueue_.takeFirst();
+            setDevice(next.first, next.second);
+            return;
+        }
         refreshDevice();  // shows what the hardware actually holds, success or not
     });
 }

@@ -5,6 +5,14 @@
 #   sudo ./install.sh --remove-legacy  also remove the old Python install
 #   DESTDIR=/tmp/stage ./install.sh --no-build   stage only (packaging)
 #
+# Build optimizations (local build → tuned for this machine by default):
+#   --no-native   portable binaries (no -march=native / -C target-cpu=native)
+#   --no-lto      disable link-time optimization for the GUI (Rust always uses fat LTO)
+#   --no-pgo      skip the profile-guided GUI build (default: instrumented build,
+#                 offscreen training
+#                 run over every tab, then the final build with the profile)
+#   --no-harden   drop stack protector / FORTIFY=3 / CET / full RELRO / PIE on the GUI
+#
 # Layout:
 #   /usr/bin/legion-power-manager                   GUI (Qt6)
 #   /usr/bin/nvcurve                                nvcurve CLI (Rust)
@@ -23,11 +31,16 @@ PREFIX=${PREFIX:-/usr}
 DESTDIR=${DESTDIR:-}
 LIBEXEC="$PREFIX/libexec/legion-power-manager"
 UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
-BUILD=1 LEGACY=0
+BUILD=1 LEGACY=0 NATIVE=1 LTO=1 PGO=1 HARDEN=1
 for a in "$@"; do
     case "$a" in
         --no-build) BUILD=0 ;;
         --remove-legacy) LEGACY=1 ;;
+        --no-native) NATIVE=0 ;;
+        --no-lto) LTO=0 ;;
+        --pgo) PGO=1 ;;
+        --no-pgo) PGO=0 ;;
+        --no-harden) HARDEN=0 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
@@ -35,11 +48,43 @@ done
 
 as_user() { if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then sudo -u "$SUDO_USER" "$@"; else "$@"; fi; }
 
+onoff() { (( $1 )) && echo ON || echo OFF; }
+
 if (( BUILD )); then
-    as_user cargo build --release --locked
-    as_user cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-        -DLPM_HELPER_DIR="$LIBEXEC"
-    as_user cmake --build gui/build -j"$(nproc)"
+    # ── Rust: fat LTO + codegen-units=1 + panic=abort come from Cargo.toml ──
+    rustflags=${RUSTFLAGS:-}
+    (( NATIVE )) && rustflags+=" -C target-cpu=native"
+    as_user env RUSTFLAGS="$rustflags" cargo build --release --locked
+
+    # ── GUI ──
+    gui_cmake() {  # gui_cmake <builddir> <pgo-mode>
+        as_user cmake -S gui -B "$1" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DLPM_HELPER_DIR="$LIBEXEC" -DLPM_LTO="$(onoff $LTO)" -DLPM_NATIVE="$(onoff $NATIVE)" \
+            -DLPM_HARDEN="$(onoff $HARDEN)" -DLPM_PGO="$2" -DLPM_PGO_DIR="$PWD/gui/build-pgo/profile"
+        as_user cmake --build "$1" -j"$(nproc)"
+    }
+    if (( PGO )); then
+        rm -rf gui/build-pgo gui/build
+        gui_cmake gui/build-pgo generate
+        echo ">> PGO training run (offscreen, every tab)…"
+        # Private runtime dir: the single-instance lock must not see a running GUI.
+        rt=$(as_user mktemp -d)
+        as_user env QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$rt" LPM_PGO_TRAIN=5 \
+            timeout 180 gui/build-pgo/legion-power-manager >/dev/null 2>&1 || true
+        rm -rf "$rt"
+        prof=gui/build-pgo/profile
+        if compgen -G "$prof/*.profraw" >/dev/null; then    # clang
+            as_user llvm-profdata merge -o "$prof/default.profdata" "$prof"/*.profraw
+        fi
+        if [[ -z $(find "$prof" -type f 2>/dev/null | head -1) ]]; then
+            echo "!! training produced no profile — building without PGO" >&2
+            gui_cmake gui/build ""
+        else
+            gui_cmake gui/build use
+        fi
+    else
+        gui_cmake gui/build ""
+    fi
 fi
 
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()

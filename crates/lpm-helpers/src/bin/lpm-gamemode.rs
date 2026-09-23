@@ -34,6 +34,7 @@ const MAX_PRESET_BYTES: u64 = 256 * 1024;
 
 /// Exact, case-sensitive profile name looked up in both curve tools.
 const UNDERVOLT_PROFILE: &str = "GAMING";
+const PKEXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const UNDERVOLT_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 /// Same directory nvcurve-root-helper applies from.
 const NVCURVE_PROFILES: &str = "/etc/nvcurve/profiles";
@@ -88,7 +89,19 @@ fn pkexec_helper(helper: &str, req: &Value) -> Result<Value, String> {
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("pkexec: {e}"))?;
     child.stdin.take().unwrap().write_all(req.to_string().as_bytes()).map_err(|e| format!("pkexec stdin: {e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("pkexec: {e}"))?;
+    // Game hooks run without a terminal and often without a polkit agent in
+    // reach: never let a stuck authorization block the game launch forever.
+    let pid = child.id() as libc::pid_t;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    let out = match rx.recv_timeout(PKEXEC_TIMEOUT) {
+        Ok(r) => r.map_err(|e| format!("pkexec: {e}"))?,
+        Err(_) => {
+            // Still waiting for authorization -> pkexec keeps the caller's real uid and can be signalled.
+            unsafe { libc::kill(pid, libc::SIGTERM); }
+            return Err(format!("{short}: no answer within {} s (authorization pending?) — skipped", PKEXEC_TIMEOUT.as_secs()));
+        }
+    };
     let text = String::from_utf8_lossy(&out.stdout);
     match text.lines().last().and_then(|l| serde_json::from_str::<Value>(l).ok()) {
         Some(v) => Ok(v),

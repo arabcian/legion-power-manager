@@ -86,7 +86,17 @@ Opt systemInfo() {
 
 struct Chip { QString name, path; };
 
+// hwmon chips only appear/disappear on module load or hot-plug; rescanning the
+// directory (plus every name file) for each of the 2 s Live getters is waste.
+static QList<Chip> scanChips();
 static QList<Chip> chips() {
+    static QList<Chip> cache;
+    static QElapsedTimer age;
+    if (!age.isValid() || age.elapsed() > 30000 || cache.isEmpty()) { cache = scanChips(); age.restart(); }
+    return cache;
+}
+
+static QList<Chip> scanChips() {
     QList<Chip> out;
     const QDir d(QStringLiteral("/sys/class/hwmon"));
     for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {

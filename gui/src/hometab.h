@@ -70,4 +70,5 @@ private:
     struct FanRow { QString key; QLabel *rpm; QLineEdit *target; QCheckBox *autoBox; QCheckBox *maxBox; QPushButton *set; int max; };
     QList<FanRow> fans_;
     int devicePending_ = 0;
+    QList<QPair<QString, QString>> deviceQueue_;  // writes clicked while one is in flight
 };

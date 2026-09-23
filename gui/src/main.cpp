@@ -82,7 +82,8 @@ int main(int argc, char **argv) {
 
     const QStringList args = app.arguments();
     if (args.contains("--version") || args.contains("-V")) { std::printf("legion-power-manager %s\n", LPM_VERSION); return 0; }
-    const bool withWindow = args.contains("--window") || qEnvironmentVariableIsSet("LPM_SCREENSHOT");
+    const bool withWindow = args.contains("--window") || qEnvironmentVariableIsSet("LPM_SCREENSHOT")
+                            || qEnvironmentVariableIsSet("LPM_PGO_TRAIN");
 
     // Taken before any window, tray or helper exists; held until main() returns.
     QLockFile lock(lockPath());
@@ -130,5 +131,18 @@ int main(int argc, char **argv) {
     // Dev aid: LPM_SCREENSHOT=/path.png renders the window once and exits.
     if (const QByteArray shot = qgetenv("LPM_SCREENSHOT"); !shot.isEmpty())
         QTimer::singleShot(1500, &app, [&win, &app, shot] { win.grab().save(QString::fromLocal8Bit(shot)); app.quit(); });
+    // Build aid (install.sh --pgo): walk every tab and sub-tab, render each a
+    // few times, then quit — a representative profile for the GUI's hot paths.
+    if (const int rounds = qEnvironmentVariableIntValue("LPM_PGO_TRAIN"); rounds > 0)
+        QTimer::singleShot(1000, &app, [&win, &app, rounds] {
+            for (int r = 0; r < rounds; ++r)
+                for (QTabWidget *t : win.findChildren<QTabWidget *>())
+                    for (int i = 0; i < t->count(); ++i) {
+                        t->setCurrentIndex(i);
+                        QCoreApplication::processEvents();
+                        (void)win.grab();
+                    }
+            app.quit();
+        });
     return app.exec();
 }
