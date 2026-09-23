@@ -8,6 +8,11 @@
 //!   keys:   charge_type            BAT*/charge_types (value must be one it offers)
 //!           fn_lock | camera_power | usb_charging   ideapad_acpi VPC*/<key>, "0"/"1"
 //!           fan<N>_target          lenovo_wmi_other hwmon, 0 (= auto) .. fanN_max
+//!           fan_fullspeed          "1"/"0": the EC's Full Speed flag (separate from
+//!                                  fanN_target; survives reboots, e.g. set from
+//!                                  Windows). Backends, first found wins:
+//!                                  lenovo_wmi_other pwm1_enable (0 = full, 2 = auto),
+//!                                  legion_laptop PNP0C09:*/fan_fullspeed (1/0)
 //!   stdout: {"ok": true, "device": .., "effective": ..} | {"ok": false, "error": ..}
 //!
 //! Writes the per-handler class interface because the legacy
@@ -117,6 +122,30 @@ fn fan_index(key: &str) -> Option<u32> {
     (!n.is_empty() && n.len() <= 2 && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse().ok()).flatten()
 }
 
+const LEGION_DRV_DIR: &str = "/sys/bus/platform/drivers/legion";
+
+/// Full Speed backend: (file, value to write for on, value for off).
+fn fullspeed_target() -> Option<(PathBuf, &'static str, &'static str)> {
+    for d in sorted_dir(HWMON_DIR) {
+        if read_trimmed(&d.join("name")).ok().as_deref() == Some("lenovo_wmi_other") && d.join("pwm1_enable").is_file() {
+            return Some((d.join("pwm1_enable"), "0", "2"));
+        }
+    }
+    sorted_dir(LEGION_DRV_DIR).into_iter().map(|d| d.join("fan_fullspeed")).find(|f| f.is_file()).map(|f| (f, "1", "0"))
+}
+
+/// Resolves the target file and the literal to write (the UI-level value is
+/// translated for backends with a different encoding).
+fn device_write(key: &str, value: &str) -> Result<(PathBuf, String), String> {
+    if key == "fan_fullspeed" {
+        let on = match value { "1" => true, "0" => false, _ => return Err("fan_fullspeed takes 0 or 1".into()) };
+        let (f, v_on, v_off) = fullspeed_target().ok_or(
+            "no Full Speed interface: this kernel's lenovo_wmi_other has no pwm1_enable and legion_laptop is not loaded")?;
+        return Ok((f, (if on { v_on } else { v_off }).to_owned()));
+    }
+    device_target(key, value).map(|f| (f, value.to_owned()))
+}
+
 /// Resolves the target file and validates the value against what that file accepts.
 fn device_target(key: &str, value: &str) -> Result<PathBuf, String> {
     if key == "charge_type" {
@@ -156,7 +185,8 @@ fn device_target(key: &str, value: &str) -> Result<PathBuf, String> {
 }
 
 fn set_device(key: &str, value: &str) -> Value {
-    let f = match device_target(key, value) { Ok(f) => f, Err(e) => return json!({"ok": false, "error": e}) };
+    let (f, value) = match device_write(key, value) { Ok(x) => x, Err(e) => return json!({"ok": false, "error": e}) };
+    let value = value.as_str();
     let Some(real) = canonical_in_sysfs(&f) else {
         return json!({"ok": false, "error": "target resolves outside sysfs"});
     };
@@ -168,7 +198,15 @@ fn set_device(key: &str, value: &str) -> Value {
         };
         return json!({"ok": false, "error": why});
     }
-    let effective = read_trimmed(&real).unwrap_or_default();
+    let mut effective = read_trimmed(&real).unwrap_or_default();
+    if key == "fan_fullspeed" {
+        // Report in UI terms (1 = full speed) whatever the backend encoding.
+        effective = match (real.file_name().and_then(|n| n.to_str()), effective.as_str()) {
+            (Some("pwm1_enable"), "0") | (Some("fan_fullspeed"), "1") => "1".into(),
+            (Some(_), "") => effective,
+            _ => "0".into(),
+        };
+    }
     json!({"ok": true, "device": key, "effective": effective})
 }
 
@@ -221,6 +259,7 @@ mod tests {
         assert!(set_device("../../etc", "1")["ok"] == false);
         assert!(set_device("fn_lock", "2")["error"].as_str().unwrap().contains("0 or 1"));
         assert!(set_device("fan1_target", "abc")["ok"] == false);
+        assert!(set_device("fan_fullspeed", "2")["error"].as_str().unwrap().contains("0 or 1"));
     }
     #[test]
     fn rejects_unknown_profile() {

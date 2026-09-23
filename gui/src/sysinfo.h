@@ -16,6 +16,12 @@ using Opt = std::optional<QString>;
 std::optional<QString> dmi(const QString &field);         // raw
 std::optional<QString> dmiClean(const QString &field);    // placeholder strings filtered
 Opt cpuModel();
+
+enum class CpuVendor { Amd, Intel, Other };
+/// vendor_id from /proc/cpuinfo (read once; LPM_CPU_VENDOR=amd|intel overrides, dev only).
+CpuVendor cpuVendor();
+inline bool isIntel() { return cpuVendor() == CpuVendor::Intel; }
+inline bool isAmd() { return cpuVendor() == CpuVendor::Amd; }
 Opt ramTotal();
 Opt kernel();
 Opt biosInfo();

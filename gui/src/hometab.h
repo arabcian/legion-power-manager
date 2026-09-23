@@ -69,6 +69,17 @@ private:
     QHash<QString, QCheckBox *> toggles_;
     struct FanRow { QString key; QLabel *rpm; QLineEdit *target; QCheckBox *autoBox; QCheckBox *maxBox; QPushButton *set; int max; };
     QList<FanRow> fans_;
+    // EC "Full Speed" flag: separate from fanN_target and persistent across
+    // reboots (e.g. switched on in Windows). fullSpeedFile_ is empty when the
+    // running kernel exposes no interface for it.
+    QString fullSpeedFile_;
+    bool fullSpeedPwm_ = false;          // pwm1_enable (0 = full) vs legion fan_fullspeed (1 = full)
+    QCheckBox *fullSpeed_ = nullptr;
+    QLabel *fanWarn_ = nullptr;
+    bool fullSpeedOn_ = false;           // last known / suspected state
+    int fullSpeedGuess_ = 0;             // consecutive polls that look like Full Speed
+    std::optional<bool> readFullSpeed() const;
+    void clearFullSpeed();
     int devicePending_ = 0;
     QList<QPair<QString, QString>> deviceQueue_;  // writes clicked while one is in flight
 };

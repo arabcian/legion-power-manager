@@ -50,7 +50,7 @@
 // Only a local, active session of a wheel member is granted silently;
 // everyone else (SSH, other seats, service accounts) gets auth_admin.
 var HELPERS = ["fwattr-helper", "legion-profile-helper", "ryzen-co-helper",
-               "tune-helper", "nvcurve-root-helper"].map(function (h) {
+               "tune-helper", "nvcurve-root-helper", "intel-uv-helper"].map(function (h) {
     return "@LIBEXEC@/" + h;
 });
 

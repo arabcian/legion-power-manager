@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QSet>
+#include <algorithm>
 #include <fstream>
 #include <sys/utsname.h>
 
@@ -49,6 +50,19 @@ static Opt grepFile(const QString &path, const QString &prefix, int field) {
 }
 
 Opt cpuModel() { return grepFile(QStringLiteral("/proc/cpuinfo"), QStringLiteral("model name"), -1); }
+
+CpuVendor cpuVendor() {
+    static const CpuVendor v = [] {
+        const QString o = qEnvironmentVariable("LPM_CPU_VENDOR").toLower();
+        if (o == "amd") return CpuVendor::Amd;
+        if (o == "intel") return CpuVendor::Intel;
+        const QString id = grepFile(QStringLiteral("/proc/cpuinfo"), QStringLiteral("vendor_id"), -1).value_or(QString());
+        if (id == "GenuineIntel") return CpuVendor::Intel;
+        if (id == "AuthenticAMD" || id == "HygonGenuine") return CpuVendor::Amd;
+        return CpuVendor::Other;
+    }();
+    return v;
+}
 
 Opt ramTotal() {
     auto kib = grepFile(QStringLiteral("/proc/meminfo"), QStringLiteral("MemTotal:"), 1);
@@ -144,11 +158,15 @@ Opt cpuTemp() {
             auto main = chipTemp(c.path);
             if (!main) continue;
             QString t = QStringLiteral("%1 °C").arg(*main, 0, 'f', 0);
+            long long hottest = -1;
             for (const QString &f : inputs(c.path, "temp")) {
                 QString l = label(f);
+                // coretemp: "Core N" per physical core; show the hottest next to the package.
+                if (l.startsWith("core ")) { if (auto v = rdInt(f)) hottest = std::max(hottest, *v); continue; }
                 if (!l.startsWith("tccd")) continue;
                 if (auto v = rdInt(f)) t += SEP + l.replace("tccd", "CCD") + QStringLiteral(" %1°C").arg(*v / 1000.0, 0, 'f', 0);
             }
+            if (hottest >= 0) t += SEP + QStringLiteral("hottest core %1°C").arg(hottest / 1000.0, 0, 'f', 0);
             return t;
         }
     }
@@ -194,6 +212,19 @@ Opt igpu() {
         if (auto hz = rdInt(c.path + "/freq1_input")) b << QStringLiteral("%1MHz").arg(*hz / 1000000);
         return joined(b);
     }
+    // Intel iGPU (i915 / xe): no hwmon temp on most parts, the actual GT clock is enough.
+    const QDir drm(QStringLiteral("/sys/class/drm"));
+    for (const QString &e : drm.entryList({"card*"}, QDir::Dirs | QDir::System, QDir::Name)) {
+        if (e.contains('-')) continue;
+        const QString card = drm.filePath(e);
+        if (rd(card + "/device/vendor") != QStringLiteral("0x8086")) continue;
+        auto mhz = rdInt(card + "/gt/gt0/rps_act_freq_mhz");                    // i915
+        if (!mhz) mhz = rdInt(card + "/device/tile0/gt0/freq0/act_freq");        // xe
+        if (!mhz) continue;
+        QStringList b{QStringLiteral("%1MHz").arg(*mhz)};
+        if (auto max = rdInt(card + "/gt/gt0/rps_max_freq_mhz")) b << QStringLiteral("max %1MHz").arg(*max);
+        return joined(b);
+    }
     return std::nullopt;
 }
 
@@ -224,6 +255,8 @@ Opt cpuPackagePower() {
     QStringList l;
     for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
         if (e.count(':') < 1 || e.count(':') > 2) continue;  // intel-rapl:0 (package), intel-rapl:0:0 (core)
+        // intel-rapl-mmio mirrors the MSR package counter; showing both reads as two packages.
+        if (e.startsWith("intel-rapl-mmio") && d.exists(QStringLiteral("intel-rapl:0"))) continue;
         const QString p = d.filePath(e);
         const auto uj = rdInt(p + "/energy_uj");
         const auto name = rd(p + "/name");

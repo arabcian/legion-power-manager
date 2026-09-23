@@ -51,10 +51,10 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
-	dobin "${r}"/{nvcurve,lpm-gamemode}
+	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv}
 
 	cmake_src_install
 
@@ -64,7 +64,7 @@ src_install() {
 	insinto /etc/polkit-1/rules.d
 	doins packaging/polkit/49-legion-power-manager.rules
 	local s
-	for s in nvcurve-autoload lpm-tune; do
+	for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon; do
 		sed -e "s|@BINDIR@|${EPREFIX}/usr/bin|g" \
 			-e "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" \
 			packaging/openrc/${s} > "${T}"/${s}.initd || die
@@ -74,6 +74,11 @@ src_install() {
 			packaging/systemd/${s}.service > "${T}"/${s}.service || die
 		systemd_dounit "${T}"/${s}.service
 	done
+	sed -e "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" \
+		packaging/sleep/lpm-intel-uv > "${T}"/50-lpm-intel-uv || die
+	exeinto /$(get_libdir)/elogind/system-sleep
+	exeopts -m0755
+	doexe "${T}"/50-lpm-intel-uv
 	keepdir /etc/nvcurve/profiles
 
 	dodoc README.md
@@ -87,6 +92,11 @@ pkg_postinst() {
 	elog "Optimizations boot preset (set with ⏻ Apply at boot):"
 	elog "  OpenRC:  rc-update add lpm-tune boot"
 	elog "  systemd: systemctl enable lpm-tune.service"
+	elog "Intel undervolt boot/resume profile (⏻ in the Intel Undervolt tab):"
+	elog "  OpenRC:  rc-update add lpm-intel-uv boot   (resume: elogind hook installed)"
+	elog "  systemd: systemctl enable lpm-intel-uv.service"
+	elog "  or the daemon (AC/battery switch, periodic re-apply, hwphint):"
+	elog "  OpenRC:  rc-update add lpm-intel-uv-daemon default / systemd: lpm-intel-uv-daemon.service"
 	elog "Lutris hooks: /usr/bin/lpm-gamemode PRE / POST / RUN (see the Game launch sub-tab)."
 	elog "The Ryzen tab needs a root-owned ryzenadj in /usr/bin, /usr/sbin,"
 	elog "/usr/local/{bin,sbin} or /opt/ryzenadj."

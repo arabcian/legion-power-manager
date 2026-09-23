@@ -20,6 +20,7 @@ add_executable(legion-power-manager
     src/hometab.cpp      src/hometab.h
     src/fwattrtab.cpp    src/fwattrtab.h
     src/ryzentab.cpp     src/ryzentab.h
+    src/inteltab.cpp     src/inteltab.h
     src/vfcurvewidget.cpp src/vfcurvewidget.h
     src/nvidiatab.cpp    src/nvidiatab.h
     src/optimizetab.cpp  src/optimizetab.h

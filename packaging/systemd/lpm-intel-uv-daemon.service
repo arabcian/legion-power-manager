@@ -1,0 +1,29 @@
+# Legion Power Manager — Intel undervolt daemon (optional, instead of
+# lpm-intel-uv.service). Counterpart of packaging/openrc/lpm-intel-uv-daemon.
+#
+#   systemctl enable --now lpm-intel-uv-daemon.service
+
+[Unit]
+Description=Legion Power Manager Intel undervolt daemon
+Conflicts=lpm-intel-uv.service
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/lpm-intel-uv daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -34,6 +34,7 @@ const MAX_PRESET_BYTES: u64 = 256 * 1024;
 
 /// Exact, case-sensitive profile name looked up in both curve tools.
 const UNDERVOLT_PROFILE: &str = "GAMING";
+const HOTPLUG_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 const PKEXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const UNDERVOLT_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 /// Same directory nvcurve-root-helper applies from.
@@ -175,6 +176,16 @@ fn apply_ryzen(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Intel undervolt profile (Intel Undervolt tab format) → intel-uv-helper.
+fn apply_intel(path: &Path) -> Result<(), String> {
+    let p = read_json(path).ok_or_else(|| format!("cannot read {}", path.display()))?;
+    let v = pkexec_helper(&format!("{HELPER_DIR}/intel-uv-helper"), &json!({"op": "apply", "profile": p}))?;
+    for r in v["results"].as_array().into_iter().flatten().filter(|r| r["ok"] != true) {
+        eprintln!("  {}: {}", r["what"].as_str().unwrap_or("?"), r["message"].as_str().unwrap_or("failed"));
+    }
+    if v["ok"] == true { Ok(()) } else { Err(v["error"].as_str().unwrap_or("some values failed").to_owned()) }
+}
+
 fn apply_nvidia() -> Result<(), String> {
     let v = pkexec_helper(&format!("{HELPER_DIR}/nvcurve-root-helper"),
         &json!({"op": "apply_named_profile", "name": UNDERVOLT_PROFILE}))?;
@@ -191,7 +202,13 @@ fn undervolt(forced: bool) -> bool {
     let nvidia = Path::new(NVCURVE_PROFILES).join(format!("{UNDERVOLT_PROFILE}.json"));
 
     let mut steps: Vec<(&str, Box<dyn Fn() -> Result<(), String>>)> = Vec::new();
-    if want_cpu {
+    let intel = xdg_config().join(format!("legion-power-manager/intel-uv-profiles/{UNDERVOLT_PROFILE}.json"));
+    if want_cpu && tune::cpu_vendor() == tune::Vendor::Intel {
+        if intel.is_file() { let r = intel.clone(); steps.push(("CPU", Box::new(move || apply_intel(&r)))); }
+        else { eprintln!("lpm-gamemode: undervolt CPU skipped — no Intel undervolt profile \"{UNDERVOLT_PROFILE}\" ({})", intel.display()); }
+    } else if want_cpu && tune::cpu_vendor() != tune::Vendor::Amd {
+        eprintln!("lpm-gamemode: undervolt CPU skipped — no CPU undervolt backend for this vendor");
+    } else if want_cpu {
         if ryzen.is_file() { let r = ryzen.clone(); steps.push(("CPU", Box::new(move || apply_ryzen(&r)))); }
         else { eprintln!("lpm-gamemode: undervolt CPU skipped — no Ryzen profile \"{UNDERVOLT_PROFILE}\" ({})", ryzen.display()); }
     }
@@ -238,7 +255,9 @@ fn prepare_run(preset: &Value) {
     if role != "none" {
         match tune::resolve_ccd(&tune::ccx_groups(), role) {
             Some(g) => match set_affinity(&g.cpus) {
-                Ok(()) => eprintln!("lpm-gamemode: pinned to CCD{} ({})", g.index, tune::fmt_cpu_list(&g.cpus)),
+                Ok(()) if role == "pcore" || role == "ecore" =>
+                    eprintln!("lpm-gamemode: pinned to {} ({})", if role == "pcore" { "P-cores" } else { "E-cores" }, tune::fmt_cpu_list(&g.cpus)),
+                Ok(()) => eprintln!("lpm-gamemode: pinned to CCD{} ({}, {} MiB L3)", g.index, tune::fmt_cpu_list(&g.cpus), g.l3_kib / 1024),
                 Err(e) => eprintln!("lpm-gamemode: sched_setaffinity: {e}"),
             },
             None => eprintln!("lpm-gamemode: affinity '{role}' does not apply to this CPU, skipped"),
@@ -293,11 +312,46 @@ fn wrap(args: &[String]) -> i32 {
     code
 }
 
+/// Lutris runs the pre-launch script (PRE) and the command prefix (RUN) in
+/// parallel unless "Wait for pre-launch script completion" is set. If the
+/// preset hot-plugs CPUs (SMT off, CCD park), RUN must not read the CCD
+/// topology — or pin the game — while CPUs are still going offline.
+fn wait_for_hotplug(preset: &Value) {
+    let vals = &preset["values"];
+    if !tune::HOTPLUG_KEYS.iter().any(|k| !vals[*k].is_null()) { return; }
+    let deadline = std::time::Instant::now() + HOTPLUG_WAIT;
+    let smt_off = vals["cpu.smt"] == "off";
+    let settled = || {
+        let game = describe_state().map_or(false, |st| st["source"] == "game" && st["refcount"].as_u64().unwrap_or(0) > 0);
+        let smt = !smt_off || read_json_str("/sys/devices/system/cpu/smt/active").as_deref() == Some("0");
+        game && smt
+    };
+    while !settled() {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("lpm-gamemode RUN: game mode not applied after {} s (is PRE set, and did it succeed?) — pinning with the current topology",
+                      HOTPLUG_WAIT.as_secs());
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    // CPU offlining finishes before tune-helper returns, but give cacheinfo a beat to settle.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+fn read_json_str(p: &str) -> Option<String> { std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned()) }
+
+/// tune-helper's describe, run directly as the user (no pkexec needed).
+fn describe_state() -> Option<Value> {
+    let out = Command::new(helper()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+        .and_then(|mut c| { c.stdin.take().unwrap().write_all(br#"{"op":"describe"}"#)?; c.wait_with_output() }).ok()?;
+    serde_json::from_slice::<Value>(&out.stdout).ok().map(|v| v["state"].clone())
+}
+
 fn run_exec(args: &[String]) -> i32 {
     let (name, cmd) = split_cmd(args);
     if cmd.is_empty() { eprintln!("lpm-gamemode RUN: no command"); return 2; }
     match load_preset(name.as_deref()) {
-        Ok((_, p)) => prepare_run(&p),
+        Ok((_, p)) => { wait_for_hotplug(&p); prepare_run(&p) }
         Err(e) => eprintln!("lpm-gamemode: {e} — starting without boost"),
     }
     let err = Command::new(&cmd[0]).args(&cmd[1..]).exec();

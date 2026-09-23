@@ -1,0 +1,32 @@
+# Legion Power Manager — Intel undervolt boot/resume profile (systemd).
+# Counterpart of packaging/openrc/lpm-intel-uv.
+#
+# Same pattern as intel-undervolt.service: a oneshot without
+# RemainAfterExit that is also wanted by the sleep targets, so it runs again
+# after every resume (the OC mailbox offsets are lost on S3/hibernate).
+#
+#   systemctl enable lpm-intel-uv.service
+
+[Unit]
+Description=Legion Power Manager Intel undervolt profile
+ConditionPathExists=/etc/legion-power-manager/intel-uv-boot.json
+After=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "echo '{\"op\":\"boot\"}' | @LIBEXEC@/intel-uv-helper"
+# Needs /dev/cpu/*/msr, /dev/mem (MCHBAR) and /sys/module/msr: no device or
+# kernel-tunable sandboxing; the rest is closed.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

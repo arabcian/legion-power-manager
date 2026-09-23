@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+pub mod intel_uv;
+pub mod intel_uv_daemon;
 pub mod tune;
 
 /// Reads at most `max` bytes from stdin. Returns Err with a ready-made

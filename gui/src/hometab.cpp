@@ -359,14 +359,16 @@ QGroupBox *HomeTab::buildDeviceBox() {
                     return;
                 }
                 // Leaving Max: back to Auto (the safe state), user can untick Auto to type.
+                // If the EC's own Full Speed flag is what keeps it at max, clear that too.
                 autoBox->setChecked(true);
+                clearFullSpeed();
                 setDevice(key, "0");
             });
             connect(autoBox, &QCheckBox::clicked, this, [this, key, edit, set, maxBox, lo](bool on) {
                 maxBox->setChecked(false);
                 edit->setEnabled(!on);
                 set->setEnabled(!on);
-                if (on) { setDevice(key, "0"); return; }
+                if (on) { clearFullSpeed(); setDevice(key, "0"); return; }
                 // Leaving Auto: start from something sane and let the user adjust.
                 if (edit->text().isEmpty()) edit->setText(QString::number(lo > 0 ? lo : 2000));
                 edit->setFocus();
@@ -383,6 +385,35 @@ QGroupBox *HomeTab::buildDeviceBox() {
             g->addWidget(set, row++, 4);
             fans_.append({key, rpm, edit, autoBox, maxBox, set, top});
         }
+    }
+
+    // EC Full Speed flag. Upstream lenovo_wmi_other exposes it as pwm1_enable only
+    // where the kernel knows the feature (0 = full speed, 2 = auto); LenovoLegionLinux's
+    // legion_laptop module as fan_fullspeed (1/0). Without either, Linux cannot
+    // read or clear it, and fanN_target keeps reading 0 while the fans run flat out.
+    if (!fanHwmon_.isEmpty() && QFileInfo(fanHwmon_ + "/pwm1_enable").isFile()) {
+        fullSpeedFile_ = fanHwmon_ + "/pwm1_enable";
+        fullSpeedPwm_ = true;
+    } else {
+        const QString d = findDir("/sys/bus/platform/drivers/legion", [](const QString &p) {
+            return QFileInfo(p + "/fan_fullspeed").isFile(); });
+        if (!d.isEmpty()) fullSpeedFile_ = d + "/fan_fullspeed";
+    }
+    if (!fullSpeedFile_.isEmpty()) {
+        fullSpeed_ = new QCheckBox("Full speed (EC)");
+        fullSpeed_->setToolTip("The embedded controller's own Full Speed mode (the switch in Lenovo Vantage /\n"
+                               "Legion Space). It overrides every fan target and stays on across reboots and OS\n"
+                               "changes until it is turned off. Source: " + fullSpeedFile_);
+        connect(fullSpeed_, &QCheckBox::clicked, this, [this](bool on) { setDevice("fan_fullspeed", on ? "1" : "0"); });
+        g->addWidget(muted("Fans"), row, 0);
+        g->addWidget(fullSpeed_, row++, 1, 1, 4);
+    }
+    if (!fans_.isEmpty() || fullSpeed_) {
+        fanWarn_ = new QLabel;
+        fanWarn_->setWordWrap(true);
+        fanWarn_->setTextFormat(Qt::RichText);
+        fanWarn_->hide();
+        g->addWidget(fanWarn_, row++, 0, 1, 5);
     }
 
     if (row == 0) { delete box; return nullptr; }
@@ -407,10 +438,54 @@ void HomeTab::refreshDevice() {
         QSignalBlocker blk(it.value());
         it.value()->setChecked(rdText(ideapadDir_ + '/' + it.key()) == "1");
     }
+    // Full Speed: read it where the kernel exposes it; otherwise infer it —
+    // every target 0 (= "auto") yet every fan at ≥ 92 % of its max for two polls in a row.
+    const std::optional<bool> fs = readFullSpeed();
+    bool suspect = false;
+    if (fs) {
+        fullSpeedOn_ = *fs;
+        fullSpeedGuess_ = 0;
+    } else if (!fans_.isEmpty()) {
+        bool looks = true;
+        for (const FanRow &f : fans_) {
+            const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
+            const int in = rdText(fanHwmon_ + "/fan" + n + "_input").toInt(), tgt = rdText(fanHwmon_ + '/' + f.key).toInt();
+            looks &= tgt == 0 && f.max > 0 && f.max < 9999 && in >= f.max * 92 / 100;
+        }
+        fullSpeedGuess_ = looks ? fullSpeedGuess_ + 1 : 0;
+        suspect = fullSpeedGuess_ >= 2;
+        fullSpeedOn_ = suspect;
+    }
+    if (fullSpeed_) { QSignalBlocker b(fullSpeed_); fullSpeed_->setChecked(fs.value_or(false)); }
+    if (fanWarn_) {
+        if (fs && *fs) {
+            fanWarn_->setText(QStringLiteral("<span style='color:%1'>EC Full Speed is on — fan targets are ignored until it is "
+                                             "switched off (untick it, or pick Auto).</span>").arg(theme::WARN));
+        } else if (suspect) {
+            fanWarn_->setText(QStringLiteral("<span style='color:%1'>The fans run at maximum with no target set: the EC's Full Speed "
+                "mode is on (it survives reboots, e.g. switched on in Windows). This kernel has no interface to turn it off — "
+                "lenovo_wmi_other lacks pwm1_enable and legion_laptop is not loaded. Turn it off in Lenovo Vantage / Legion "
+                "Space, or load LenovoLegionLinux's legion_laptop module; an EC reset (power off, hold the power button "
+                "~30 s) also clears it.</span>").arg(theme::WARN));
+        }
+        fanWarn_->setVisible((fs && *fs) || suspect);
+    }
+
     for (const FanRow &f : fans_) {
         const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
         f.rpm->setText(rdText(fanHwmon_ + "/fan" + n + "_input") + " RPM");
         const int target = rdText(fanHwmon_ + '/' + f.key).toInt();
+        if (!f.target->hasFocus() && fullSpeedOn_) {
+            // target 0 would otherwise be shown as "Auto" while the EC holds the fans at max.
+            f.maxBox->setChecked(true);
+            f.autoBox->setChecked(false);
+            f.target->setEnabled(false);
+            f.set->setEnabled(false);
+            f.maxBox->setToolTip(QStringLiteral("Held at maximum by the EC's Full Speed mode%1.")
+                .arg(fullSpeed_ ? QString() : QStringLiteral(" (detected from RPM; cannot be cleared from this kernel)")));
+            continue;
+        }
+        f.maxBox->setToolTip(QStringLiteral("Run this fan at its maximum, %1 RPM.").arg(f.max));
         if (!f.target->hasFocus()) {
             // Auto only reflects the hardware while the user is not mid-edit
             // (unticked Auto + empty box = about to type a value).
@@ -426,6 +501,19 @@ void HomeTab::refreshDevice() {
             f.set->setEnabled(!locked);
         }
     }
+}
+
+std::optional<bool> HomeTab::readFullSpeed() const {
+    if (fullSpeedFile_.isEmpty()) return std::nullopt;
+    const QString v = rdText(fullSpeedFile_);
+    if (v.isEmpty()) return std::nullopt;  // read error: fall back to the RPM heuristic
+    return fullSpeedPwm_ ? v == QLatin1String("0") : v == QLatin1String("1");
+}
+
+void HomeTab::clearFullSpeed() {
+    if (!fullSpeedOn_) return;
+    if (fullSpeed_) { setDevice("fan_fullspeed", "0"); return; }
+    showStatus("The EC's Full Speed mode is on and this kernel cannot turn it off — see the note under the fans.", 10000);
 }
 
 void HomeTab::setDevice(const QString &key, const QString &value) {

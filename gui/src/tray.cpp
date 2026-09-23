@@ -1,5 +1,6 @@
 #include "tray.h"
 #include "hometab.h"
+#include "inteltab.h"
 #include "mainwindow.h"
 #include "nvidiatab.h"
 #include "optimizetab.h"
@@ -83,9 +84,9 @@ void Tray::rebuild() {
         });
     }
 
-    // Ryzen
+    // Ryzen (AMD only — the window has no Ryzen tab on Intel)
+    if (RyzenTab *ryzen = win_->ryzen()) {
     QMenu *rm = menu_->addMenu("CPU Curve (Ryzen)");
-    RyzenTab *ryzen = win_->ryzen();
     const QStringList rnames = ryzen->savedProfileNames();
     if (rnames.isEmpty()) disabledEntry(rm, "(no saved profiles)");
     for (const QString &n : rnames)
@@ -98,6 +99,24 @@ void Tray::rebuild() {
         ryzen->applyReset();
         notify("CPU curve", "Resetting Curve Optimizer (coall=0)…");
     });
+    }
+
+    // Intel undervolt (Intel only)
+    if (IntelTab *intel = win_->intel()) {
+        QMenu *im = menu_->addMenu("CPU Undervolt (Intel)");
+        const QStringList inames = intel->savedProfileNames();
+        if (inames.isEmpty()) disabledEntry(im, "(no saved profiles)");
+        for (const QString &n : inames)
+            connect(im->addAction(n), &QAction::triggered, this, [this, intel, n] {
+                if (claimCooldown() && intel->applyNamedProfile(n)) notify("CPU undervolt", "Applying profile '" + n + "'…");
+            });
+        im->addSeparator();
+        connect(im->addAction("Reset voltages"), &QAction::triggered, this, [this, intel] {
+            if (!claimCooldown()) return;
+            intel->applyReset();
+            notify("CPU undervolt", "Resetting voltage offsets to 0 mV…");
+        });
+    }
 
     // NVIDIA
     QMenu *nm = menu_->addMenu("GPU Curve (NVIDIA)");

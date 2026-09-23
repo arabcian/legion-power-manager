@@ -1,9 +1,11 @@
 #include "mainwindow.h"
 #include "fwattrtab.h"
 #include "hometab.h"
+#include "inteltab.h"
 #include "nvidiatab.h"
 #include "optimizetab.h"
 #include "ryzentab.h"
+#include "sysinfo.h"
 #include "tray.h"
 #include <QCloseEvent>
 #include <QStatusBar>
@@ -27,8 +29,16 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(home_, &HomeTab::profileChanged, fw, &FwattrTab::refreshLockState);
     nvidia_ = new NvidiaTab;
     tabs_->addTab(nvidia_, "NVIDIA Curve Optimizer");
-    ryzen_ = new RyzenTab;
-    tabs_->addTab(ryzen_, "Ryzen Curve Optimizer");
+    // One CPU voltage tab per vendor: Curve Optimizer (AMD SMU) or the
+    // OC-mailbox undervolt tab (Intel). The other one is never created, so
+    // nothing polls ryzen_smu on Intel or touches MSR 0x150 on AMD.
+    if (sysinfo::isAmd()) {
+        ryzen_ = new RyzenTab;
+        tabs_->addTab(ryzen_, "Ryzen Curve Optimizer");
+    } else if (sysinfo::isIntel()) {
+        intel_ = new IntelTab;
+        tabs_->addTab(intel_, "Intel Undervolt");
+    }
     optimize_ = new OptimizeTab;
     tabs_->addTab(optimize_, "Optimizations");
 

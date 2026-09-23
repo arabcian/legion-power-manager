@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+# Legion Power Manager — Intel undervolt daemon (optional, instead of lpm-intel-uv).
+#
+# Keeps /etc/legion-power-manager/intel-uv-boot.json applied: AC / battery
+# profile switching, full re-apply after resume, periodic re-apply of power
+# limits / TCC / BD PROCHOT / cTDP (firmware and the EC restore their own),
+# hwphint EPP switching. Reloads the file on change or SIGHUP.
+#
+#   rc-update add lpm-intel-uv-daemon default
+
+description="Legion Power Manager Intel undervolt daemon"
+command="@BINDIR@/lpm-intel-uv"
+command_args="daemon"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/lpm-intel-uv.log"
+error_log="/var/log/lpm-intel-uv.log"
+extra_started_commands="reload"
+
+depend() {
+	need localmount
+	after modules
+}
+
+reload() {
+	ebegin "Reloading ${RC_SVCNAME}"
+	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	eend $?
+}

@@ -2,6 +2,7 @@
 #include <QMainWindow>
 
 class HomeTab;
+class IntelTab;
 class NvidiaTab;
 class OptimizeTab;
 class RyzenTab;
@@ -12,7 +13,8 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     HomeTab *home() const { return home_; }
-    RyzenTab *ryzen() const { return ryzen_; }
+    RyzenTab *ryzen() const { return ryzen_; }  // nullptr on non-AMD CPUs
+    IntelTab *intel() const { return intel_; }  // nullptr on non-Intel CPUs
     NvidiaTab *nvidia() const { return nvidia_; }
     OptimizeTab *optimize() const { return optimize_; }
     /// Set by the tray's Quit: closeEvent then really closes instead of hiding.
@@ -25,7 +27,8 @@ protected:
 private:
     QTabWidget *tabs_;
     HomeTab *home_;
-    RyzenTab *ryzen_;
+    RyzenTab *ryzen_ = nullptr;
+    IntelTab *intel_ = nullptr;
     NvidiaTab *nvidia_;
     OptimizeTab *optimize_;
     bool forceQuit_ = false, hideOnClose_ = false;

@@ -1,6 +1,8 @@
 #include "optimizetab.h"
 #include "privileged.h"
+#include "inteltab.h"
 #include "ryzentab.h"
+#include "sysinfo.h"
 #include "theme.h"
 
 #include <QApplication>
@@ -49,9 +51,10 @@ static QString helperPath() { return privileged::helperPath(QStringLiteral("tune
 // Templates only: values a machine does not offer are skipped on load. Keep
 // the names valid for lpm-gamemode (letters, digits, space, _ - .).
 
-struct Builtin { const char *name, *summary, *json; };
+// `vendor`: "amd" / "intel" = only listed on that CPU vendor, nullptr = everywhere.
+struct Builtin { const char *vendor, *name, *summary, *json; };
 static const Builtin BUILTINS[] = {
-    {"Gaming X3D",
+    {"amd", "Gaming X3D",
      "Full lutris-game-tune set plus X3D placement: game on the V-Cache CCD, IRQs and kernel work on the other one.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.epp_boost":"1",
@@ -69,7 +72,7 @@ static const Builtin BUILTINS[] = {
         "blk.scheduler":"none","pci.aspm":"performance","pci.latency_timer":"tuned",
         "snd.hda_power_save":0,"snd.hda_power_save_controller":"0","usb.autosuspend":-1,"gpu.amdgpu_dpm":"low"},
       "run":{"nice":-5,"autogroup":true,"affinity":"cache"}})"},
-    {"Competitive",
+    {"amd", "Competitive",
      "Gaming X3D taken to the limit: frequency CCD parked, deep C-states off. Maximum determinism, most heat.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.boost":"1",
@@ -82,7 +85,7 @@ static const Builtin BUILTINS[] = {
         "blk.scheduler":"none","pci.aspm":"performance","snd.hda_power_save":0,"usb.autosuspend":-1,
         "gpu.amdgpu_dpm":"low","cpu.ccd_park":"frequency"},
       "run":{"nice":-10,"autogroup":true,"affinity":"cache"}})"},
-    {"Low latency desktop",
+    {"amd", "Low latency desktop",
      "Everyday responsiveness without the power cost: efficient floor clock, full preemption, no compaction stalls.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance",
@@ -90,7 +93,7 @@ static const Builtin BUILTINS[] = {
         "mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,"vm.max_map_count":2147483642,"vm.page_cluster":0,
         "kernel.split_lock_mitigate":0,"sched.preempt":"full","wq.power_efficient":"0","snd.hda_power_save":0},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
-    {"Compile throughput",
+    {"amd", "Compile throughput",
      "Long parallel builds (emerge, kernel): frequency CCD preferred, throughput preemption, bigger slices.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance","cpu.boost":"1",
@@ -99,14 +102,14 @@ static const Builtin BUILTINS[] = {
         "sched.preempt":"voluntary","sched.base_slice_ns":3000000,"sched.migration_cost_ns":500000,
         "wq.cpumask":"all","irq.affinity":"all","blk.scheduler":"mq-deadline"},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
-    {"CO validation",
+    {"amd", "CO validation",
      "For proving Curve Optimizer offsets: boost on, every idle state on (idle-to-boost transitions are where CO fails), MCE polled every 10 s.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.boost":"1",
         "cpu.min_freq":"cpuinfo_min","cpu.cstate_max":"all","cpu.smt":"on","cpu.ccd_park":"none",
         "kernel.watchdog":1,"mce.check_interval":10},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
-    {"Quiet battery",
+    {"amd", "Quiet battery",
      "Unplugged: power EPP, no turbo, lowest floor clock, aggressive device power saving.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"power","cpu.boost":"0",
@@ -114,10 +117,73 @@ static const Builtin BUILTINS[] = {
         "snd.hda_power_save":1,"snd.hda_power_save_controller":"1","usb.autosuspend":2,
         "wq.power_efficient":"1","kernel.watchdog":1,"gpu.amdgpu_dpm":"auto","vm.stat_interval":10},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
+    // ── Intel (hybrid P/E-core) ──────────────────────────────────────────────
+    {"intel", "Intel gaming hybrid",
+     "lutris-game-tune set for a hybrid Intel CPU: P-cores on performance EPP, E-cores on balance_power, kernel work and IRQs steered to the E-cores.",
+     R"({"values":{
+        "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance",
+        "cpu.epp_pcore":"performance","cpu.epp_ecore":"balance_power","cpu.boost":"1","cpu.hwp_dynamic_boost":"1",
+        "thp.enabled":"madvise","thp.shmem_enabled":"advise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,
+        "mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,"mm.ksm_run":0,"vm.max_map_count":2147483642,
+        "vm.swappiness":10,"vm.compaction_proactiveness":5,"vm.watermark_boost_factor":15000,
+        "vm.watermark_scale_factor":50,"vm.min_free_kbytes":262144,"vm.zone_reclaim_mode":0,
+        "vm.page_lock_unfairness":1,"vm.stat_interval":10,"vm.page_cluster":0,
+        "kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
+        "kernel.sched_autogroup":1,"kernel.cfs_bandwidth_slice_us":3000,
+        "sched.preempt":"full","sched.base_slice_ns":1000000,"sched.migration_cost_ns":500000,"sched.nr_migrate":32,
+        "wq.power_efficient":"0","wq.cpumask":"ecore","irq.affinity":"ecore",
+        "blk.scheduler":"none","pci.aspm":"performance","pci.latency_timer":"tuned",
+        "snd.hda_power_save":0,"snd.hda_power_save_controller":"0","usb.autosuspend":-1,
+        "gpu.intel_slpc_profile":"power_saving"},
+      "run":{"nice":-5,"autogroup":true,"affinity":"none"}})"},
+    {"intel", "Intel competitive",
+     "Intel gaming hybrid taken further: game pinned to the P-cores, every core on performance EPP, deep C-states off. Most deterministic, most heat.",
+     R"({"values":{
+        "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance",
+        "cpu.epp_pcore":"performance","cpu.epp_ecore":"balance_performance","cpu.boost":"1","cpu.hwp_dynamic_boost":"1",
+        "cpu.cstate_max":"1","thp.enabled":"madvise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,
+        "mm.lru_gen_min_ttl":1000,"mm.ksm_run":0,"vm.max_map_count":2147483642,"vm.swappiness":10,"vm.stat_interval":10,
+        "vm.page_cluster":0,"kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
+        "kernel.timer_migration":0,"sched.preempt":"full","sched.base_slice_ns":1000000,"wq.power_efficient":"0",
+        "wq.cpumask":"ecore","irq.affinity":"ecore","blk.scheduler":"none","pci.aspm":"performance",
+        "snd.hda_power_save":0,"usb.autosuspend":-1,"gpu.intel_slpc_profile":"power_saving"},
+      "run":{"nice":-10,"autogroup":true,"affinity":"pcore"}})"},
+    {"intel", "Intel low latency desktop",
+     "Everyday responsiveness on Intel: balance_performance EPP, HWP dynamic boost, full preemption, no compaction stalls.",
+     R"({"values":{
+        "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance","cpu.hwp_dynamic_boost":"1",
+        "thp.enabled":"madvise","thp.defrag":"defer+madvise","mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,
+        "vm.max_map_count":2147483642,"vm.page_cluster":0,"kernel.split_lock_mitigate":0,"sched.preempt":"full",
+        "wq.power_efficient":"0","snd.hda_power_save":0},
+      "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
+    {"intel", "Intel compile throughput",
+     "Long parallel builds: every P- and E-core busy, balance_performance EPP, throughput preemption, bigger slices.",
+     R"({"values":{
+        "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance",
+        "cpu.epp_pcore":"balance_performance","cpu.epp_ecore":"balance_performance","cpu.boost":"1",
+        "cpu.ccd_park":"none","cpu.cstate_max":"all","thp.enabled":"always","thp.defrag":"madvise","vm.swappiness":60,
+        "sched.preempt":"voluntary","sched.base_slice_ns":3000000,"sched.migration_cost_ns":500000,
+        "wq.cpumask":"all","irq.affinity":"all","blk.scheduler":"mq-deadline"},
+      "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
+    {"intel", "Intel quiet battery",
+     "Unplugged: power EPP, no turbo, E-cores capped by EPP, iGPU power saving, aggressive device power saving.",
+     R"({"values":{
+        "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"power","cpu.epp_pcore":"balance_power",
+        "cpu.epp_ecore":"power","cpu.boost":"0","cpu.hwp_dynamic_boost":"0","cpu.min_freq":"cpuinfo_min",
+        "cpu.cstate_max":"all","pci.aspm":"powersupersave","snd.hda_power_save":1,"snd.hda_power_save_controller":"1",
+        "usb.autosuspend":2,"wq.power_efficient":"1","kernel.watchdog":1,"gpu.intel_slpc_profile":"power_saving",
+        "vm.stat_interval":10},
+      "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
 };
 
+static bool builtinForThisCpu(const Builtin &b) {
+    if (!b.vendor) return true;
+    const QLatin1String v(b.vendor);
+    return (v == QLatin1String("amd") && sysinfo::isAmd()) || (v == QLatin1String("intel") && sysinfo::isIntel());
+}
+
 static const Builtin *builtin(const QString &name) {
-    for (const Builtin &b : BUILTINS) if (name == QLatin1String(b.name)) return &b;
+    for (const Builtin &b : BUILTINS) if (builtinForThisCpu(b) && name == QLatin1String(b.name)) return &b;
     return nullptr;
 }
 
@@ -319,7 +385,9 @@ QWidget *OptimizeTab::buildLaunchPage() {
     affinity_ = new QComboBox;
     affinity_->setMinimumWidth(260);
     g->addWidget(affinity_, 2, 1);
-    g->addWidget(muted("Pins the game to one CCD. Pair it with \"Unbound workqueue CPUs\" / \"IRQ affinity\" on the other CCD."), 2, 2);
+    g->addWidget(muted(sysinfo::isIntel()
+        ? QStringLiteral("Pins the game to the P-cores (or E-cores). Pair it with \"Unbound workqueue CPUs\" / \"IRQ affinity\" on the E-cores.")
+        : QStringLiteral("Pins the game to one CCD. Pair it with \"Unbound workqueue CPUs\" / \"IRQ affinity\" on the other CCD.")), 2, 2);
     g->setColumnStretch(2, 1);
     v->addWidget(runBox);
 
@@ -334,6 +402,13 @@ QWidget *OptimizeTab::buildLaunchPage() {
     uvGpu_ = new QCheckBox("Undervolt GPU");
     uvGpu_->setChecked(cfg.value("undervolt_gpu").toBool());
     uvGpu_->setToolTip(QStringLiteral("Applies the NVIDIA curve profile \"%1\".").arg(UNDERVOLT_PROFILE));
+    if (sysinfo::isIntel()) {
+        uvCpu_->setToolTip(QStringLiteral("Applies the Intel Undervolt profile \"%1\" (voltage offsets, IccMax, TCC, power limits).").arg(UNDERVOLT_PROFILE));
+    } else if (!sysinfo::isAmd()) {
+        uvCpu_->setChecked(false);
+        uvCpu_->setEnabled(false);
+        uvCpu_->setToolTip(QStringLiteral("No CPU undervolt backend for this CPU."));
+    }
     ug->addWidget(uvCpu_, 0, 0);
     ug->addWidget(uvGpu_, 0, 1);
     uvInfo_ = new QLabel;
@@ -393,7 +468,7 @@ QWidget *OptimizeTab::buildLaunchPage() {
 void OptimizeTab::saveUndervolt() {
     if (!uvCpu_) return;
     QJsonObject cfg = readJsonFile(configFile());
-    cfg["undervolt_cpu"] = uvCpu_->isChecked();
+    cfg["undervolt_cpu"] = uvCpu_->isChecked() && (sysinfo::isAmd() || sysinfo::isIntel());
     cfg["undervolt_gpu"] = uvGpu_->isChecked();
     QString err;
     if (!writeJsonFile(configFile(), cfg, &err)) { showStatus("Could not save undervolt setting: " + err, theme::DANGER); return; }
@@ -418,13 +493,16 @@ void OptimizeTab::updateLaunchPreview() {
     autogroup_->setEnabled(nice_->value() < 0);
 
     if (uvInfo_) {
-        const bool cpu = QFileInfo(ryzen::profilesDir() + '/' + UNDERVOLT_PROFILE + ".json").isFile();
+        const bool cpu = QFileInfo((sysinfo::isIntel() ? inteluv::profilesDir() : ryzen::profilesDir()) + '/' + UNDERVOLT_PROFILE + ".json").isFile();
         const bool gpu = QFileInfo(NVCURVE_PROFILES + '/' + UNDERVOLT_PROFILE + ".json").isFile();
         auto tag = [](const char *what, bool found, bool on) {
             const char *c = !on ? theme::MUTED : found ? theme::OK : theme::WARN;
             return QStringLiteral("<span style='color:%1'>%2 %3</span>").arg(c, what, found ? "✓ found" : "✗ missing");
         };
-        uvInfo_->setText(tag("Ryzen", cpu, uvCpu_->isChecked()) + " &nbsp;·&nbsp; " + tag("NVIDIA", gpu, uvGpu_->isChecked()));
+        const QString cpuTag = sysinfo::isAmd() ? tag("Ryzen", cpu, uvCpu_->isChecked())
+            : sysinfo::isIntel() ? tag("Intel", cpu, uvCpu_->isChecked())
+            : QStringLiteral("<span style='color:%1'>CPU: no undervolt backend</span>").arg(theme::MUTED);
+        uvInfo_->setText(cpuTag + " &nbsp;·&nbsp; " + tag("NVIDIA", gpu, uvGpu_->isChecked()));
     }
 }
 
@@ -511,6 +589,10 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
             const int i = c.toObject().value("index").toInt();
             affinity_->addItem(ccdText(i), QStringLiteral("ccd%1").arg(i));
         }
+        if (const QJsonObject h = topology_.value("hybrid").toObject(); !h.isEmpty()) {
+            affinity_->addItem("P-cores (" + h.value("pcores").toString() + ")", "pcore");
+            affinity_->addItem("E-cores (" + h.value("ecores").toString() + ")", "ecore");
+        }
         const int k = affinity_->findData(keep);
         affinity_->setCurrentIndex(k < 0 ? 0 : k);
     }
@@ -526,11 +608,24 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
                          .arg(c.value("cpus").toString()).arg(c.value("l3_kib").toInt() / 1024)
                          .arg(c.value("max_khz").toInt() / 1000).arg(role);
         }
+        const QJsonObject hy = topology_.value("hybrid").toObject();
+        if (!hy.isEmpty()) {
+            // Intel hybrid: one shared L3, the useful split is P-cores vs E-cores.
+            lines.clear();
+            const QJsonArray cc = topology_.value("ccds").toArray();
+            const int l3 = cc.isEmpty() ? 0 : cc.first().toObject().value("l3_kib").toInt() / 1024;
+            lines << QStringLiteral("<b style='color:%1'>P-cores</b> · CPUs %2 · max %3 MHz")
+                         .arg(theme::ACCENT, hy.value("pcores").toString()).arg(hy.value("pcore_max_khz").toInt() / 1000);
+            lines << QStringLiteral("<b style='color:%1'>E-cores</b> · CPUs %2 · max %3 MHz")
+                         .arg(theme::OK, hy.value("ecores").toString()).arg(hy.value("ecore_max_khz").toInt() / 1000);
+            if (l3 > 0) lines << QStringLiteral("Shared L3 · %1 MB").arg(l3);
+        }
         if (lines.isEmpty()) lines << "No L3 topology found.";
         if (topology_.value("online").toString() != topology_.value("present").toString())
-            lines << QStringLiteral("<span style='color:%1'>Online CPUs: %2 of %3 — a CCD is parked or SMT is off.</span>")
-                         .arg(theme::WARN, topology_.value("online").toString(), topology_.value("present").toString());
-        else if (topology_.value("ccds").toArray().size() < 2)
+            lines << QStringLiteral("<span style='color:%1'>Online CPUs: %2 of %3 — %4 parked or SMT is off.</span>")
+                         .arg(theme::WARN, topology_.value("online").toString(), topology_.value("present").toString(),
+                              hy.isEmpty() ? QStringLiteral("a CCD is") : QStringLiteral("E-cores are"));
+        else if (hy.isEmpty() && topology_.value("ccds").toArray().size() < 2)
             lines << QStringLiteral("<span style='color:%1'>Single CCD: affinity, workqueue/IRQ steering and CCD parking do not apply.</span>").arg(theme::MUTED);
         topoLabel_->setText(lines.join("<br>"));
     }
@@ -822,7 +917,7 @@ void OptimizeTab::updateStateBanner() {
 
 QStringList OptimizeTab::presetNames() const {
     QStringList out;
-    for (const Builtin &b : BUILTINS) out << QString::fromLatin1(b.name);
+    for (const Builtin &b : BUILTINS) if (builtinForThisCpu(b)) out << QString::fromLatin1(b.name);
     QStringList user = QDir(presetsDir()).entryList({"*.json"}, QDir::Files, QDir::Name);
     for (QString &s : user) { s.chop(5); if (validPresetName(s) && !out.contains(s)) out << s; }
     return out;

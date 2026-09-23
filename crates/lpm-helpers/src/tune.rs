@@ -11,6 +11,11 @@
 //! the baseline back. Table order is apply order: amd_pstate/status comes
 //! first (it resets the per-policy files), CPU hot-plug comes last (an offline
 //! CPU's cpufreq policy rejects writes) and is restored first.
+//!
+//! Rows carry a [`Vendor`]: AMD-only rows (amd-pstate, CCD/X3D, amdgpu) and
+//! Intel-only rows (intel_pstate, hybrid P/E-core, uncore, RAPL, TCC, i915/xe)
+//! are hidden from `describe` and report "not available" on the other vendor,
+//! so one preset file stays portable across both.
 
 use crate::{canonical_in_sysfs, read_trimmed, sysfs_write};
 use serde_json::{json, Map, Value};
@@ -19,6 +24,37 @@ use std::path::{Path, PathBuf};
 pub const CPU_DIR: &str = "/sys/devices/system/cpu";
 pub const X3D_DRIVER_DIR: &str = "/sys/bus/platform/drivers/amd_x3d_vcache";
 pub const DEBUGFS: &str = "/sys/kernel/debug";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Vendor { Any, Amd, Intel }
+
+impl Vendor {
+    pub fn as_str(self) -> &'static str {
+        match self { Vendor::Any => "other", Vendor::Amd => "amd", Vendor::Intel => "intel" }
+    }
+}
+
+/// vendor_id of the first CPU in /proc/cpuinfo.
+pub fn vendor_from_cpuinfo(s: &str) -> Vendor {
+    for l in s.lines() {
+        let Some((k, v)) = l.split_once(':') else { continue };
+        if k.trim() != "vendor_id" { continue; }
+        return match v.trim() { "GenuineIntel" => Vendor::Intel, "AuthenticAMD" | "HygonGenuine" => Vendor::Amd, _ => Vendor::Any };
+    }
+    Vendor::Any
+}
+
+/// The running CPU's vendor (read once). `Any` if unknown.
+pub fn cpu_vendor() -> Vendor {
+    static V: std::sync::OnceLock<Vendor> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::fs::read_to_string("/proc/cpuinfo").map(|s| vendor_from_cpuinfo(&s)).unwrap_or(Vendor::Any))
+}
+
+fn vendor_ok(t: &Tunable) -> bool { t.vendor == Vendor::Any || t.vendor == cpu_vendor() }
+
+/// Hybrid (Alder Lake and later) core class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CoreType { P, E }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -49,8 +85,22 @@ pub enum Target {
     PerPolicy(&'static str),
     /// Same file in the cpufreq policies covering one CCD (index into ccx_groups).
     PerCcdPolicy(&'static str, usize),
-    /// Per-policy `boost` (6.11+), else global cpufreq/boost.
+    /// Per-policy `boost` (6.11+), else global cpufreq/boost, else
+    /// intel_pstate/no_turbo (inverted: the preset value stays "1 = turbo on").
     Boost,
+    /// Same file in the cpufreq policies of one hybrid core class (Intel P/E).
+    PerCoreType(&'static str, CoreType),
+    /// Same file under every cpuN/ (e.g. power/energy_perf_bias).
+    PerCpu(&'static str),
+    /// intel_uncore_frequency/<domain>/<file> for every uncore domain.
+    Uncore(&'static str),
+    /// RAPL package-domain power limit in watts for the named constraint
+    /// (long_term / short_term), on both the MSR and the MMIO interface.
+    RaplWatts(&'static str),
+    /// cur_state of the "TCC Offset" thermal cooling device (intel_tcc_cooling).
+    TccOffset,
+    /// Intel iGPU GT attribute: i915 card*/gt/gt*/<i915>, xe card*/device/tile*/gt*/freq0/<xe>.
+    IntelGt { i915: &'static str, xe: &'static str },
     /// amd_x3d_vcache/<instance>/amd_x3d_mode, instance discovered at runtime.
     X3d,
     /// Per-policy scaling_min_freq from a sibling frequency file.
@@ -85,15 +135,19 @@ pub struct Tunable {
     pub debugfs: bool,
     /// Can visibly hurt stability, thermals or idle power; the GUI marks it.
     pub caution: bool,
+    /// Only offered on this CPU vendor.
+    pub vendor: Vendor,
 }
 
 const fn t(key: &'static str, group: &'static str, label: &'static str, help: &'static str,
            kind: Kind, options: Options, target: Target) -> Tunable {
-    Tunable { key, group, label, help, kind, options, target, debugfs: false, caution: false }
+    Tunable { key, group, label, help, kind, options, target, debugfs: false, caution: false, vendor: Vendor::Any }
 }
 const fn int(min: i64, max: i64) -> Kind { Kind::Int { min, max } }
 const fn dbg(mut x: Tunable) -> Tunable { x.debugfs = true; x }
 const fn warn(mut x: Tunable) -> Tunable { x.caution = true; x }
+const fn amd(mut x: Tunable) -> Tunable { x.vendor = Vendor::Amd; x }
+const fn intel(mut x: Tunable) -> Tunable { x.vendor = Vendor::Intel; x }
 const BR: Options = Options::Bracketed;
 const NO: Options = Options::None;
 
@@ -102,57 +156,101 @@ pub const HOTPLUG_KEYS: &[&str] = &["cpu.smt", "cpu.ccd_park"];
 
 pub const TUNABLES: &[Tunable] = &[
     // ── CPU ───────────────────────────────────────────────────────────────
-    t("cpu.pstate_status", "CPU", "amd-pstate mode",
+    amd(t("cpu.pstate_status", "CPU", "amd-pstate mode",
       "active = EPP/CPPC decides frequency (recommended on Zen 2+); guided = kernel sets a floor, firmware the rest; passive = legacy governor control. Leave on active unless you have a specific reason: guided/passive exist mainly for older firmware or debugging odd boost behaviour. Changing it resets every per-policy governor/EPP value underneath, which is why this row is always applied first and restored last of the non-hot-plug rows.",
-      Kind::Choice, Options::Fixed(&["active", "guided", "passive"]), Target::File("/sys/devices/system/cpu/amd_pstate/status")),
-    t("cpu.dynamic_epp", "CPU", "Dynamic EPP (amd-pstate)",
+      Kind::Choice, Options::Fixed(&["active", "guided", "passive"]), Target::File("/sys/devices/system/cpu/amd_pstate/status"))),
+    intel(t("cpu.intel_pstate_status", "CPU", "intel_pstate mode",
+      "active = the CPU's own HWP (Speed Shift) logic picks the frequency and the governor/EPP rows below are hints to it - the right mode on every HWP-capable Intel CPU (6th gen and later). passive = intel_pstate becomes a plain cpufreq driver ('intel_cpufreq') driven by a kernel governor such as schedutil: useful only for comparing governors or on firmware with broken HWP. 'off' is deliberately not offered (it unloads frequency control entirely). Changing it resets every per-policy governor/EPP/limit underneath, so it is applied before any of them.",
+      Kind::Choice, Options::Fixed(&["active", "passive"]), Target::File("/sys/devices/system/cpu/intel_pstate/status"))),
+    amd(t("cpu.dynamic_epp", "CPU", "Dynamic EPP (amd-pstate)",
       "Kernel 7.x amd-pstate feature: switches every policy's EPP automatically with the power source (AC = performance-leaning, battery = power-leaning). While enabled the kernel owns EPP, so the global and per-CCD EPP rows below are refused (EBUSY) or overridden on the next AC/battery change - applied right after the pstate mode so 'disabled' lands before any EPP row; disable it when you tune EPP by hand or per game.",
-      Kind::Choice, Options::Fixed(&["enabled", "disabled"]), Target::File("/sys/devices/system/cpu/amd_pstate/dynamic_epp")),
+      Kind::Choice, Options::Fixed(&["enabled", "disabled"]), Target::File("/sys/devices/system/cpu/amd_pstate/dynamic_epp"))),
     t("cpu.governor", "CPU", "Scaling governor",
       "In amd-pstate active mode this mostly gates EPP: 'performance' pins EPP to 0 regardless of the EPP row below, 'powersave' lets EPP decide. For gaming keep 'powersave' here and control behaviour with EPP instead - EPP has finer steps (5 levels vs 2) and swaps faster. Set 'performance' only for a fixed worst-case floor (e.g. Competitive preset) or on kernels/firmware where EPP is ignored. On a 2+ CCD chip this row is hidden - set Governor · CCD0 and · CCD1 instead (to the same value, if you want one governor for the whole chip); a single-CCD chip has no CCD rows, so this is the only place to set it.",
       Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerPolicy("scaling_governor")),
     t("cpu.epp", "CPU", "Energy-performance preference",
       "EPP hint to CPPC firmware (active mode), five steps from most aggressive to most efficient. Needs governor 'powersave' to take effect. Pick by scenario: competitive/latency-sensitive -> performance; general gaming on AC -> balance_performance (usually indistinguishable in fps, noticeably cooler/quieter); on battery or light desktop work -> balance_power; power -> power-priority, expect lower sustained clocks. If frame times feel spiky right after a load change, try balance_performance before touching anything else - that spikiness is often EPP being too cautious to boost. On a 2+ CCD chip this row is hidden - set EPP · CCD0 and · CCD1 instead; a single-CCD chip has no CCD rows, so this is the only place to set it.",
       Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerPolicy("energy_performance_preference")),
-    t("cpu.epp_boost", "CPU", "amd-pstate epp_boost",
+    amd(t("cpu.epp_boost", "CPU", "amd-pstate epp_boost",
       "EPP boost module parameter (global; the patch series has no per-policy knob). Only on kernels with the (not upstream) epp_boost patch. Leave off unless you specifically built a kernel with this patch and want EPP to react faster; harmless no-op otherwise, the row will show n/a.",
-      Kind::Bool, NO, Target::File("/sys/module/amd_pstate/parameters/epp_boost")),
+      Kind::Bool, NO, Target::File("/sys/module/amd_pstate/parameters/epp_boost"))),
     t("cpu.boost", "CPU", "Core performance boost",
-      "Turbo (core performance boost). Leave it on for normal use - this is not a fps knob, it only removes the clock ceiling above base. Turn it off for two specific jobs: (1) thermal/fan-curve testing where you want repeatable numbers, (2) validating Ryzen Curve Optimizer offsets, since boost clocks typically first expose an unstable core (use the CO validation preset, which also widens C-states and shortens the MCE poll).",
+      "Turbo (core performance boost). Leave it on for normal use - this is not a fps knob, it only removes the clock ceiling above base. On Intel this drives intel_pstate/no_turbo (inverted, so 1 still means turbo on). Turn it off for two specific jobs: (1) thermal/fan-curve testing where you want repeatable numbers, (2) validating undervolt/Curve Optimizer offsets, since boost clocks typically first expose an unstable core (use the CO validation preset, which also widens C-states and shortens the MCE poll).",
       Kind::Bool, NO, Target::Boost),
     t("cpu.min_freq", "CPU", "Minimum frequency",
-      "lowest_nonlinear raises the CPU's idle floor to amd_pstate_lowest_nonlinear_freq (typically 400-600 MHz above the hardware minimum): frequencies below that point are inefficient on Zen, disproportionate wake-up latency for negligible power savings. Safe to enable for every scenario, including battery; the lowest-risk, no-downside row on this whole tab.",
+      "(Only 'cpuinfo_min' is offered on Intel: intel_pstate has no lowest-nonlinear file and HWP already avoids the inefficient range on its own.) lowest_nonlinear raises the CPU's idle floor to amd_pstate_lowest_nonlinear_freq (typically 400-600 MHz above the hardware minimum): frequencies below that point are inefficient on Zen, disproportionate wake-up latency for negligible power savings. Safe to enable for every scenario, including battery; the lowest-risk, no-downside row on this whole tab.",
       Kind::Choice, Options::Special, Target::MinFreq),
     // Per-CCD overrides: applied after the global rows above, so a preset can
     // set everything and then split the dies (e.g. V-Cache die performance,
     // frequency die balance_power while it only hosts IRQs and background work).
-    t("cpu.governor_ccd0", "CPU", "Governor · CCD0",
+    amd(t("cpu.governor_ccd0", "CPU", "Governor · CCD0",
       "Scaling governor for CCD0's CPUs (the global 'Scaling governor' row is hidden on 2+ CCD chips - this and the CCD1 row are how you set it). Set both CCD rows the same for one governor across the whole chip, or split them for asymmetric behaviour: powersave on the CCD whose EPP row you are actually using, since 'performance' here pins EPP and makes the EPP row moot.",
-      Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerCcdPolicy("scaling_governor", 0)),
-    t("cpu.governor_ccd1", "CPU", "Governor · CCD1",
+      Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerCcdPolicy("scaling_governor", 0))),
+    amd(t("cpu.governor_ccd1", "CPU", "Governor · CCD1",
       "Scaling governor for CCD1's CPUs (the global row is hidden on 2+ CCD chips). See the CCD0 row for how to set this.",
-      Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerCcdPolicy("scaling_governor", 1)),
-    t("cpu.epp_ccd0", "CPU", "EPP · CCD0",
+      Kind::Choice, Options::ListFile("scaling_available_governors"), Target::PerCcdPolicy("scaling_governor", 1))),
+    amd(t("cpu.epp_ccd0", "CPU", "EPP · CCD0",
       "EPP for CCD0's CPUs (the global EPP row is hidden on 2+ CCD chips - this and the CCD1 row are how you set it). Needs governor 'powersave' on CCD0 (see the Governor · CCD0 row) - 'performance' pins EPP and this row becomes moot. Concrete split for a V-Cache part: CCD0 = V-Cache -> performance here (the game runs there); CCD1 = frequency die -> balance_power on its own row, since it is mostly idle plus background/IRQ work during a game. That is exactly what the Gaming X3D and Competitive presets set (wq/irq affinity also point at CCD1).",
-      Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCcdPolicy("energy_performance_preference", 0)),
-    t("cpu.epp_ccd1", "CPU", "EPP · CCD1",
+      Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCcdPolicy("energy_performance_preference", 0))),
+    amd(t("cpu.epp_ccd1", "CPU", "EPP · CCD1",
       "EPP for CCD1's CPUs (the global row is hidden on 2+ CCD chips). Needs governor 'powersave' on CCD1 (Governor · CCD1 row). See the CCD0 row for the usual split.",
-      Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCcdPolicy("energy_performance_preference", 1)),
-    t("cpu.boost_ccd0", "CPU", "Boost · CCD0",
+      Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCcdPolicy("energy_performance_preference", 1))),
+    amd(t("cpu.boost_ccd0", "CPU", "Boost · CCD0",
       "Turbo for CCD0's CPUs only (needs kernel 6.11+ with per-policy boost; shows n/a otherwise, use the global Boost row instead). Use this to trade one die's headroom for the other's: turn boost off on the idle/background CCD so its heat and power budget go to the CCD doing the work.",
-      Kind::Bool, NO, Target::PerCcdPolicy("boost", 0)),
-    t("cpu.boost_ccd1", "CPU", "Boost · CCD1",
+      Kind::Bool, NO, Target::PerCcdPolicy("boost", 0))),
+    amd(t("cpu.boost_ccd1", "CPU", "Boost · CCD1",
       "Turbo for CCD1's CPUs only (needs kernel 6.11+ with per-policy boost). See the CCD0 row for why you would split this.",
-      Kind::Bool, NO, Target::PerCcdPolicy("boost", 1)),
-    t("cpu.max_freq_ccd0", "CPU", "Max frequency · CCD0 (kHz)",
+      Kind::Bool, NO, Target::PerCcdPolicy("boost", 1))),
+    amd(t("cpu.max_freq_ccd0", "CPU", "Max frequency · CCD0 (kHz)",
       "Hard frequency ceiling (kHz) for CCD0's CPUs, independent of boost/EPP. The kernel clamps whatever you enter to the hardware's real range, so an oversized value is harmless - it just becomes the hardware max. Two uses: (1) cap the non-gaming CCD low (e.g. 3500000 = 3.5 GHz) to keep it cool and quiet while it only handles background work; (2) cap a whole CCD during thermal testing instead of disabling boost outright, for a repeatable non-zero ceiling. Leave unchecked for normal gaming.",
-      int(400_000, 7_000_000), NO, Target::PerCcdPolicy("scaling_max_freq", 0)),
-    t("cpu.max_freq_ccd1", "CPU", "Max frequency · CCD1 (kHz)",
+      int(400_000, 7_000_000), NO, Target::PerCcdPolicy("scaling_max_freq", 0))),
+    amd(t("cpu.max_freq_ccd1", "CPU", "Max frequency · CCD1 (kHz)",
       "Hard frequency ceiling (kHz) for CCD1's CPUs. See the CCD0 row for the two common uses (capping the idle CCD, or repeatable thermal tests).",
-      int(400_000, 7_000_000), NO, Target::PerCcdPolicy("scaling_max_freq", 1)),
-    t("cpu.x3d_mode", "CPU", "3D V-Cache CCD preference",
+      int(400_000, 7_000_000), NO, Target::PerCcdPolicy("scaling_max_freq", 1))),
+    // ── Intel (intel_pstate / hybrid / uncore / RAPL / TCC) ───────────────
+    // After the global governor/EPP/boost rows, so the P/E-core overrides win.
+    intel(t("cpu.hwp_dynamic_boost", "CPU", "HWP dynamic boost",
+      "intel_pstate raises the HWP minimum for a moment when a task wakes up after waiting on I/O, so a thread that just got its data back does not start at the idle clock. 1 = on: lower wake-up latency for bursty, I/O-bound work (asset streaming, shader compiles) at a small idle-power cost; the Intel gaming presets turn it on. 0 = the kernel default. Only takes effect in active mode with HWP.",
+      Kind::Bool, NO, Target::File("/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost"))),
+    intel(t("cpu.max_perf_pct", "CPU", "Max performance (%)",
+      "Global intel_pstate ceiling as a percentage of the highest turbo P-state, applied on top of every policy's scaling_max_freq. 100 = no cap. A lower value (e.g. 70-80) is the simplest way to take the top, least efficient turbo bins away on battery or for a quiet profile without disabling turbo outright. Applied before the minimum row; the kernel refuses a max below the current min.",
+      int(1, 100), NO, Target::File("/sys/devices/system/cpu/intel_pstate/max_perf_pct"))),
+    intel(t("cpu.min_perf_pct", "CPU", "Min performance (%)",
+      "Global intel_pstate floor as a percentage of the highest P-state (stock is the hardware minimum, usually 15-20%). Raising it keeps clocks up between bursts - a blunt latency tool that costs idle power and heat on every core; prefer EPP · P-cores = performance first. Cannot exceed Max performance.",
+      int(1, 100), NO, Target::File("/sys/devices/system/cpu/intel_pstate/min_perf_pct"))),
+    intel(t("cpu.epb", "CPU", "Energy-performance bias (EPB)",
+      "Legacy IA32_ENERGY_PERF_BIAS per CPU, 0 (performance) … 15 (power saving); 6 is the normal default. With HWP active EPP is what matters and EPB mostly steers uncore/package decisions. Shows n/a when the kernel does not expose power/energy_perf_bias.",
+      int(0, 15), NO, Target::PerCpu("power/energy_perf_bias"))),
+    intel(t("cpu.epp_pcore", "CPU", "EPP · P-cores",
+      "EPP for the performance cores only (/sys/devices/cpu_core/cpus). The game's main threads live here: performance for competitive play, balance_performance for everything else. Applied after the global EPP row, so a preset can set everything to balance_performance and then push only the P-cores. Needs governor 'powersave' (active mode).",
+      Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCoreType("energy_performance_preference", CoreType::P))),
+    intel(t("cpu.epp_ecore", "CPU", "EPP · E-cores",
+      "EPP for the efficient cores only (/sys/devices/cpu_atom/cpus). During a game they mostly run background work, IRQs and helper threads: balance_power keeps them from eating the package power budget the P-cores and the dGPU could use, which on a laptop often raises the P-cores' sustained clock.",
+      Kind::Choice, Options::ListFile("energy_performance_available_preferences"), Target::PerCoreType("energy_performance_preference", CoreType::E))),
+    intel(t("cpu.max_freq_pcore", "CPU", "Max frequency · P-cores (kHz)",
+      "Frequency ceiling for the P-cores, independent of turbo/EPP; the kernel clamps to the real range. Use it to cut the last turbo bins (a big share of the voltage and heat) while keeping all-core clocks, e.g. 4800000 on a 5.3 GHz part.",
+      int(400_000, 7_000_000), NO, Target::PerCoreType("scaling_max_freq", CoreType::P))),
+    intel(t("cpu.max_freq_ecore", "CPU", "Max frequency · E-cores (kHz)",
+      "Frequency ceiling for the E-cores. Capping them (e.g. 3000000) while a game runs on the P-cores frees package power and thermal headroom for the P-cores at almost no cost to background work.",
+      int(400_000, 7_000_000), NO, Target::PerCoreType("scaling_max_freq", CoreType::E))),
+    intel(t("cpu.uncore_max_khz", "CPU", "Uncore max frequency (kHz)",
+      "Ceiling of the uncore (ring/fabric, L3, memory path) from intel_uncore_frequency. Lowering it saves several watts of package power on battery at the cost of memory latency and L3 bandwidth - bad for games, fine for desktop work. Applied before the minimum row.",
+      int(400_000, 8_000_000), NO, Target::Uncore("max_freq_khz"))),
+    intel(t("cpu.uncore_min_khz", "CPU", "Uncore min frequency (kHz)",
+      "Floor of the uncore clock. Raising it (up to the max) removes the ramp-up delay of the ring/memory path after idle - a small but measurable win in frame-time consistency for latency-sensitive games, paid for with idle package power. Leave at the stock minimum on battery.",
+      int(400_000, 8_000_000), NO, Target::Uncore("min_freq_khz"))),
+    warn(intel(t("cpu.rapl_pl1", "CPU", "RAPL PL1 · long term (W)",
+      "Package sustained power limit, written to both RAPL interfaces (MSR intel-rapl and MMIO intel-rapl-mmio). On a Legion the EC also programs PL1 through the firmware attribute 'ppt_pl1_spl' and re-programs it on every platform-profile change, so prefer the Firmware Attributes tab (Custom profile) and use this row for testing or on machines without that attribute. Lower = cooler and quieter, higher = more sustained all-core clock if cooling allows.",
+      int(5, 400), NO, Target::RaplWatts("long_term")))),
+    warn(intel(t("cpu.rapl_pl2", "CPU", "RAPL PL2 · short term (W)",
+      "Package short-term (turbo burst) power limit on both RAPL interfaces. Same caveat as PL1: the EC's 'ppt_pl2_sppt' firmware attribute rewrites it on a profile change. Keep it >= PL1.",
+      int(5, 400), NO, Target::RaplWatts("short_term")))),
+    intel(t("cpu.tcc_offset", "CPU", "TCC offset (°C below TjMax)",
+      "Thermal Control Circuit activation offset (intel_tcc_cooling): the CPU starts throttling this many degrees below TjMax (e.g. 105 °C - 10 = 95 °C). Keeps a laptop's surface and fans calmer under sustained load and trims the hottest, least efficient turbo; 0 = stock. Not an undervolt: voltage is unchanged, the ceiling just arrives earlier.",
+      int(0, 63), NO, Target::TccOffset)),
+    amd(t("cpu.x3d_mode", "CPU", "3D V-Cache CCD preference",
       "amd_x3d_vcache driver hint (kernel 6.13+, X3D chips only) telling the scheduler which CCD to prefer for new threads. cache = V-Cache CCD first: right for almost every game, since large working sets (open-world titles, simulation-heavy games, emulators) benefit most from the extra L3. frequency = the higher-clocked CCD: better for single-threaded or clock-sensitive work (compiling, older/less cache-hungry engines, clock-bound benchmarks). Combine with the launch affinity in the Game launch tab to actually pin the game process, not just hint the scheduler. Written with a 3 s timeout: some BIOS/AGESA versions stall in the ACPI call; a timeout is reported as a failure for this row but does not block the rest of Apply.",
-      Kind::Choice, Options::Fixed(&["frequency", "cache"]), Target::X3d),
+      Kind::Choice, Options::Fixed(&["frequency", "cache"]), Target::X3d)),
     warn(t("cpu.cstate_max", "CPU", "Deepest C-state kept",
       "Disables every C-state deeper than the one you pick, on every CPU. Two reasons to touch this: (1) input-latency chasing - deep C-states add microseconds of wake-up jitter on the way back to full clock, so capping to a shallower state trims worst-case latency at the cost of idle power and heat; (2) Curve Optimizer validation - the transition out of a deep idle state back to boost clock is exactly where a marginal core first crashes, so capping C-states while dialing in offsets (paired with a short MCE poll interval) surfaces instability faster than gaming normally would. Day-to-day/battery use: leave at 'all enabled'. Meant to be temporary, not a permanent setting.",
       Kind::Choice, Options::Special, Target::CState)),
@@ -280,9 +378,18 @@ pub const TUNABLES: &[Tunable] = &[
     t("usb.autosuspend", "Devices", "USB autosuspend delay (s)",
       "Default autosuspend delay (seconds) applied to USB devices as they are plugged in or the driver binds. -1 disables autosuspend entirely for newly-bound devices: no risk of a mouse/controller/USB DAC needing a moment to wake up right when you move it - the recommended value for gaming peripherals. This only affects devices that bind after the change; anything already plugged in keeps whatever delay it already had (replug it, or reboot with this in the boot preset, to apply retroactively). A positive number is the idle seconds before autosuspend for devices without their own override.",
       int(-1, 3600), NO, Target::File("/sys/module/usbcore/parameters/autosuspend")),
-    t("gpu.amdgpu_dpm", "Devices", "iGPU DPM level (amdgpu)",
+    amd(t("gpu.amdgpu_dpm", "Devices", "iGPU DPM level (amdgpu)",
       "Forces the integrated Radeon GPU's power state. 'low' pins the iGPU to its lowest performance level, freeing shared SoC power/thermal budget for the CPU cores - worth trying specifically when gaming on the discrete GPU, since the iGPU is doing nothing but display output/compositing anyway. 'auto' (default) lets the driver manage it dynamically. 'high' forces maximum iGPU performance, only useful running GPU work on the iGPU itself (rare on a laptop with a discrete GPU) - not something a gaming preset should set.",
-      Kind::Choice, Options::Fixed(&["auto", "low", "high"]), Target::AmdgpuDpm),
+      Kind::Choice, Options::Fixed(&["auto", "low", "high"]), Target::AmdgpuDpm)),
+    intel(t("gpu.intel_max_mhz", "Devices", "iGPU max frequency (Intel, MHz)",
+      "Ceiling of the Intel integrated GPU (i915 rps_max_freq_mhz / xe max_freq). Same idea as the amdgpu 'low' level on AMD: while the game renders on the NVIDIA dGPU the iGPU only composites the desktop, so capping it hands the shared package power budget to the CPU cores. The kernel refuses values outside RPn…RP0 and a max below the current min.",
+      int(100, 4000), NO, Target::IntelGt { i915: "rps_max_freq_mhz", xe: "max_freq" })),
+    intel(t("gpu.intel_min_mhz", "Devices", "iGPU min frequency (Intel, MHz)",
+      "Floor of the Intel iGPU clock. Only worth raising when the iGPU itself renders (hybrid mode, video playback stutter); otherwise leave it at the hardware minimum (RPn).",
+      int(100, 4000), NO, Target::IntelGt { i915: "rps_min_freq_mhz", xe: "min_freq" })),
+    intel(t("gpu.intel_slpc_profile", "Devices", "iGPU SLPC power profile (i915)",
+      "GuC SLPC power profile of the Intel iGPU: base = stock frequency management, power_saving = the GuC keeps the iGPU clock lower and ramps more slowly. power_saving is a free battery win when the dGPU does the rendering.",
+      Kind::Choice, BR, Target::IntelGt { i915: "slpc_power_profile", xe: "" })),
     // ── Stability ─────────────────────────────────────────────────────────
     t("mce.check_interval", "Stability", "MCE poll interval (s)",
       "Polling interval (seconds) for correctable machine-check errors (early-warning signs of a marginal core/memory, short of a full crash). Stock is 300s. 10s (what the CO validation preset uses) catches a marginal Curve Optimizer offset within seconds of it starting to misbehave instead of up to 5 minutes later - pair with `dmesg -w` or rasdaemon open in a terminal while stress-testing a new offset. Set back to something relaxed (or 0 to stop polling) for normal use; frequent polling has a small but real overhead not worth paying permanently.",
@@ -291,8 +398,8 @@ pub const TUNABLES: &[Tunable] = &[
     warn(t("cpu.smt", "CPU", "SMT",
       "Turns SMT (the second logical thread per physical core) on or off system-wide. Most games are unaffected or slightly faster with SMT on (more threads available); a minority of titles - especially ones sensitive to cache contention between sibling threads, or with poor thread-count scaling - show better 1% lows with it off, since every physical core is then dedicated to one thread with no sibling contention. This is genuinely game-specific: test SMT on vs off on the specific title if chasing 1% lows. Hot-plugs half the CPUs off/online, which is why this row is always applied last and restored first - every other per-CPU setting needs the CPU online first to accept the write.",
       Kind::Choice, Options::Fixed(&["on", "off"]), Target::File("/sys/devices/system/cpu/smt/control"))),
-    warn(t("cpu.ccd_park", "CPU", "Park a CCD (offline)",
-      "Takes an entire CCD fully offline (every CPU in it): no scheduling, no IRQs, no cross-CCD cache-coherency traffic can reach it at all. The most deterministic possible setup for an X3D chip - the game gets sole, uncontested use of one die's cache and cores with zero interference from the other die under any circumstance - at the obvious cost of losing that die's cores entirely until restored. The Competitive preset parks the frequency CCD as its most aggressive step; only reach for this if affinity plus workqueue/IRQ steering (which achieve most of the isolation benefit without losing any cores) is not enough for what you are chasing. cpu0's CCD can never be parked (the kernel needs cpu0 online), so on a 2-CCD chip you can only ever park 'the other one'.",
+    warn(t("cpu.ccd_park", "CPU", "Park a CCD / E-cores (offline)",
+      "On a hybrid Intel CPU this parks the E-cores instead (the P-cores hold cpu0 and can never be parked): the game then only ever shares the ring with P-cores - a test tool for titles with bad hybrid scheduling, not a daily setting. Takes an entire CCD fully offline (every CPU in it): no scheduling, no IRQs, no cross-CCD cache-coherency traffic can reach it at all. The most deterministic possible setup for an X3D chip - the game gets sole, uncontested use of one die's cache and cores with zero interference from the other die under any circumstance - at the obvious cost of losing that die's cores entirely until restored. The Competitive preset parks the frequency CCD as its most aggressive step; only reach for this if affinity plus workqueue/IRQ steering (which achieve most of the isolation benefit without losing any cores) is not enough for what you are chasing. cpu0's CCD can never be parked (the kernel needs cpu0 online), so on a 2-CCD chip you can only ever park 'the other one'.",
       Kind::Choice, Options::Special, Target::CcdPark)),
 ];
 
@@ -346,12 +453,49 @@ fn ccd_policies(ccd: usize) -> Vec<PathBuf> {
     let groups = ccx_groups();
     if groups.len() < 2 { return vec![]; }
     let Some(g) = groups.get(ccd) else { return vec![] };
+    policies_within(&g.cpus)
+}
+
+/// cpufreq policies whose CPUs all belong to `set`.
+fn policies_within(set: &[usize]) -> Vec<PathBuf> {
+    if set.is_empty() { return vec![]; }
     policies().into_iter().filter(|p| {
         let cpus = read(&p.join("related_cpus")).map(|s| s.split_whitespace().filter_map(|c| c.parse().ok()).collect::<Vec<usize>>())
             .unwrap_or_default();
-        !cpus.is_empty() && cpus.iter().all(|c| g.cpus.contains(c))
+        !cpus.is_empty() && cpus.iter().all(|c| set.contains(c))
     }).collect()
 }
+
+/// Intel hybrid core classes from the perf PMU nodes (cpu_core / cpu_atom).
+/// Lists are as the kernel reports them (all present CPUs of that class).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hybrid { pub pcores: Vec<usize>, pub ecores: Vec<usize> }
+
+pub fn hybrid() -> Option<Hybrid> {
+    let list = |n: &str| read(&Path::new("/sys/devices").join(n).join("cpus")).map(|s| cpu_list(&s)).unwrap_or_default();
+    let (p, e) = (list("cpu_core"), list("cpu_atom"));
+    (!p.is_empty() && !e.is_empty()).then_some(Hybrid { pcores: p, ecores: e })
+}
+
+fn core_type_cpus(ct: CoreType) -> Vec<usize> {
+    hybrid().map(|h| match ct { CoreType::P => h.pcores, CoreType::E => h.ecores }).unwrap_or_default()
+}
+
+/// A hybrid core class as a Ccx-shaped CPU group (online CPUs only), for the
+/// same affinity / workqueue / IRQ / park role machinery the CCDs use.
+fn hybrid_group(ct: CoreType) -> Option<Ccx> {
+    let online = online_cpus();
+    let cpus: Vec<usize> = core_type_cpus(ct).into_iter().filter(|c| online.is_empty() || online.contains(c)).collect();
+    if cpus.is_empty() { return None; }
+    let max_khz = cpus.iter()
+        .filter_map(|c| read(&Path::new(CPU_DIR).join(format!("cpu{c}/cpufreq/cpuinfo_max_freq"))))
+        .filter_map(|s| s.parse().ok()).max().unwrap_or(0);
+    let l3_kib = cpus.first().and_then(|c| read(&Path::new(CPU_DIR).join(format!("cpu{c}/cache/index3/size")))).map_or(0, |s| size_kib(&s));
+    Some(Ccx { index: if ct == CoreType::P { 0 } else { 1 }, cpus, l3_kib, max_khz })
+}
+
+/// More than one steerable CPU domain: 2+ CCDs, or a hybrid P/E split.
+fn has_domains() -> bool { ccx_groups().len() > 1 || hybrid().is_some() }
 
 pub fn x3d_mode_path() -> Option<PathBuf> {
     std::fs::read_dir(X3D_DRIVER_DIR).ok()?.flatten()
@@ -443,28 +587,55 @@ pub struct Ccx { pub index: usize, pub cpus: Vec<usize>, pub l3_kib: u64, pub ma
 /// L3 domains of the online CPUs, sorted by first CPU. A parked CCD has no
 /// online CPU and does not appear.
 pub fn ccx_groups() -> Vec<Ccx> {
-    let mut seen: Vec<String> = Vec::new();
-    let mut out = Vec::new();
-    for (_, d) in cpus() {
+    // Built from online CPUs only, and groups whose L3 lists overlap are merged.
+    // Deduplicating by the raw shared_cpu_list string is not enough: while SMT
+    // or CCD parking hot-plugs CPUs, one CPU can still report "0-7,16-23" and
+    // the next "0-7" for the same L3 — two "CCDs" with the same cache size, so
+    // resolve_ccd("cache") saw a tie and the game ran unpinned on every CPU.
+    let online = online_cpus();
+    let is_online = |c: &usize| online.is_empty() || online.contains(c);
+    let mut l3 = Vec::new();
+    for (n, d) in cpus() {
+        if !is_online(&(n as usize)) { continue; }
         let idx = d.join("cache/index3");
         if read(&idx.join("level")).as_deref() != Some("3") { continue; }
         let Some(list) = read(&idx.join("shared_cpu_list")) else { continue };
-        if seen.contains(&list) { continue; }
-        seen.push(list.clone());
-        let cpus = cpu_list(&list);
-        let max_khz = cpus.iter()
+        l3.push((n as usize, cpu_list(&list), read(&idx.join("size")).map_or(0, |s| size_kib(&s))));
+    }
+    let mut out = group_l3(l3, &online);
+    for g in &mut out {
+        g.max_khz = g.cpus.iter()
             .filter_map(|c| read(&Path::new(CPU_DIR).join(format!("cpu{c}/cpufreq/cpuinfo_max_freq"))))
             .filter_map(|s| s.parse().ok()).max().unwrap_or(0);
-        out.push(Ccx { index: 0, cpus, l3_kib: read(&idx.join("size")).map_or(0, |s| size_kib(&s)), max_khz });
     }
     out.sort_by_key(|g| g.cpus.first().copied().unwrap_or(0));
     for (i, g) in out.iter_mut().enumerate() { g.index = i; }
     out
 }
+/// (cpu, its L3 shared_cpu_list, L3 KiB) per online CPU -> merged L3 domains.
+fn group_l3(entries: Vec<(usize, Vec<usize>, u64)>, online: &[usize]) -> Vec<Ccx> {
+    let mut out: Vec<Ccx> = Vec::new();
+    for (n, list, l3_kib) in entries {
+        let mut cpus: Vec<usize> = list.into_iter().filter(|c| online.is_empty() || online.contains(c)).collect();
+        if !cpus.contains(&n) { cpus.push(n); }
+        // A CPU list can bridge two existing groups only transiently; absorb all it touches.
+        let (hit, mut rest): (Vec<Ccx>, Vec<Ccx>) = out.into_iter().partition(|g| g.cpus.iter().any(|c| cpus.contains(c)));
+        let mut merged = Ccx { index: 0, cpus, l3_kib, max_khz: 0 };
+        for g in hit { merged.cpus.extend(g.cpus); merged.l3_kib = merged.l3_kib.max(g.l3_kib); }
+        merged.cpus.sort_unstable();
+        merged.cpus.dedup();
+        rest.push(merged);
+        out = rest;
+    }
+    out
+}
 
-/// "cache" | "frequency" | "ccdN" -> that L3 domain. None on single-CCD
-/// parts or when the role does not tell the dies apart.
 pub fn resolve_ccd(groups: &[Ccx], role: &str) -> Option<Ccx> {
+    match role {
+        "pcore" => return hybrid_group(CoreType::P),
+        "ecore" => return hybrid_group(CoreType::E),
+        _ => {}
+    }
     if groups.len() < 2 { return None; }
     let pick = match role {
         "cache" => {
@@ -500,6 +671,11 @@ fn role_options(groups: &[Ccx], park: bool) -> Vec<(String, String)> {
             v.push((format!("ccd{}", g.index), format!("CCD{} ({}, {} MB L3)", g.index, fmt_cpu_list(&g.cpus), g.l3_kib / 1024)));
         }
     }
+    for (role, what, ct) in [("pcore", "P-cores", CoreType::P), ("ecore", "E-cores", CoreType::E)] {
+        if let Some(g) = hybrid_group(ct).filter(|g| usable(g)) {
+            v.push((role.to_owned(), format!("{what} ({})", fmt_cpu_list(&g.cpus))));
+        }
+    }
     v
 }
 
@@ -509,7 +685,7 @@ fn online_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("online")).map(|s
 
 /// Which role option describes this CPU set, if any.
 fn role_matching(groups: &[Ccx], set: &[usize]) -> Option<String> {
-    for role in ["cache", "frequency"] {
+    for role in ["cache", "frequency", "pcore", "ecore"] {
         if resolve_ccd(groups, role).map_or(false, |g| g.cpus == set) { return Some(role.into()); }
     }
     groups.iter().find(|g| g.cpus == set).map(|g| format!("ccd{}", g.index))
@@ -585,6 +761,65 @@ fn amdgpu_dpm_files() -> Vec<PathBuf> {
     v
 }
 
+fn uncore_files(f: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(Path::new(CPU_DIR).join("intel_uncore_frequency")).into_iter().flatten().flatten()
+        .map(|e| e.path().join(f))
+        .filter(|p| p.is_file())
+        .collect();
+    v.sort();
+    v
+}
+
+const POWERCAP: &str = "/sys/class/powercap";
+
+/// Package-domain constraint_N_power_limit_uw files whose constraint_N_name is `name`.
+fn rapl_files(name: &str) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(POWERCAP).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let top = (n.starts_with("intel-rapl:") || n.starts_with("intel-rapl-mmio:")) && n.matches(':').count() == 1;
+        if !top || !read(&e.path().join("name")).map_or(false, |x| x.starts_with("package")) { continue; }
+        for i in 0..8 {
+            if read(&e.path().join(format!("constraint_{i}_name"))).as_deref() == Some(name) {
+                let f = e.path().join(format!("constraint_{i}_power_limit_uw"));
+                if f.is_file() { if let Some(c) = canonical_in_sysfs(&f) { v.push(c); } }
+            }
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+fn tcc_files() -> Vec<PathBuf> {
+    numbered(Path::new("/sys/class/thermal"), "cooling_device").into_iter()
+        .filter(|(_, d)| read(&d.join("type")).as_deref() == Some("TCC Offset"))
+        .map(|(_, d)| d.join("cur_state"))
+        .filter(|p| p.is_file())
+        .filter_map(|p| canonical_in_sysfs(&p))
+        .collect()
+}
+
+fn intel_gt_files(i915: &str, xe: &str) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for (_, card) in numbered(Path::new("/sys/class/drm"), "card") {
+        if read(&card.join("device/vendor")).as_deref() != Some("0x8086") { continue; }
+        for (_, gt) in numbered(&card.join("gt"), "gt") { v.push(gt.join(i915)); }
+        if !xe.is_empty() {
+            for (_, tile) in numbered(&card.join("device"), "tile") {
+                for (_, gt) in numbered(&tile, "gt") { v.push(gt.join("freq0").join(xe)); }
+            }
+        }
+    }
+    let mut v: Vec<PathBuf> = v.into_iter().filter(|p| p.is_file()).filter_map(|p| canonical_in_sysfs(&p)).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// intel_pstate/no_turbo is the inverse of "boost".
+fn inverted(f: &Path) -> bool { f.file_name().map_or(false, |n| n == "no_turbo") }
+
 fn irq_files() -> Vec<PathBuf> {
     numbered(Path::new("/proc/irq"), "").into_iter()
         .map(|(_, p)| p.join("smp_affinity_list"))
@@ -606,6 +841,7 @@ pub fn best_effort(t: &Tunable) -> bool { matches!(t.target, Target::Irq | Targe
 
 /// Every concrete file the tunable writes. Empty = not available here.
 pub fn files(t: &Tunable) -> Vec<PathBuf> {
+    if !vendor_ok(t) { return vec![]; }
     let existing = |p: PathBuf| if p.is_file() { vec![p] } else { vec![] };
     match t.target {
         // smt/control also reports notsupported / forceoff / notimplemented: not writable then.
@@ -624,8 +860,17 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
         Target::PerCcdPolicy(f, ccd) => ccd_policies(ccd).into_iter().map(|p| p.join(f)).filter(|p| p.is_file()).collect(),
         Target::Boost => {
             let per: Vec<_> = policies().into_iter().map(|p| p.join("boost")).filter(|p| p.is_file()).collect();
-            if per.is_empty() { existing(Path::new(CPU_DIR).join("cpufreq/boost")) } else { per }
+            if !per.is_empty() { return per; }
+            let global = existing(Path::new(CPU_DIR).join("cpufreq/boost"));
+            if !global.is_empty() { return global; }
+            existing(Path::new(CPU_DIR).join("intel_pstate/no_turbo"))
         }
+        Target::PerCoreType(f, ct) => policies_within(&core_type_cpus(ct)).into_iter().map(|p| p.join(f)).filter(|p| p.is_file()).collect(),
+        Target::PerCpu(f) => cpus().into_iter().map(|(_, c)| c.join(f)).filter(|p| p.is_file()).collect(),
+        Target::Uncore(f) => uncore_files(f),
+        Target::RaplWatts(n) => rapl_files(n),
+        Target::TccOffset => tcc_files(),
+        Target::IntelGt { i915, xe } => intel_gt_files(i915, xe),
         Target::X3d => x3d_mode_path().into_iter().collect(),
         Target::CState => cpus().into_iter()
             .flat_map(|(_, c)| numbered(&c.join("cpuidle"), "state"))
@@ -637,14 +882,14 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
             .map(|(_, p)| p.join("check_interval")).filter(|p| p.is_file()).collect(),
         Target::AmdgpuDpm => amdgpu_dpm_files(),
         Target::PciLatency => pci_config_files(),
-        Target::WqCpumask => if ccx_groups().len() > 1 {
+        Target::WqCpumask => if has_domains() {
             existing(PathBuf::from("/sys/devices/virtual/workqueue/cpumask"))
         } else { vec![] },
-        Target::Irq => if ccx_groups().len() > 1 { irq_files() } else { vec![] },
+        Target::Irq => if has_domains() { irq_files() } else { vec![] },
         Target::CcdPark => {
             // Stays available while a CCD is parked, so "none" can bring it back.
             let parked = online_cpus().len() < present_cpus().len();
-            if ccx_groups().len() < 2 && !parked { return vec![]; }
+            if !has_domains() && !parked { return vec![]; }
             cpus().into_iter().map(|(_, c)| c.join("online")).filter(|p| p.is_file()).collect()
         }
     }
@@ -662,6 +907,8 @@ pub fn options(t: &Tunable) -> Vec<(String, String)> {
                 .unwrap_or_default())
         }
         (Options::Bracketed, Target::File(p)) => same(read(Path::new(p)).map(|s| parse_bracketed(&s).1).unwrap_or_default()),
+        (Options::Bracketed, Target::IntelGt { .. }) =>
+            same(files(t).first().and_then(|f| read(f)).map(|s| parse_bracketed(&s).1).unwrap_or_default()),
         (Options::Bracketed, Target::PerBlock(_)) => {
             // Options every disk supports (a preset must be writable everywhere).
             let mut common: Option<Vec<String>> = None;
@@ -671,10 +918,15 @@ pub fn options(t: &Tunable) -> Vec<(String, String)> {
             }
             same(common.unwrap_or_default())
         }
-        (Options::Special, Target::MinFreq) => vec![
-            ("lowest_nonlinear".into(), "lowest_nonlinear (efficient floor)".into()),
-            ("cpuinfo_min".into(), "cpuinfo_min (hardware minimum)".into()),
-        ],
+        (Options::Special, Target::MinFreq) => {
+            let mut v = Vec::new();
+            // amd-pstate only; intel_pstate has no such file.
+            if policies().first().map_or(false, |p| p.join("amd_pstate_lowest_nonlinear_freq").is_file()) {
+                v.push(("lowest_nonlinear".into(), "lowest_nonlinear (efficient floor)".into()));
+            }
+            v.push(("cpuinfo_min".into(), "cpuinfo_min (hardware minimum)".into()));
+            v
+        }
         (Options::Special, Target::CState) => {
             let names = cstate_names();
             let mut v = vec![("all".to_string(), "all enabled".to_string())];
@@ -768,11 +1020,18 @@ pub fn current(t: &Tunable) -> Option<String> {
         Target::CcdPark => {
             let online = online_cpus();
             let off: Vec<usize> = present_cpus().into_iter().filter(|c| !online.contains(c)).collect();
+            if !off.is_empty() && hybrid().map_or(false, |h| h.ecores == off) { return Some("ecore".into()); }
             return Some(if off.is_empty() { "none".into() } else { format!("offline {}", fmt_cpu_list(&off)) });
+        }
+        Target::RaplWatts(_) => {
+            let mut w = fs.iter().filter_map(|p| read(p)).filter_map(|r| parse_int(&r)).map(|uw| (uw / 1_000_000).to_string());
+            let first = w.next()?;
+            return Some(if w.all(|v| v == first) { first } else { "mixed".into() });
         }
         _ => {}
     }
-    let mut vals = fs.iter().filter_map(|p| read(p)).map(|raw| match t.kind {
+    let mut vals = fs.iter().filter_map(|p| read(p).map(|r| (p, r))).map(|(p, raw)| match t.kind {
+        Kind::Bool if inverted(p) => match bool_norm(&raw) { Some("1") => "0".to_owned(), Some(_) => "1".to_owned(), None => raw },
         Kind::Bool => bool_norm(&raw).map(str::to_owned).unwrap_or(raw),
         Kind::Int { .. } => parse_int(&raw).map(|n| n.to_string()).unwrap_or(raw),
         Kind::Choice => restorable(&raw),
@@ -847,7 +1106,13 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
                 .map(|p| if p.is_file() { Ok((p, "0".to_owned())) } else { Err(format!("{} missing", p.display())) })
                 .collect::<Result<Vec<_>, _>>()?
         }
+        Target::RaplWatts(_) => {
+            let w: i64 = value.parse().map_err(|_| format!("'{value}' is not a wattage"))?;
+            fs.into_iter().map(|f| (f, (w * 1_000_000).to_string())).collect()
+        }
         _ if t.kind == Kind::Bool => fs.into_iter().map(|f| {
+            // no_turbo speaks the opposite of "boost".
+            let value = if inverted(&f) { if value == "1" { "0" } else { "1" } } else { value };
             // Match the file's own vocabulary (module params report Y/N).
             let yn = read(&f).map_or(false, |r| r == "Y" || r == "N");
             let w = match (yn, value) { (true, "1") => "Y", (true, _) => "N", (false, v) => v };
@@ -918,12 +1183,20 @@ pub fn describe_topology() -> Value {
                                           "l3_kib": c.l3_kib, "max_khz": c.max_khz})).collect::<Vec<_>>(),
         "cache_ccd": role("cache"), "frequency_ccd": role("frequency"),
         "online": fmt_cpu_list(&online_cpus()), "present": fmt_cpu_list(&present_cpus()),
+        "vendor": cpu_vendor().as_str(),
+        "hybrid": hybrid().map(|h| {
+            let max = |set: &[usize]| set.iter()
+                .filter_map(|c| read(&Path::new(CPU_DIR).join(format!("cpu{c}/cpufreq/cpuinfo_max_freq"))))
+                .filter_map(|s| s.parse::<u64>().ok()).max().unwrap_or(0);
+            json!({"pcores": fmt_cpu_list(&h.pcores), "ecores": fmt_cpu_list(&h.ecores),
+                   "pcore_max_khz": max(&h.pcores), "ecore_max_khz": max(&h.ecores)})
+        }),
     })
 }
 
 /// Tunable list for the GUI.
 pub fn describe() -> Value {
-    let rows: Vec<Value> = TUNABLES.iter().map(|t| {
+    let rows: Vec<Value> = TUNABLES.iter().filter(|t| vendor_ok(t)).map(|t| {
         let fs = files(t);
         let (min, max) = match t.kind { Kind::Int { min, max } => (json!(min), json!(max)), _ => (Value::Null, Value::Null) };
         let opts: Vec<Value> = options(t).into_iter().map(|(v, l)| json!({"value": v, "label": l})).collect();
@@ -942,6 +1215,7 @@ pub fn describe() -> Value {
     m.insert("ok".into(), json!(true));
     m.insert("tunables".into(), Value::Array(rows));
     m.insert("topology".into(), describe_topology());
+    m.insert("vendor".into(), json!(cpu_vendor().as_str()));
     Value::Object(m)
 }
 
@@ -962,6 +1236,21 @@ mod tests {
         assert_eq!(parse_bracketed("none voluntary (full) lazy").0.as_deref(), Some("full"));
         assert_eq!(restorable("[none] mq-deadline kyber"), "none");
         assert_eq!(restorable("2000"), "2000");
+    }
+    #[test]
+    fn l3_groups_during_smt_offline() {
+        // Mid-hot-plug snapshot: cpu0 still lists its (now offline) siblings, cpu1 does not.
+        let online: Vec<usize> = (0..16).collect();
+        let mut e = vec![(0, cpu_list("0-7,16-23"), 98304), (1, cpu_list("0-7"), 98304)];
+        for c in 2..8 { e.push((c, cpu_list("0-7"), 98304)); }
+        for c in 8..16 { e.push((c, cpu_list("8-15,24-31"), 32768)); }
+        let mut g = group_l3(e, &online);
+        g.sort_by_key(|g| g.cpus[0]);
+        for (i, x) in g.iter_mut().enumerate() { x.index = i; }
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].cpus, (0..8).collect::<Vec<_>>());
+        assert_eq!(g[1].cpus, (8..16).collect::<Vec<_>>());
+        assert_eq!(resolve_ccd(&g, "cache").unwrap().index, 0);
     }
     #[test]
     fn table_invariants() {
@@ -992,6 +1281,21 @@ mod tests {
         assert_eq!(validate(b, &json!("Y")).unwrap(), "1");
         assert_eq!(parse_int("0x0007"), Some(7));
         assert_eq!(validate(find("usb.autosuspend").unwrap(), &json!(-1)).unwrap(), "-1");
+    }
+    #[test]
+    fn vendors() {
+        assert_eq!(vendor_from_cpuinfo("processor\t: 0\nvendor_id\t: GenuineIntel\n"), Vendor::Intel);
+        assert_eq!(vendor_from_cpuinfo("vendor_id : AuthenticAMD"), Vendor::Amd);
+        assert_eq!(vendor_from_cpuinfo("model name : x"), Vendor::Any);
+        // Vendor-specific rows are tagged; shared rows stay portable.
+        assert_eq!(find("cpu.x3d_mode").unwrap().vendor, Vendor::Amd);
+        assert_eq!(find("cpu.intel_pstate_status").unwrap().vendor, Vendor::Intel);
+        assert_eq!(find("cpu.epp").unwrap().vendor, Vendor::Any);
+        let pos = |k: &str| TUNABLES.iter().position(|t| t.key == k).unwrap();
+        assert!(pos("cpu.intel_pstate_status") < pos("cpu.governor"));
+        assert!(pos("cpu.epp") < pos("cpu.epp_pcore") && pos("cpu.max_perf_pct") < pos("cpu.min_perf_pct"));
+        assert!(pos("cpu.uncore_max_khz") < pos("cpu.uncore_min_khz"));
+        assert!(inverted(Path::new("/sys/devices/system/cpu/intel_pstate/no_turbo")));
     }
     #[test]
     fn cpu_formats() {

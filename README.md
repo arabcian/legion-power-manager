@@ -2,7 +2,8 @@
 
 Port of the PySide6 Legion Power Manager: privileged work in Rust, GUI in Qt6.
 Five tabs: Home (power profile), Firmware Attributes, NVIDIA Curve Optimizer,
-Ryzen Curve Optimizer, Optimizations (system tuning).
+Ryzen Curve Optimizer *or* Intel Undervolt (picked by CPU vendor), Optimizations
+(system tuning).
 
 ## Install
 
@@ -34,6 +35,20 @@ create your config directories.
 - **CPU curve (Ryzen tab).** Per-core Curve Optimizer offsets, or one offset
   for every core with *Apply All-Core*. *Disable* a slot if your CPU has fewer
   physical cores than SMU slots (common on cut-down/partially-populated CCDs).
+- **CPU undervolt (Intel Undervolt tab, Intel CPUs only).** *Read current*,
+  tick the values to write, *Apply*. Voltage offsets for core / cache / iGPU /
+  system agent / analog I/O (OC mailbox MSR 0x150), IccMax, TCC offset and
+  PL1/PL2 (MSR 0x610, mirrored to MCHBAR). A readback mismatch means the BIOS
+  locks undervolting (Plundervolt, CVE-2019-11157). *⏻ Apply at boot & resume*
+  stores the values for the `lpm-intel-uv` service; offsets are lost on S3,
+  so the unit (systemd) / elogind hook (OpenRC) re-applies them after resume.
+  Separate AC / battery profiles, BD PROCHOT, cTDP, PL lock, positive offsets
+  (opt-in), ThrottleStop.ini import, live throttle/VCore/RAPL monitor.
+  Optional daemon (`lpm-intel-uv-daemon` service): switches profile with the
+  charger, re-applies after resume and every interval (the EC restores PL1/PL2),
+  and runs hwphint EPP switching by load or RAPL power.
+  Without the GUI: `sudo lpm-intel-uv read | apply … | reset | monitor | measure |
+  throttlestop FILE | turbo on|off | daemon`.
 - **System tuning (Optimizations tab).** Pick a built-in preset (top dropdown),
   *Load*, review the checked rows, *Apply checked*. ★ *Use for games* wires it
   into Lutris/Steam (see the Game launch sub-tab for the exact hooks); ⏻ *Apply
@@ -53,10 +68,12 @@ distro actually runs:
     # systemd
     systemctl enable --now nvcurve-autoload.service
     systemctl enable --now lpm-tune.service
+    systemctl enable lpm-intel-uv.service           # Intel only
 
     # OpenRC
     rc-update add nvcurve-autoload default
     rc-update add lpm-tune boot
+    rc-update add lpm-intel-uv boot                 # Intel only
 
 Neither does anything until you've actually set a ★ default profile / ⏻ boot
 preset from the GUI — enabling the service early is harmless.
@@ -66,9 +83,10 @@ preset from the GUI — enabling the service early is harmless.
     /usr/bin/legion-power-manager                    GUI + tray
     /usr/bin/nvcurve                                 nvcurve CLI
     /usr/bin/lpm-gamemode                            Lutris/Steam game-mode hook (user, no setuid)
+    /usr/bin/lpm-intel-uv                            standalone Intel undervolt CLI (root)
     /usr/libexec/legion-power-manager/
         legion-profile-helper  fwattr-helper  ryzen-co-helper
-        tune-helper                                             (root:root 0755)
+        tune-helper  intel-uv-helper                            (root:root 0755)
         nvcurve-root-helper                                     (root:root 0700)
     /usr/share/polkit-1/actions/com.legion-power-manager.policy
     /etc/polkit-1/rules.d/49-legion-power-manager.rules
@@ -101,6 +119,7 @@ Cargo workspace:
 | Crate | Content | Status |
 |---|---|---|
 | `crates/lpm-helpers` | pkexec root helpers: `legion-profile-helper`, `fwattr-helper`, `ryzen-co-helper` | step 1 ✔ |
+| `crates/lpm-helpers` `intel_uv` | Intel undervolt core, `intel-uv-helper`, `lpm-intel-uv` CLI | ✔ |
 | `crates/nvcurve` | nvcurve core library: NvAPI + NVML (dlopen), HAL, safety, snapshots, profiles, autoload | step 2a ✔ |
 | `crates/nvcurve` bins | `nvcurve` CLI, `nvcurve-root-helper` | step 2b ✔ |
 | nvcurve REST/WS server | not ported — nothing in the GUI uses it | — |
@@ -443,3 +462,27 @@ a while if the NVIDIA device is not up yet. Both are skipped by a
 `ConditionPathExists` when no default profile / boot preset is set.
 Service files hold `@BINDIR@`/`@LIBEXEC@`; install.sh and the ebuild fill them
 in (`PREFIX`, `UNITDIR` are honoured).
+
+## Intel CPU support (step 6)
+
+The CPU vendor is read from `/proc/cpuinfo` (`vendor_id`) by both the GUI and
+the helpers (`tune::cpu_vendor()`).
+
+* **Ryzen Curve Optimizer tab** and the tray's *CPU Curve (Ryzen)* menu are only
+  created on AMD. On Intel, *Undervolt CPU* in Game launch is disabled and
+  `lpm-gamemode` skips the CPU step (an Intel undervolt tool is planned).
+* Every tunable carries a vendor (`amd()` / `intel()` in `tune.rs`). Rows of the
+  other vendor are left out of `describe` and reported as *not available* on
+  apply, so preset files stay portable.
+* Intel rows (Optimizations → CPU / Devices): `intel_pstate` mode, HWP dynamic
+  boost, max/min perf %, EPB, EPP · P-cores / E-cores, max frequency · P/E,
+  uncore min/max (`intel_uncore_frequency`), RAPL PL1/PL2 (MSR + MMIO, watts),
+  TCC offset (`intel_tcc_cooling`), iGPU min/max MHz and SLPC profile (i915/xe).
+  *Core performance boost* maps to `intel_pstate/no_turbo` (inverted).
+* Hybrid topology (`/sys/devices/cpu_core|cpu_atom/cpus`) adds the `pcore` /
+  `ecore` roles to launch affinity, unbound workqueue CPUs, IRQ affinity and
+  parking (E-cores only; cpu0 is a P-core).
+* Built-in presets are vendor-specific: *Intel gaming hybrid*, *Intel
+  competitive*, *Intel low latency desktop*, *Intel compile throughput*,
+  *Intel quiet battery*.
+* Dev aid: `LPM_CPU_VENDOR=amd|intel` forces the GUI's vendor.

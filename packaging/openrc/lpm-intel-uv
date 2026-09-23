@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# Legion Power Manager — Intel undervolt boot profile.
+#
+# Applies /etc/legion-power-manager/intel-uv-boot.json (Intel Undervolt tab →
+# "Apply at boot & resume"). Re-applying after resume is done by the elogind
+# sleep hook (voltage offsets are lost on S3). `stop` resets the voltage
+# planes to 0 mV.
+#
+#   rc-update add lpm-intel-uv boot
+
+description="Apply the Legion Power Manager Intel undervolt profile"
+HELPER="@LIBEXEC@/intel-uv-helper"
+
+depend() {
+	need localmount
+	after modules
+}
+
+start() {
+	[ -f /etc/legion-power-manager/intel-uv-boot.json ] || { einfo "No Intel undervolt boot profile set"; return 0; }
+	ebegin "Applying Intel undervolt profile"
+	printf '%s' '{"op":"boot"}' | "${HELPER}" >/dev/null
+	eend $? "Some values were rejected (run: lpm-intel-uv boot)"
+}
+
+stop() {
+	ebegin "Resetting Intel voltage offsets to 0 mV"
+	printf '%s' '{"op":"reset"}' | "${HELPER}" >/dev/null
+	eend $?
+}

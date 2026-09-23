@@ -90,10 +90,10 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
-install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$DESTDIR$PREFIX/bin/"
+install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$DESTDIR$PREFIX/bin/"
 DESTDIR="$DESTDIR" cmake --install gui/build
 
 install -d "${own[@]}" -m 0755 "$DESTDIR$PREFIX/share/polkit-1/actions" "$DESTDIR/etc/polkit-1/rules.d" \
@@ -104,16 +104,29 @@ sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/49-legion-power-manager.rules > "$
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"; chmod 0644 "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 # Service files carry @BINDIR@/@LIBEXEC@ so a non-/usr PREFIX points at the right binaries.
 subst() { sed -e "s|@BINDIR@|$PREFIX/bin|g" -e "s|@LIBEXEC@|$LIBEXEC|g" "$1"; }
-for s in nvcurve-autoload lpm-tune; do
+for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon; do
     subst "packaging/openrc/$s" > "$DESTDIR/etc/init.d/$s"
     chmod 0755 "$DESTDIR/etc/init.d/$s"
 done
 install -d "${own[@]}" -m 0755 "$DESTDIR$UNITDIR"
-for u in nvcurve-autoload lpm-tune; do
+for u in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon; do
     subst "packaging/systemd/$u.service" > "$DESTDIR$UNITDIR/$u.service"
     chmod 0644 "$DESTDIR$UNITDIR/$u.service"
 done
-[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR"/etc/init.d/{nvcurve-autoload,lpm-tune} "$DESTDIR$UNITDIR"/{nvcurve-autoload,lpm-tune}.service
+[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR"/etc/init.d/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon} "$DESTDIR$UNITDIR"/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon}.service
+# elogind resume hook (re-applies the Intel undervolt boot profile; systemd uses the unit's sleep targets).
+ELOGIND_SLEEP=${ELOGIND_SLEEP:-}
+if [[ -z $ELOGIND_SLEEP ]]; then
+    for d in /lib64/elogind /usr/lib64/elogind /lib/elogind /usr/lib/elogind; do
+        [[ -d $d ]] && { ELOGIND_SLEEP=$d/system-sleep; break; }
+    done
+fi
+if [[ -n $ELOGIND_SLEEP ]]; then
+    install -d "${own[@]}" -m 0755 "$DESTDIR$ELOGIND_SLEEP"
+    subst packaging/sleep/lpm-intel-uv > "$DESTDIR$ELOGIND_SLEEP/50-lpm-intel-uv"
+    chmod 0755 "$DESTDIR$ELOGIND_SLEEP/50-lpm-intel-uv"
+    [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR$ELOGIND_SLEEP/50-lpm-intel-uv"
+fi
 
 if (( LEGACY )) && [[ -z "$DESTDIR" ]]; then
     # Old Python layout (and the step-1/2 drop-in binaries that replaced its .py helpers).
@@ -131,9 +144,11 @@ if [[ -z "$DESTDIR" ]]; then
         systemctl daemon-reload || true
         echo "  systemctl enable nvcurve-autoload.service   # GPU V/F profile"
         echo "  systemctl enable lpm-tune.service           # Optimizations boot preset"
+        grep -q GenuineIntel /proc/cpuinfo && echo "  systemctl enable lpm-intel-uv.service       # Intel undervolt boot/resume profile (or lpm-intel-uv-daemon)"
     else
         echo "  rc-update add nvcurve-autoload default   # GPU V/F profile"
         echo "  rc-update add lpm-tune boot              # Optimizations boot preset"
+        grep -q GenuineIntel /proc/cpuinfo && echo "  rc-update add lpm-intel-uv boot          # Intel undervolt boot profile (or lpm-intel-uv-daemon default)"
     fi
     if [[ -x /usr/local/bin/lutris-game-tune-wrapper ]]; then
         echo
