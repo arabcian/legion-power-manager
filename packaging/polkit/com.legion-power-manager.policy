@@ -3,15 +3,17 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>legion-power-manager</vendor>
-  <!-- Six Rust root helpers, one per tab, each pinned by exec.path; installed
-       root:root 0755 (nvcurve-root-helper 0700) under /usr/libexec/legion-power-manager.
-       The authoritative grant is /etc/polkit-1/rules.d/49-legion-power-manager.rules. -->
+  <!-- Seven Rust root helpers, each pinned by exec.path; installed root:root 0755
+       (nvcurve-root-helper 0700) under /usr/libexec/legion-power-manager.
+       The password-less grant (wheel, local active session) comes only from
+       /etc/polkit-1/rules.d/49-legion-power-manager.rules; the defaults below
+       are the safe fallback when that file is absent. -->
   <action id="com.legion-power-manager.fwattr.write">
     <description>Write a firmware_attributes sysfs value</description>
     <description xml:lang="tr">Bir firmware_attributes sysfs değerini yaz</description>
     <message>Authentication is required to write a firmware attribute value</message>
     <message xml:lang="tr">Bir firmware özniteliği değerini yazmak için kimlik doğrulama gerekiyor</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/fwattr-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
@@ -20,7 +22,7 @@
     <description xml:lang="tr">Legion Power Manager üzerinden NVIDIA GPU V/F eğrisi ayarlarını uygula</description>
     <message>Administrator authentication required (NVIDIA curve optimizer)</message>
     <message xml:lang="tr">Yönetici kimlik doğrulaması gerekiyor (NVIDIA eğri optimizasyonu)</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/nvcurve-root-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
@@ -29,7 +31,7 @@
     <description xml:lang="tr">Legion Power Manager üzerinden RyzenAdj Curve Optimizer değerlerini uygula</description>
     <message>Authentication is required to change the CPU Curve Optimizer voltage offsets</message>
     <message xml:lang="tr">CPU Curve Optimizer voltaj offsetlerini değiştirmek için kimlik doğrulama gerekiyor</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/ryzen-co-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
@@ -38,7 +40,7 @@
     <description xml:lang="tr">Legion Power Manager üzerinden Intel CPU voltaj offsetlerini ve güç limitlerini uygula</description>
     <message>Authentication is required to change the CPU voltage offsets (MSR access)</message>
     <message xml:lang="tr">CPU voltaj offsetlerini değiştirmek için kimlik doğrulama gerekiyor (MSR erişimi)</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/intel-uv-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
@@ -47,7 +49,7 @@
     <description xml:lang="tr">Legion Power Manager ile deneysel GPU güç limitlerini ayarla</description>
     <message>Authentication is required to change the GPU power ceiling (EC table)</message>
     <message xml:lang="tr">GPU güç tavanını değiştirmek için kimlik doğrulama gerekiyor (EC tablosu)</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/legion-gpu-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
@@ -56,7 +58,7 @@
     <description xml:lang="tr">ACPI platform güç profilini değiştir</description>
     <message>Authentication is required to change the laptop power profile</message>
     <message xml:lang="tr">Dizüstü bilgisayarın güç profilini değiştirmek için kimlik doğrulama gerekiyor</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/legion-profile-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
@@ -65,7 +67,7 @@
     <description xml:lang="tr">Legion Power Manager üzerinden sistem optimizasyon değerlerini uygula veya geri yükle</description>
     <message>Authentication is required to change kernel tuning settings</message>
     <message xml:lang="tr">Çekirdek optimizasyon ayarlarını değiştirmek için kimlik doğrulama gerekiyor</message>
-    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/tune-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>

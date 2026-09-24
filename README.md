@@ -118,6 +118,38 @@ Unchanged data locations: `/etc/nvcurve/{config.json,profiles/}` (GPU),
   profiles, reset entries and a 2.5 s cooldown, rebuilt on every open.
 - The icon is drawn at runtime (same glyph as before); an SVG is installed for menus.
 
+## Scenes
+
+A scene is one name for the whole machine: power profile, firmware limits,
+CPU curve (Ryzen CO or Intel undervolt), NVIDIA curve, Optimizations preset
+and an optional command. It does not copy those settings — it names the
+profiles the other tabs already save, so editing a profile updates every
+scene that uses it. Each component can be left *Unchanged*.
+
+Scenes are applied in dependency order through the same root helpers as the
+tabs (power profile first, because firmware limits are only accepted in
+Custom). A failing component is reported and the rest still run. Applying
+never opens a dialog: results show in the Scenes tab, or as a tray
+notification when the window is hidden.
+
+- **Optimizations presets are switched, not stacked.** A scene's preset is
+  applied with `replace`: every knob the new preset does not set goes back to
+  its original value, so nothing from the previous scene lingers.
+  *Restore originals* puts everything back. While a game session holds game
+  mode (`lpm-gamemode PRE`), scenes leave the tuning alone.
+- **Firmware limits** are captured from the current firmware-attribute values
+  (*Capture current*). The WMI-only GPU values (cTGP, Dynamic Boost) are
+  included once the Firmware Attributes tab has read them this session.
+- **Automatic switching** applies the chosen scene when the charger is
+  plugged in or pulled (debounced) and once at login. A charger that stays
+  connected counts as AC even when the battery dips under full load.
+- **Run command** executes as the user, without a shell — for things this
+  app does not manage (display refresh rate, audio profile…).
+
+Files: `~/.config/legion-power-manager/scenes/<name>.json` and
+`~/.config/legion-power-manager/scenes.json` (automatic switching). The tray
+has a *Scene* menu with every scene and the auto-switch toggle.
+
 ## Components
 
 Cargo workspace:
@@ -366,6 +398,25 @@ the active user can therefore retune the kernel; tighten
 Dev aids: `LPM_TUNE_FAKE=/path/describe.json` renders canned data,
 `LPM_OPT_SUBTAB=N` and `LPM_OPT_LOAD=<preset>` pick the sub-tab and preset
 for `LPM_SCREENSHOT`.
+
+### Added knobs (sysmap review)
+
+- **CPU:** cpuidle governor (menu / teo …, from `available_governors`).
+- **Memory:** multi-size THP per size (16 KB – 1 MB) and khugepaged
+  (`max_ptes_none`, `pages_to_scan`, scan / alloc sleep).
+- **Scheduler:** sched_ext scheduler (`scx_lavd`, `scx_bpfland` …) — started
+  detached by tune-helper, stopped on restore / game-mode release. Only
+  allowlisted `scx_*` binaries, root-owned in system directories, are run.
+- **Network** (new group): TCP congestion control (bbr offered when the module
+  exists), default qdisc (only qdiscs the running kernel has), Wi-Fi power save
+  (through `iw`; NetworkManager may re-enable it on reconnect).
+- **Devices:** PCIe ASPM per link (`l1` / `l1ss`), for links a driver or the
+  firmware left without ASPM; links that refuse are skipped.
+- **Home → Device:** fan mode (Standard / Super silent / Efficient cooling /
+  Dust cleaning) where ideapad_acpi exposes `fan_mode`.
+
+Like every other knob these record the original value on first write and go
+back on *Restore originals*, game-mode release or a scene switch.
 
 ### Deep-optimization guide
 
