@@ -419,32 +419,6 @@ QGroupBox *HomeTab::buildDeviceBox() {
         }
         h->addStretch(1);
         if (!toggles_.isEmpty()) g->addLayout(h, row++, 0, 1, 5);
-
-        if (QFileInfo(ideapadDir_ + "/fan_mode").isFile()) {
-            fanMode_ = new QComboBox;
-            fanMode_->addItem("Standard", "1");
-            fanMode_->addItem("Super silent", "0");
-            fanMode_->addItem("Efficient cooling", "4");
-            fanMode_->addItem("Dust cleaning", "2");
-            fanMode_->setToolTip("The EC's fan mode (ideapad fan_mode).\n"
-                                 "Dust cleaning runs the fans through a cleaning cycle to blow dust out of the fins —\n"
-                                 "run it now and then with the laptop on a table; switch back to Standard afterwards\n"
-                                 "if the firmware does not do so itself.\n"
-                                 "On Legion models the power profile also drives the fans, so Super silent / Efficient\n"
-                                 "cooling may be overridden by the next profile change.");
-            connect(fanMode_, &QComboBox::activated, this, [this](int i) {
-                const QString v = fanMode_->itemData(i).toString();
-                if (v == QLatin1String("2") && QMessageBox::question(this, "Dust cleaning",
-                        "Start the fan dust-cleaning cycle?\n\nThe fans will run loudly for a while. "
-                        "Keep the vents unobstructed.") != QMessageBox::Yes) {
-                    refreshDevice();
-                    return;
-                }
-                setDevice("fan_mode", v);
-            });
-            g->addWidget(muted("Fan mode"), row, 0);
-            g->addWidget(fanMode_, row++, 1, 1, 4);
-        }
     }
 
     int bannerRow = -1;
@@ -592,11 +566,6 @@ void HomeTab::refreshDevice() {
             QSignalBlocker blk(charge_);
             charge_->setCurrentIndex(charge_->findData(raw.mid(a + 1, b - a - 1)));
         }
-    }
-    if (fanMode_ && !fanMode_->view()->isVisible()) {
-        QSignalBlocker blk(fanMode_);
-        const int i = fanMode_->findData(rdText(ideapadDir_ + "/fan_mode"));
-        if (i >= 0) fanMode_->setCurrentIndex(i);
     }
     for (auto it = toggles_.cbegin(); it != toggles_.cend(); ++it) {
         QSignalBlocker blk(it.value());

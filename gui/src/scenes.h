@@ -51,7 +51,9 @@ QString dir();
 bool validName(const QString &name);
 QStringList names();
 std::optional<Scene> load(const QString &name);
-bool save(const Scene &s, QString *err = nullptr);
+/// `tuningValues`: the Optimizations preset's values, stored next to its name
+/// so lpm-gamemode can apply presets that only exist built into the GUI.
+bool save(const Scene &s, QString *err = nullptr, const QJsonObject &tuningValues = {});
 bool remove(const QString &name);
 Auto loadAuto();
 bool saveAuto(const Auto &a, QString *err = nullptr);
@@ -59,6 +61,13 @@ bool saveAuto(const Auto &a, QString *err = nullptr);
 /// true = on mains (barrel or USB-C PD), false = on battery,
 /// nullopt = the machine reports no power supplies (cannot tell).
 std::optional<bool> onAc();
+
+/// Shared with lpm-gamemode ($XDG_RUNTIME_DIR/legion-power-manager/scene.json):
+/// the active scene, whoever applied it, and the game-launch bookkeeping.
+QString activeScene();
+void setActiveScene(const QString &name);
+/// Game sessions currently holding game mode (tune-helper's state).
+int gameSessions();
 
 } // namespace scenes
 
@@ -71,8 +80,8 @@ public:
     /// queued and runs right after (an AC flip mid-apply is never lost).
     void apply(const QString &name);
     bool busy() const { return busy_; }
-    /// Last scene applied this session (empty until one has run).
-    QString active() const { return active_; }
+    /// Active scene (applied by the GUI or by lpm-gamemode at game start/exit).
+    QString active() const { return scenes::activeScene(); }
 
     scenes::Auto autoConfig() const { return auto_; }
     /// Persists the setting; enabling it applies the matching scene at once.
@@ -102,7 +111,8 @@ private:
     QList<QPair<QString, Step>> steps_;
     QStringList log_;
     bool ok_ = true, busy_ = false;
-    QString current_, active_, pending_;
+    QString current_, pending_;
+    bool deferred_ = false;  // a power-source switch waiting for the game to end
 
     scenes::Auto auto_;
     QTimer *powerTimer_;

@@ -109,6 +109,8 @@ private:
     QSpinBox *nice_ = nullptr;
     QCheckBox *autogroup_ = nullptr, *uvCpu_ = nullptr, *uvGpu_ = nullptr;
     QLabel *uvInfo_ = nullptr;
+    QComboBox *gameScene_ = nullptr;   // scene the first game switches to (tune.json "game_scene")
+    void fillGameScenes();
     QLineEdit *lutrisPre_ = nullptr, *lutrisPost_ = nullptr, *lutrisPrefix_ = nullptr, *steam_ = nullptr;
     QLabel *topoLabel_ = nullptr;
     QTabWidget *groups_ = nullptr;

@@ -49,13 +49,14 @@ Tray::Tray(MainWindow *win) : QSystemTrayIcon(appIcon(), win), win_(win), menu_(
     // (tray pick, charger plugged/pulled); the tab shows its own status line.
     SceneEngine *eng = win_->scenes();
     connect(eng, &SceneEngine::finished, this, [this](const QString &n, bool ok, const QStringList &log) {
+        if (n.isEmpty()) return;  // informational only
         if (win_->isVisible() && win_->isActiveWindow()) return;
         QStringList bad;
         for (const QString &l : log) if (l.startsWith(QStringLiteral("✗"))) bad << l.mid(2);
         notify("Scene: " + n, ok ? QStringLiteral("Applied.") : bad.join('\n'));
     });
     connect(eng, &SceneEngine::started, this, [this](const QString &n) { setToolTip("Legion Power Manager — applying scene '" + n + "'…"); });
-    connect(eng, &SceneEngine::finished, this, [this](const QString &n) { setToolTip("Legion Power Manager — scene: " + n); });
+    connect(eng, &SceneEngine::finished, this, [this](const QString &n) { if (!n.isEmpty()) setToolTip("Legion Power Manager — scene: " + n); });
 }
 
 void Tray::toggleWindow() {

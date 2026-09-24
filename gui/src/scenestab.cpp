@@ -197,6 +197,7 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
         setStatus("Applying '" + n + "'…");
     });
     connect(eng_, &SceneEngine::finished, this, [this](const QString &n, bool ok, const QStringList &log) {
+        if (n.isEmpty()) { setStatus(log.join(' '), theme::FG_DIM); return; }  // informational (deferred switch)
         apply_->setEnabled(list_->count() > 0);
         setStatus((ok ? "'" + n + "' applied — " : "'" + n + "' applied with problems — ") + log.join(QStringLiteral("  ·  ")),
                   ok ? theme::OK : theme::WARN);
@@ -362,7 +363,9 @@ void ScenesTab::captureFirmware() {
 bool ScenesTab::saveCurrent() {
     const Scene s = fromEditor();
     QString err;
-    if (!scenes::save(s, &err)) { setStatus("Could not save: " + err, theme::DANGER); return false; }
+    const QJsonObject values = s.tuning.kind == Choice::Profile
+        ? win_->optimize()->presetObject(s.tuning.name).value("values").toObject() : QJsonObject();
+    if (!scenes::save(s, &err, values)) { setStatus("Could not save: " + err, theme::DANGER); return false; }
     loaded_ = s;
     updateDirty();
     return true;
@@ -388,7 +391,9 @@ void ScenesTab::newScene(bool duplicate) {
     Scene s = duplicate ? fromEditor() : Scene{};
     s.name = name;
     QString err;
-    if (!scenes::save(s, &err)) { setStatus("Could not save: " + err, theme::DANGER); return; }
+    const QJsonObject values = s.tuning.kind == Choice::Profile
+        ? win_->optimize()->presetObject(s.tuning.name).value("values").toObject() : QJsonObject();
+    if (!scenes::save(s, &err, values)) { setStatus("Could not save: " + err, theme::DANGER); return; }
     loaded_ = {};  // no unsaved-changes prompt for the scene we are leaving (duplicate carries them)
     reloadList(name);
     setStatus(duplicate ? "Duplicated as '" + name + "'." : "Created '" + name + "'. Pick what it should set, then Save.", theme::OK);

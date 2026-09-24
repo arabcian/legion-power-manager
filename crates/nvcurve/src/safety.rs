@@ -1,7 +1,7 @@
 //! Centralised write validation (port of safety.py).
 
 use crate::hal::limits::{get_mem_offset_range, get_power_limit};
-use crate::nvapi::{CT_POINTS, MAX_DELTA_KHZ};
+use crate::nvapi::{CT_POINTS, MAX_DELTA_KHZ, MIN_DELTA_KHZ};
 use std::collections::BTreeMap;
 
 /// Upper plausibility bound for a memory locked clock (MHz).
@@ -9,10 +9,14 @@ pub const MAX_MEM_CLOCK_MHZ: i64 = 100_000;
 
 fn mhz(khz: i64) -> f64 { khz as f64 / 1000.0 }
 
-/// Validate a curve write. Empty = safe. `max_delta_khz` is clamped to the
-/// driver's hard cap, which no caller can raise.
+/// Validate a curve write. Empty = safe.
+///
+/// Positive deltas (overclock) are limited by `max_delta_khz`, itself clamped
+/// to the driver's +1000 MHz cap. Negative deltas only lower clocks and are
+/// limited by the driver floor alone (MIN_DELTA_KHZ, -2000 MHz), so a lowered
+/// `--max-delta` never blocks an undervolt / flatten curve.
 pub fn validate_write(deltas: &BTreeMap<i64, i64>, max_delta_khz: i64) -> Vec<String> {
-    let effective = max_delta_khz.min(MAX_DELTA_KHZ);
+    let up = max_delta_khz.min(MAX_DELTA_KHZ);
     let mut errs = Vec::new();
     for (&p, &d) in deltas {
         if p < 0 || p >= CT_POINTS as i64 {
@@ -24,12 +28,15 @@ pub fn validate_write(deltas: &BTreeMap<i64, i64>, max_delta_khz: i64) -> Vec<St
                                freqDelta field (must be within {}..{} kHz).", i32::MIN, i32::MAX));
             continue;
         }
-        if d.abs() > effective {
+        if d < MIN_DELTA_KHZ {
+            errs.push(format!("Delta {:+.0} MHz for point {p} is below the driver floor of {:.0} MHz.",
+                              mhz(d), mhz(MIN_DELTA_KHZ)));
+        } else if d > up {
             if max_delta_khz > MAX_DELTA_KHZ {
                 errs.push(format!("Delta {:+.0} MHz for point {p} exceeds the driver's hard cap of \
-                                   ±{:.0} MHz — this cannot be raised with --max-delta.", mhz(d), mhz(MAX_DELTA_KHZ)));
+                                   +{:.0} MHz — this cannot be raised with --max-delta.", mhz(d), mhz(MAX_DELTA_KHZ)));
             } else {
-                errs.push(format!("Delta {:+.0} MHz for point {p} exceeds safety limit of ±{:.0} MHz. \
+                errs.push(format!("Delta {:+.0} MHz for point {p} exceeds safety limit of +{:.0} MHz. \
                                    Use --max-delta to raise the limit if needed.", mhz(d), mhz(max_delta_khz)));
             }
         }
@@ -122,6 +129,17 @@ mod tests {
         d.insert(-1, 0);
         d.insert(CT_POINTS as i64, 0);
         assert_eq!(validate_write(&d, 1).len(), 2);
+    }
+    #[test]
+    fn negative_floor() {
+        let mut d = BTreeMap::new();
+        d.insert(10, -1_500_000);                        // flatten-style: fine
+        assert!(validate_write(&d, 1_000_000).is_empty());
+        assert!(validate_write(&d, 100_000).is_empty()); // a low overclock cap never blocks undervolt
+        d.insert(10, -2_000_000);
+        assert!(validate_write(&d, 1_000_000).is_empty());
+        d.insert(10, -2_000_001);
+        assert!(validate_write(&d, 1_000_000)[0].contains("floor"));
     }
     #[test]
     fn negative_freq() {

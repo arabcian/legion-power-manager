@@ -29,7 +29,9 @@ static const QString CONFIG_PATH = QStringLiteral("/etc/nvcurve/config.json");
 static const QString RUN_DIR = QStringLiteral("/run/nvcurve-gui");
 static const QString SCRATCH = QStringLiteral("_live");
 static const QString STAR = QStringLiteral(" ★");
-static constexpr int MAX_OFFSET = 1000;  // driver's ±1000 MHz hard cap
+// Driver limits: +1000 MHz up, -2000 MHz down (a flattened undervolt curve
+// pulls its top points well past -1000; matches nvcurve MIN/MAX_DELTA_KHZ).
+static constexpr int MAX_OFFSET = 1000, MIN_OFFSET = -2000;
 
 static QString helperPath() { return privileged::helperPath(QStringLiteral("nvcurve-root-helper")); }
 static int floorDiv(qint64 a, int b) { return int(std::floor(double(a) / b)); }  // Python //
@@ -139,7 +141,7 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     freqLabel_ = lbl("Freq: - MHz", theme::OK);
     offLabel_ = lbl("Offset: - MHz", theme::ACCENT);
     for (QLabel *l : {selLabel_, voltLabel_, freqLabel_, offLabel_}) { l->setMinimumWidth(96); ih->addWidget(l); }
-    pointSpin_ = spin(-MAX_OFFSET, MAX_OFFSET, " MHz", 92);
+    pointSpin_ = spin(MIN_OFFSET, MAX_OFFSET, " MHz", 92);
     pointSpin_->setEnabled(false);
     pointSpin_->setToolTip("Total offset for the selected point(s)");
     connect(pointSpin_, &QSpinBox::valueChanged, this, [this](int v) {
@@ -432,7 +434,7 @@ void NvidiaTab::setOffsetClamped(int i, int total) {
     // (The Python widget clamped *frequencies* to 800..3000, so dragging the
     // whole curve silently lifted idle points far below 800 MHz up to 800 —
     // a large positive offset nobody asked for.)
-    total = std::clamp(total, -MAX_OFFSET, MAX_OFFSET);
+    total = std::clamp(total, MIN_OFFSET, MAX_OFFSET);
     if (i < base_.size()) total = std::max(total, -int(base_[i].y()));
     pointOffsets_[i] = total - coreOffset_;
 }

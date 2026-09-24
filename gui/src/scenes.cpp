@@ -92,7 +92,7 @@ std::optional<Scene> load(const QString &name) {
     return s;
 }
 
-bool save(const Scene &s, QString *err) {
+bool save(const Scene &s, QString *err, const QJsonObject &tuningValues) {
     if (!validName(s.name)) { if (err) *err = "invalid scene name"; return false; }
     QJsonObject o{{"version", 1}};
     if (!s.platformProfile.isEmpty()) o["platform_profile"] = s.platformProfile;
@@ -103,6 +103,11 @@ bool save(const Scene &s, QString *err) {
     }
     for (const auto &[key, c] : {std::pair{"cpu_curve", s.cpu}, {"gpu_curve", s.gpu}, {"tuning", s.tuning}})
         if (c.kind != Choice::Unchanged) o[QLatin1String(key)] = choiceTo(c);
+    if (s.tuning.kind == Choice::Profile && !tuningValues.isEmpty()) {
+        QJsonObject t = o.value("tuning").toObject();
+        t["values"] = tuningValues;
+        o["tuning"] = t;
+    }
     if (!s.command.isEmpty()) o["command"] = s.command;
     return writeObject(sceneFile(s.name), o, err);
 }
@@ -144,6 +149,26 @@ std::optional<bool> onAc() {
     if (anySupply) return false;              // chargers present, none online
     if (anyBattery) return !discharging;      // no charger nodes: go by the battery
     return std::nullopt;
+}
+
+static QString stateFile() {
+    return QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/legion-power-manager/scene.json");
+}
+
+QString activeScene() {
+    const QString n = readObject(stateFile()).value("active").toString();
+    return validName(n) ? n : QString();
+}
+
+void setActiveScene(const QString &name) {
+    QJsonObject o = readObject(stateFile());
+    o["active"] = name;
+    writeObject(stateFile(), o, nullptr);
+}
+
+int gameSessions() {
+    // /run/legion-power-manager/tune/state.json is root-owned but world-readable.
+    return readObject(QStringLiteral("/run/legion-power-manager/tune/state.json")).value("refcount").toInt();
 }
 
 } // namespace scenes
@@ -190,6 +215,14 @@ void SceneEngine::pollPower() {
 }
 
 void SceneEngine::applyForSource(bool onAc) {
+    // Never switch scenes under a running game: lpm-gamemode POST returns to
+    // the scene for the then-current power source when the last game exits.
+    if (gameSessions() > 0) {
+        if (!deferred_) Q_EMIT finished(QString(), true, {QStringLiteral("power source changed — scene switch deferred until the game exits")});
+        deferred_ = true;
+        return;
+    }
+    deferred_ = false;
     const QString n = onAc ? auto_.onAc : auto_.onBattery;
     if (!n.isEmpty()) apply(n);
 }
@@ -377,7 +410,7 @@ void SceneEngine::next() {
 
 void SceneEngine::finish() {
     busy_ = false;
-    active_ = current_;
+    setActiveScene(current_);
     Q_EMIT finished(current_, ok_, log_);
     if (!pending_.isEmpty()) {
         const QString n = std::exchange(pending_, QString());

@@ -2,6 +2,7 @@
 #include "privileged.h"
 #include "inteltab.h"
 #include "ryzentab.h"
+#include "scenes.h"
 #include "sysinfo.h"
 #include "theme.h"
 
@@ -394,34 +395,40 @@ QWidget *OptimizeTab::buildLaunchPage() {
     v->addWidget(runBox);
 
     // Global (tune.json), not per preset: takes effect on the next game start.
-    auto *uvBox = box(QStringLiteral("Undervolt at game start  (curve presets named \"%1\")").arg(UNDERVOLT_PROFILE), "box_purple");
+    auto *uvBox = box(QStringLiteral("System at game start"), "box_purple");
     auto *ug = new QGridLayout(uvBox);
     ug->setHorizontalSpacing(10);
+    ug->setVerticalSpacing(6);
     const QJsonObject cfg = readJsonFile(configFile());
+    ug->addWidget(new QLabel("Scene"), 0, 0);
+    gameScene_ = new QComboBox;
+    gameScene_->setMinimumWidth(220);
+    gameScene_->setToolTip("The first game to start switches the machine to this scene; when the last game exits it goes "
+                           "back to the scene active before (or to the AC / battery scene if automatic switching is on).\n"
+                           "The scene's Optimizations preset is not used while playing — the ★ game preset handles tuning.");
+    ug->addWidget(gameScene_, 0, 1, 1, 2);
     uvCpu_ = new QCheckBox("Undervolt CPU");
     uvCpu_->setChecked(cfg.value("undervolt_cpu").toBool());
-    uvCpu_->setToolTip(QStringLiteral("Applies the Ryzen Curve Optimizer profile \"%1\" (all-core, then per-core).").arg(UNDERVOLT_PROFILE));
     uvGpu_ = new QCheckBox("Undervolt GPU");
     uvGpu_->setChecked(cfg.value("undervolt_gpu").toBool());
-    uvGpu_->setToolTip(QStringLiteral("Applies the NVIDIA curve profile \"%1\".").arg(UNDERVOLT_PROFILE));
-    if (sysinfo::isIntel()) {
-        uvCpu_->setToolTip(QStringLiteral("Applies the Intel Undervolt profile \"%1\" (voltage offsets, IccMax, TCC, power limits).").arg(UNDERVOLT_PROFILE));
-    } else if (!sysinfo::isAmd()) {
+    if (!sysinfo::isAmd() && !sysinfo::isIntel()) {
         uvCpu_->setChecked(false);
         uvCpu_->setEnabled(false);
         uvCpu_->setToolTip(QStringLiteral("No CPU undervolt backend for this CPU."));
     }
-    ug->addWidget(uvCpu_, 0, 0);
-    ug->addWidget(uvGpu_, 0, 1);
+    ug->addWidget(uvCpu_, 1, 0);
+    ug->addWidget(uvGpu_, 1, 1);
     uvInfo_ = new QLabel;
     uvInfo_->setTextFormat(Qt::RichText);
     uvInfo_->setWordWrap(true);
-    ug->addWidget(uvInfo_, 0, 2);
-    ug->addWidget(muted(QStringLiteral("Run by lpm-gamemode PRE / WRAP: CPU first, GPU 2 s later. A missing \"%1\" "
-                                       "profile is skipped. Test now: lpm-gamemode UNDERVOLT").arg(UNDERVOLT_PROFILE)), 1, 0, 1, 3);
+    ug->addWidget(uvInfo_, 1, 2);
+    ug->addWidget(muted(QStringLiteral("With a scene: the undervolt boxes decide whether its CPU / GPU curve is applied — unticked, "
+                                       "the scene loads without touching the curves. Without a scene: the \"%1\" curve profiles "
+                                       "are applied (CPU first, GPU 2 s later). Run by lpm-gamemode PRE / WRAP.").arg(UNDERVOLT_PROFILE)),
+                   2, 0, 1, 3);
     ug->setColumnStretch(2, 1);
     v->addWidget(uvBox);
-
+    fillGameScenes();
 
     auto *topo = box("CPU topology", "box_blue");
     auto *tl = new QVBoxLayout(topo);
@@ -465,7 +472,20 @@ QWidget *OptimizeTab::buildLaunchPage() {
     connect(affinity_, &QComboBox::currentIndexChanged, this, onRun);
     connect(uvCpu_, &QCheckBox::toggled, this, &OptimizeTab::saveUndervolt);
     connect(uvGpu_, &QCheckBox::toggled, this, &OptimizeTab::saveUndervolt);
+    connect(gameScene_, &QComboBox::activated, this, &OptimizeTab::saveUndervolt);
     return scroll;
+}
+
+void OptimizeTab::fillGameScenes() {
+    if (!gameScene_) return;
+    const QString sel = readJsonFile(configFile()).value("game_scene").toString();
+    const QSignalBlocker b(gameScene_);
+    gameScene_->clear();
+    gameScene_->addItem(QStringLiteral("— none (keep the current scene)"), QString());
+    const QStringList names = scenes::names();
+    for (const QString &n : names) gameScene_->addItem(n, n);
+    if (!sel.isEmpty() && !names.contains(sel)) gameScene_->addItem(sel + QStringLiteral("  (missing)"), sel);
+    gameScene_->setCurrentIndex(std::max(0, gameScene_->findData(sel)));
 }
 
 void OptimizeTab::saveUndervolt() {
@@ -473,14 +493,17 @@ void OptimizeTab::saveUndervolt() {
     QJsonObject cfg = readJsonFile(configFile());
     cfg["undervolt_cpu"] = uvCpu_->isChecked() && (sysinfo::isAmd() || sysinfo::isIntel());
     cfg["undervolt_gpu"] = uvGpu_->isChecked();
+    const QString scene = gameScene_ ? gameScene_->currentData().toString() : QString();
+    if (scene.isEmpty()) cfg.remove("game_scene"); else cfg["game_scene"] = scene;
     QString err;
-    if (!writeJsonFile(configFile(), cfg, &err)) { showStatus("Could not save undervolt setting: " + err, theme::DANGER); return; }
+    if (!writeJsonFile(configFile(), cfg, &err)) { showStatus("Could not save the game start setting: " + err, theme::DANGER); return; }
     updateLaunchPreview();
     QStringList on;
     if (uvCpu_->isChecked()) on << "CPU";
     if (uvGpu_->isChecked()) on << "GPU";
-    showStatus(on.isEmpty() ? QStringLiteral("Undervolt at game start: off")
-                            : QStringLiteral("Undervolt at game start: %1 (\"%2\")").arg(on.join(" + "), UNDERVOLT_PROFILE), theme::OK, 4000);
+    const QString uv = on.isEmpty() ? QStringLiteral("no undervolt") : QStringLiteral("undervolt %1").arg(on.join(" + "));
+    showStatus(scene.isEmpty() ? QStringLiteral("Game start: %1 (\"%2\" profiles)").arg(uv, UNDERVOLT_PROFILE)
+                               : QStringLiteral("Game start: scene \"%1\", %2").arg(scene, uv), theme::OK, 5000);
 }
 
 void OptimizeTab::updateLaunchPreview() {
@@ -495,7 +518,20 @@ void OptimizeTab::updateLaunchPreview() {
     for (QLineEdit *e : {lutrisPre_, lutrisPrefix_, steam_}) e->setToolTip(who);
     autogroup_->setEnabled(nice_->value() < 0);
 
-    if (uvInfo_) {
+    if (uvInfo_ && gameScene_ && !gameScene_->currentData().toString().isEmpty()) {
+        // Scene mode: say which curve the scene would load, or that it leaves it alone.
+        const auto sc = scenes::load(gameScene_->currentData().toString());
+        auto part = [](const char *what, const std::optional<scenes::Scene> &s, bool cpu, bool on) {
+            const scenes::Choice c = !s ? scenes::Choice{} : cpu ? s->cpu : s->gpu;
+            const QString v = c.kind == scenes::Choice::Profile ? "\"" + c.name + "\""
+                            : c.kind == scenes::Choice::Reset ? QStringLiteral("reset") : QStringLiteral("unchanged");
+            const char *col = !on || c.kind == scenes::Choice::Unchanged ? theme::MUTED : theme::OK;
+            return QStringLiteral("<span style='color:%1'>%2: %3%4</span>").arg(col, what, on ? v : QStringLiteral("skipped"),
+                                                                           on || c.kind == scenes::Choice::Unchanged ? QString() : " (" + v + ")");
+        };
+        uvInfo_->setText(!sc ? QStringLiteral("<span style='color:%1'>scene not found</span>").arg(theme::WARN)
+                             : part("CPU", sc, true, uvCpu_->isChecked()) + " &nbsp;·&nbsp; " + part("GPU", sc, false, uvGpu_->isChecked()));
+    } else if (uvInfo_) {
         const bool cpu = QFileInfo((sysinfo::isIntel() ? inteluv::profilesDir() : ryzen::profilesDir()) + '/' + UNDERVOLT_PROFILE + ".json").isFile();
         const bool gpu = QFileInfo(NVCURVE_PROFILES + '/' + UNDERVOLT_PROFILE + ".json").isFile();
         auto tag = [](const char *what, bool found, bool on) {
@@ -513,6 +549,8 @@ void OptimizeTab::updateLaunchPreview() {
 
 void OptimizeTab::showEvent(QShowEvent *e) {
     QWidget::showEvent(e);
+    fillGameScenes();  // scenes may have been added or deleted meanwhile
+    updateLaunchPreview();
     refresh();
     poll_->start();
 }

@@ -74,7 +74,6 @@ private:
     // Device box (battery charge mode, ideapad toggles, fan targets)
     QString chargeFile_, ideapadDir_, fanHwmon_;
     QComboBox *charge_ = nullptr;
-    QComboBox *fanMode_ = nullptr;   // ideapad fan_mode (silent / standard / dust cleaning / efficient)
     QHash<QString, QCheckBox *> toggles_;
     struct FanRow { QString key; QLabel *rpm; QLineEdit *target; QCheckBox *autoBox; QCheckBox *maxBox; QPushButton *set; int max; };
     QList<FanRow> fans_;

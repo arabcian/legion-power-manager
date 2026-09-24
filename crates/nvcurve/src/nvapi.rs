@@ -39,8 +39,12 @@ pub const RANGES_SIZE: usize = 0x0928;
 pub const PERF_SIZE: usize = 0x030C;
 pub const VBOOST_SIZE: usize = 0x0028;
 
-/// ±1000 MHz hard cap (Blackwell driver limit).
+/// Upward cap: +1000 MHz (Blackwell driver limit for positive offsets).
 pub const MAX_DELTA_KHZ: i64 = 1_000_000;
+/// Downward floor: -2000 MHz. Negative offsets only lower clocks (a flattened
+/// undervolt curve pulls the top points down by well over 1000 MHz), and the
+/// driver accepts them; the old symmetric ±1000 clamp broke such curves.
+pub const MIN_DELTA_KHZ: i64 = -2_000_000;
 
 /// Linux NvAPI uses small negative codes.
 pub fn error_name(code: i32) -> String {
