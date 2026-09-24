@@ -146,8 +146,20 @@ notification when the window is hidden.
 - **Run command** executes as the user, without a shell — for things this
   app does not manage (display refresh rate, audio profile…).
 
+- **Game start** (Optimizations → Game launch → *System at game start*): pick
+  a scene and the first game started through `lpm-gamemode PRE` / `WRAP`
+  switches to it; the last `POST` returns to the scene that was active before
+  (or to the AC / battery scene when automatic switching is on). The
+  *Undervolt CPU / GPU* boxes decide whether the scene's curves are applied —
+  unticked, the scene loads without touching them. The scene's Optimizations
+  part is skipped while playing: the ★ game preset owns tuning. Automatic
+  AC / battery switching waits until the last game has exited.
+  `lpm-gamemode SCENE <name>` applies a scene from a script.
+
 Files: `~/.config/legion-power-manager/scenes/<name>.json` and
-`~/.config/legion-power-manager/scenes.json` (automatic switching). The tray
+`~/.config/legion-power-manager/scenes.json` (automatic switching); the
+active scene is shared with lpm-gamemode in
+`$XDG_RUNTIME_DIR/legion-power-manager/scene.json`. The tray
 has a *Scene* menu with every scene and the auto-switch toggle.
 
 ## Components
@@ -283,7 +295,7 @@ Port of `nvcurve_gui.py` (embedded mode), same nvcurve-root-helper ops and
 - **Group drag clamp bug:** the Python widget clamped every *frequency* to
   800–3000 MHz while dragging, so shifting the whole curve lifted all
   sub-800 MHz idle points to 800 — large unintended positive offsets that
-  then got applied. Now *offsets* are clamped to ±1000 MHz (driver cap) and
+  then got applied. Now *offsets* are clamped to the driver range (+1000 / -2000 MHz) and
   frequencies only to ≥ 0.
 - **Arrow-key edits** in the Python widget changed only the plotted points and
   were lost on the next recompute (e.g. touching the core spin box). All edits
@@ -412,8 +424,6 @@ for `LPM_SCREENSHOT`.
   (through `iw`; NetworkManager may re-enable it on reconnect).
 - **Devices:** PCIe ASPM per link (`l1` / `l1ss`), for links a driver or the
   firmware left without ASPM; links that refuse are skipped.
-- **Home → Device:** fan mode (Standard / Super silent / Efficient cooling /
-  Dust cleaning) where ideapad_acpi exposes `fan_mode`.
 
 Like every other knob these record the original value on first write and go
 back on *Restore originals*, game-mode release or a scene switch.
