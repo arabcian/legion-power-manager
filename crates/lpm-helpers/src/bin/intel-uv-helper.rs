@@ -14,23 +14,20 @@ use lpm_helpers::intel_uv::{self, parse_profile};
 use lpm_helpers::intel_uv_daemon::{apply_boot, parse_boot};
 use lpm_helpers::*;
 use serde_json::{json, Value};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const MAX_STDIN_BYTES: usize = 16 * 1024;
 const BOOT_DIR: &str = "/etc/legion-power-manager";
 const BOOT_FILE: &str = "/etc/legion-power-manager/intel-uv-boot.json";
 
+/// The boot profile is applied by root at every boot and resume, so it lives
+/// in a verified root-owned directory and is replaced atomically (the old
+/// version used create_dir_all under the caller's umask: `umask 000; pkexec`
+/// left /etc/legion-power-manager world-writable).
 fn write_boot(profile: &Value) -> Result<(), String> {
-    std::fs::create_dir_all(BOOT_DIR).map_err(|e| format!("{BOOT_DIR}: {e}"))?;
-    let tmp = format!("{BOOT_FILE}.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&tmp).map_err(|e| format!("{tmp}: {e}"))?;
-    let body = serde_json::to_string_pretty(profile).unwrap_or_default();
-    f.write_all(body.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| format!("{tmp}: {e}"))?;
-    std::fs::rename(&tmp, BOOT_FILE).map_err(|e| format!("{BOOT_FILE}: {e}"))
+    secure_dir(BOOT_DIR)?;
+    let body = serde_json::to_vec_pretty(profile).map_err(|e| e.to_string())?;
+    write_root_file(BOOT_FILE, &body)
 }
 
 fn run() -> Value {
@@ -71,4 +68,4 @@ fn run() -> Value {
     out
 }
 
-fn main() { std::process::exit(finish(run())); }
+fn main() { init(); std::process::exit(finish(run())); }

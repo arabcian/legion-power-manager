@@ -4,6 +4,11 @@
 #include "theme.h"
 
 #include <QButtonGroup>
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QFile>
+#include <QPointer>
+#include <QThreadPool>
 #include <QGridLayout>
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -27,6 +32,49 @@
 #include <QVBoxLayout>
 
 static constexpr int POLL_MS = 2500, LIVE_POLL_MS = 2000, SMI_TIMEOUT_MS = 3000;
+// nvidia-smi while the dGPU idles: every query resets the driver's idle timer,
+// so polling it every 2 s kept the GPU out of D3cold for as long as the Home
+// tab was open. Idle → one query every 15 s, long enough for it to suspend.
+static constexpr int SMI_IDLE_MS = 15000;
+
+/// Monotonic milliseconds (QDeadlineTimer-free, works on Qt 6.4).
+static qint64 monoMs() {
+    static QElapsedTimer t;
+    if (!t.isValid()) t.start();
+    return t.elapsed();
+}
+
+/// NVIDIA display-class PCI function (sysfs dir), or empty.
+static QString nvidiaPciDir() {
+    const QDir d(QStringLiteral("/sys/bus/pci/devices"));
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
+        const QString p = d.filePath(e);
+        if (pp::readText(p + "/vendor").value_or(QString()) == QLatin1String("0x10de")
+            && pp::readText(p + "/class").value_or(QString()).startsWith(QLatin1String("0x03")))
+            return p;
+    }
+    return {};
+}
+
+/// GPU model from the driver's procfs node — reading it does not touch the
+/// hardware, unlike nvidia-smi, which powers the dGPU up just to print a name.
+static std::optional<QString> nvidiaProcModel() {
+    const QDir d(QStringLiteral("/proc/driver/nvidia/gpus"));
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
+        QFile f(d.filePath(e) + QStringLiteral("/information"));
+        if (!f.open(QIODevice::ReadOnly)) continue;
+        for (const QByteArray &line : f.read(16 * 1024).split('\n'))
+            if (line.startsWith("Model:"))
+                if (const QString m = QString::fromUtf8(line.mid(6)).trimmed(); !m.isEmpty()) return m;
+    }
+    return std::nullopt;
+}
+
+/// nvidia-smi path, resolved once ($PATH does not change under us).
+static const QString &nvidiaSmiExe() {
+    static const QString exe = QStandardPaths::findExecutable(QStringLiteral("nvidia-smi"));
+    return exe;
+}
 
 static const QHash<QString, QString> LABELS{
     {"low-power", "Power Saver"}, {"quiet", "Quiet"}, {"cool", "Cool"}, {"balanced", "Balanced"},
@@ -143,7 +191,7 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
 // ── nvidia-smi (async, bounded) ─────────────────────────────────────────────
 
 void HomeTab::runNvidiaSmi(const QStringList &args, std::function<void(const QByteArray &)> onOk) {
-    const QString exe = QStandardPaths::findExecutable(QStringLiteral("nvidia-smi"));
+    const QString &exe = nvidiaSmiExe();
     if (exe.isEmpty()) { onOk({}); return; }
     auto *p = new QProcess(this);
     auto *t = new QTimer(p);
@@ -197,10 +245,14 @@ QGroupBox *HomeTab::buildHardwareBox() {
     g->setColumnStretch(1, 1);
     g->setRowStretch(row, 1);
 
-    runNvidiaSmi({"--query-gpu=name", "--format=csv,noheader"}, [this](const QByteArray &out) {
-        if (auto n = sysinfo::parseGpuName(out)) { gpuHwValue_->setText(*n); }
-        else { gpuHwKey_->hide(); gpuHwValue_->hide(); }
-    });
+    if (auto m = nvidiaProcModel()) {
+        gpuHwValue_->setText(*m);
+    } else {
+        runNvidiaSmi({"--query-gpu=name", "--format=csv,noheader"}, [this](const QByteArray &out) {
+            if (auto n = sysinfo::parseGpuName(out)) { gpuHwValue_->setText(*n); }
+            else { gpuHwKey_->hide(); gpuHwValue_->hide(); }
+        });
+    }
     return box;
 }
 
@@ -250,13 +302,60 @@ void HomeTab::refreshLive() {
     // Not visible (hidden to tray / other tab) → no reads. nvidia-smi in
     // particular wakes the dGPU out of D3cold.
     if (!isVisible()) return;
-    for (const LiveRow &r : liveRows_) r.value->setText(r.getter().value_or(QStringLiteral("—")));
     refreshDevice();
+    refreshGpuLive();
+    if (liveBusy_ || liveRows_.isEmpty()) return;  // never stack sweeps
+
+    // The sysfs sweep runs off the GUI thread: battery/charger attributes are
+    // ACPI method calls (_BST/_PSR) answered by the EC, and an EC that is busy
+    // (fan or profile change in flight) can hold a read for tens to hundreds
+    // of ms — which used to stall repaint and input every 2 s.
+    liveBusy_ = true;
+    QList<std::function<std::optional<QString>()>> getters;
+    getters.reserve(liveRows_.size());
+    for (const LiveRow &r : std::as_const(liveRows_)) getters.append(r.getter);
+    QPointer<HomeTab> self(this);
+    QThreadPool::globalInstance()->start([self, getters] {
+        QList<std::optional<QString>> vals;
+        vals.reserve(getters.size());
+        for (const auto &g : getters) vals.append(g());
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, vals] {
+            if (!self) return;
+            self->liveBusy_ = false;
+            for (int i = 0; i < vals.size() && i < self->liveRows_.size(); ++i) {
+                const QString t = vals[i].value_or(QStringLiteral("—"));
+                if (self->liveRows_[i].value->text() != t) self->liveRows_[i].value->setText(t);
+            }
+        }, Qt::QueuedConnection);
+    });
+}
+
+void HomeTab::refreshGpuLive() {
     if (smiLive_) return;  // previous query still running — never stack them
+    if (!dgpuProbed_) {
+        dgpuProbed_ = true;
+        if (const QString pci = nvidiaPciDir(); !pci.isEmpty()) dgpuRuntimeStatus_ = pci + QStringLiteral("/power/runtime_status");
+    }
+    // Asleep (runtime PM "suspended" = D3hot/D3cold): report it, don't wake it.
+    if (!dgpuRuntimeStatus_.isEmpty()
+        && pp::readText(dgpuRuntimeStatus_).value_or(QString()) == QLatin1String("suspended")) {
+        gpuLiveValue_->setText(QStringLiteral("asleep (runtime suspended, ~0 W)"));
+        gpuLiveKey_->show();
+        gpuLiveValue_->show();
+        nextSmiAt_ = 0;  // query immediately once something else wakes it
+        return;
+    }
+    if (monoMs() < nextSmiAt_) return;
     runNvidiaSmi({"--query-gpu=temperature.gpu,power.draw,clocks.current.graphics,utilization.gpu",
                   "--format=csv,noheader,nounits"},
                  [this](const QByteArray &out) {
                      smiLive_ = nullptr;
+                     // Busy → normal cadence; idle (0 % util) → back off so the
+                     // driver's idle timer can expire and the GPU can suspend.
+                     const QStringList parts = QString::fromUtf8(out).trimmed().section('\n', 0, 0).split(',');
+                     bool ok = false;
+                     const int util = parts.size() >= 4 ? parts[3].trimmed().toInt(&ok) : 0;
+                     nextSmiAt_ = monoMs() + (ok && util > 0 ? 0 : SMI_IDLE_MS);
                      if (auto v = sysinfo::parseGpuLive(out)) {
                          gpuLiveValue_->setText(*v);
                          gpuLiveKey_->show();
@@ -320,6 +419,32 @@ QGroupBox *HomeTab::buildDeviceBox() {
         }
         h->addStretch(1);
         if (!toggles_.isEmpty()) g->addLayout(h, row++, 0, 1, 5);
+
+        if (QFileInfo(ideapadDir_ + "/fan_mode").isFile()) {
+            fanMode_ = new QComboBox;
+            fanMode_->addItem("Standard", "1");
+            fanMode_->addItem("Super silent", "0");
+            fanMode_->addItem("Efficient cooling", "4");
+            fanMode_->addItem("Dust cleaning", "2");
+            fanMode_->setToolTip("The EC's fan mode (ideapad fan_mode).\n"
+                                 "Dust cleaning runs the fans through a cleaning cycle to blow dust out of the fins —\n"
+                                 "run it now and then with the laptop on a table; switch back to Standard afterwards\n"
+                                 "if the firmware does not do so itself.\n"
+                                 "On Legion models the power profile also drives the fans, so Super silent / Efficient\n"
+                                 "cooling may be overridden by the next profile change.");
+            connect(fanMode_, &QComboBox::activated, this, [this](int i) {
+                const QString v = fanMode_->itemData(i).toString();
+                if (v == QLatin1String("2") && QMessageBox::question(this, "Dust cleaning",
+                        "Start the fan dust-cleaning cycle?\n\nThe fans will run loudly for a while. "
+                        "Keep the vents unobstructed.") != QMessageBox::Yes) {
+                    refreshDevice();
+                    return;
+                }
+                setDevice("fan_mode", v);
+            });
+            g->addWidget(muted("Fan mode"), row, 0);
+            g->addWidget(fanMode_, row++, 1, 1, 4);
+        }
     }
 
     int bannerRow = -1;
@@ -467,6 +592,11 @@ void HomeTab::refreshDevice() {
             QSignalBlocker blk(charge_);
             charge_->setCurrentIndex(charge_->findData(raw.mid(a + 1, b - a - 1)));
         }
+    }
+    if (fanMode_ && !fanMode_->view()->isVisible()) {
+        QSignalBlocker blk(fanMode_);
+        const int i = fanMode_->findData(rdText(ideapadDir_ + "/fan_mode"));
+        if (i >= 0) fanMode_->setCurrentIndex(i);
     }
     for (auto it = toggles_.cbegin(); it != toggles_.cend(); ++it) {
         QSignalBlocker blk(it.value());

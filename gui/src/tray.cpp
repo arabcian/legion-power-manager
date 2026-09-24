@@ -5,6 +5,7 @@
 #include "nvidiatab.h"
 #include "optimizetab.h"
 #include "ryzentab.h"
+#include "scenes.h"
 #include "theme.h"
 #include <QApplication>
 #include <QMenu>
@@ -43,6 +44,18 @@ Tray::Tray(MainWindow *win) : QSystemTrayIcon(appIcon(), win), win_(win), menu_(
         if (r == Trigger || r == DoubleClick) toggleWindow();
     });
     rebuild();
+
+    // Scene results: a notification when nobody is looking at the Scenes tab
+    // (tray pick, charger plugged/pulled); the tab shows its own status line.
+    SceneEngine *eng = win_->scenes();
+    connect(eng, &SceneEngine::finished, this, [this](const QString &n, bool ok, const QStringList &log) {
+        if (win_->isVisible() && win_->isActiveWindow()) return;
+        QStringList bad;
+        for (const QString &l : log) if (l.startsWith(QStringLiteral("✗"))) bad << l.mid(2);
+        notify("Scene: " + n, ok ? QStringLiteral("Applied.") : bad.join('\n'));
+    });
+    connect(eng, &SceneEngine::started, this, [this](const QString &n) { setToolTip("Legion Power Manager — applying scene '" + n + "'…"); });
+    connect(eng, &SceneEngine::finished, this, [this](const QString &n) { setToolTip("Legion Power Manager — scene: " + n); });
 }
 
 void Tray::toggleWindow() {
@@ -67,6 +80,38 @@ static void disabledEntry(QMenu *m, const QString &t) { m->addAction(t)->setEnab
 
 void Tray::rebuild() {
     menu_->clear();
+
+    // Scenes: the whole machine in one click; the component menus below stay
+    // for one-off changes.
+    SceneEngine *eng = win_->scenes();
+    const QStringList sceneNames = scenes::names();
+    if (!sceneNames.isEmpty()) {
+        QMenu *sm = menu_->addMenu("Scene");
+        for (const QString &n : sceneNames) {
+            QAction *a = sm->addAction(n);
+            a->setCheckable(true);
+            a->setChecked(n == eng->active());
+            connect(a, &QAction::triggered, this, [this, eng, n] {
+                if (!claimCooldown()) return;
+                eng->apply(n);
+                notify("Scene", "Applying '" + n + "'…");
+            });
+        }
+        sm->addSeparator();
+        QAction *au = sm->addAction("Switch with power source");
+        au->setCheckable(true);
+        const scenes::Auto cfg = eng->autoConfig();
+        au->setChecked(cfg.enabled);
+        au->setEnabled(!cfg.onAc.isEmpty() || !cfg.onBattery.isEmpty());
+        if (!au->isEnabled()) au->setToolTip("Choose the AC / battery scenes in the Scenes tab first");
+        connect(au, &QAction::toggled, this, [eng](bool on) {
+            scenes::Auto c = eng->autoConfig();
+            c.enabled = on;
+            eng->setAuto(c);
+        });
+        sm->setEnabled(!eng->busy());
+        menu_->addSeparator();
+    }
 
     // Power profile
     QMenu *pm = menu_->addMenu("Power Profile");

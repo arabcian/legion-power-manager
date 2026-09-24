@@ -43,8 +43,11 @@ pub fn parse_boot(v: &Value) -> Result<BootConfig, String> {
 }
 
 pub fn load_boot() -> Result<Option<BootConfig>, String> {
-    if !Path::new(BOOT_FILE).is_file() { return Ok(None); }
-    let s = std::fs::read_to_string(BOOT_FILE).map_err(|e| format!("{BOOT_FILE}: {e}"))?;
+    if !Path::new(BOOT_FILE).exists() { return Ok(None); }
+    // Root writes MSR voltages from this file at every boot/resume: only a
+    // root-owned, not group/other-writable regular file is trusted.
+    let s = crate::read_root_file(BOOT_FILE, 256 * 1024)
+        .ok_or_else(|| format!("{BOOT_FILE}: not a root-owned, non-writable regular file (or too large) — ignored"))?;
     let v: Value = serde_json::from_str(&s).map_err(|e| format!("{BOOT_FILE}: {e}"))?;
     parse_boot(&v).map(Some).map_err(|e| format!("{BOOT_FILE}: {e}"))
 }

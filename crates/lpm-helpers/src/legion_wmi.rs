@@ -34,7 +34,7 @@ const ACPI_CALL: &str = "/proc/acpi/call";
 
 /// cTGP: no hard cap the user can't exceed — they asked to write freely for a
 /// test. Kept only as a sanity ceiling so a typo can't send a wild value to
-/// the EC. The GUI shows the *recommended* 5..150 envelope separately.
+/// the EC. The recommended envelope is available from status on request.
 pub const CTGP_SANITY_MAX: i64 = 250;
 
 pub struct Feat {
@@ -88,8 +88,18 @@ fn sysfs_read(attr: &str) -> Option<SysRange> {
 fn sysfs_write(attr: &str, value: i64) -> Result<(), String> {
     let d = attr_dir(attr).ok_or_else(|| format!("{attr}: attribute not present"))?;
     let r = sysfs_read(attr).ok_or_else(|| format!("{attr}: metadata unreadable"))?;
-    if r.ranged && (value < r.min || value > r.max) {
-        return Err(format!("{value} outside firmware range [{}, {}]", r.min, r.max));
+    if r.ranged {
+        if value < r.min || value > r.max {
+            return Err(format!("{value} outside firmware range [{}, {}]", r.min, r.max));
+        }
+    } else if let Some(f) = FEATURES.iter().find(|f| f.attr == attr) {
+        // No firmware range published: fall back to the feature's own
+        // envelope instead of writing an unchecked integer to the EC.
+        if value < f.lo || value > f.hi {
+            return Err(format!("{value} outside {}..{} {} (firmware publishes no range)", f.lo, f.hi, f.unit));
+        }
+    } else {
+        return Err(format!("{attr}: no range known; refusing"));
     }
     crate::sysfs_write(&d.join("current_value"), value.to_string().as_bytes())
         .map_err(|e| format!("{attr}: {e}"))
@@ -110,13 +120,21 @@ fn modprobe_acpi_call() {
     }
 }
 
+/// One acpi_call transaction. The module keeps a single global result
+/// buffer: two concurrent callers (the GUI's status poll and an apply, or a
+/// second tool) can read each other's result. The write→read pair is
+/// therefore done under an exclusive flock on the proc file, and the reply
+/// is bounded (the module's buffer is small; a runaway read never grows).
 fn acpi_raw(expr: &str) -> Result<String, String> {
     use std::io::{Read, Write};
+    const MAX_REPLY: u64 = 64 * 1024;
     let mut f = OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC).open(ACPI_CALL)
         .map_err(|e| format!("{ACPI_CALL}: {e}"))?;
+    let _lock = crate::FdLock::exclusive(&f).map_err(|e| format!("{ACPI_CALL} lock: {e}"))?;
     f.write_all(expr.as_bytes()).map_err(|e| format!("acpi_call write: {e}"))?;
-    let mut out = String::new();
-    f.read_to_string(&mut out).map_err(|e| format!("acpi_call read: {e}"))?;
+    let mut raw = Vec::new();
+    (&mut f).take(MAX_REPLY).read_to_end(&mut raw).map_err(|e| format!("acpi_call read: {e}"))?;
+    let out = String::from_utf8_lossy(&raw);
     let out = out.trim_matches(char::from(0)).trim().to_owned();
     if out.starts_with("Error") { return Err(format!("acpi_call: {out}")); }
     Ok(out)
@@ -148,12 +166,45 @@ pub fn platform_profile() -> Option<String> {
 }
 fn in_custom() -> bool { platform_profile().as_deref() == Some("custom") }
 
-/// nvidia-smi Max/Min Power Limit, if nvidia-smi is on PATH. Used only to show
-/// the recommended cTGP envelope; never a hard limit here.
+/// Runtime-PM state of the NVIDIA dGPU ("active", "suspended", …), if present.
+fn dgpu_runtime_status() -> Option<String> {
+    for e in std::fs::read_dir("/sys/bus/pci/devices").ok()?.flatten() {
+        let d = e.path();
+        let rd = |f: &str| std::fs::read_to_string(d.join(f)).ok().map(|s| s.trim().to_owned());
+        if rd("vendor").as_deref() == Some("0x10de") && rd("class").map_or(false, |c| c.starts_with("0x03")) {
+            return rd("power/runtime_status");
+        }
+    }
+    None
+}
+
+/// nvidia-smi Max/Min Power Limit — advisory only, never a hard limit here.
+///
+/// Opt-in ({"op":"status","envelope":true}) and skipped while the dGPU is
+/// runtime-suspended: nvidia-smi powers the GPU up just to answer, and the
+/// plain status poll used to do that on every Firmware Attributes load —
+/// including at login, with the app still hidden in the tray. Bounded by a
+/// timeout because nvidia-smi can hang on a wedged GPU, and this runs as root
+/// inside a pkexec call the GUI is waiting on.
 fn nvidia_power_limits() -> Option<(i64, i64)> {
-    let exe = ["/usr/bin/nvidia-smi", "/bin/nvidia-smi", "/usr/local/bin/nvidia-smi"].iter().find(|p| Path::new(p).is_file())?;
-    let out = std::process::Command::new(exe).args(["-q", "-d", "POWER"]).env_clear().env("PATH", "/usr/bin:/bin").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    if dgpu_runtime_status().as_deref() == Some("suspended") { return None; }
+    let exe = ["/usr/bin/nvidia-smi", "/bin/nvidia-smi", "/opt/bin/nvidia-smi"].iter().find(|p| crate::trusted_path(Path::new(p)))?;
+    let mut child = Command::new(exe).args(["-q", "-d", "POWER"]).env_clear().env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let reader = std::thread::spawn(move || { let mut s = Vec::new(); let _ = (&mut out).take(256 * 1024).read_to_end(&mut s); s });
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() < TIMEOUT => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => { let _ = child.kill(); let _ = child.wait(); return None; }
+        }
+    }
+    let text = String::from_utf8_lossy(&reader.join().ok()?).into_owned();
     let grab = |label: &str| text.lines().find(|l| l.contains(label))
         .and_then(|l| l.split(':').nth(1)).and_then(|v| v.trim().split_whitespace().next())
         .and_then(|n| n.parse::<f64>().ok()).map(|f| f as i64);
@@ -170,7 +221,7 @@ fn read_value(f: &Feat) -> Result<i64, String> {
 
 // ── operations ──────────────────────────────────────────────────────────────
 
-pub fn status() -> Value {
+pub fn status(want_envelope: bool) -> Value {
     if !acpi_available() { modprobe_acpi_call(); }
     let mut out = json!({
         "ok": true,
@@ -194,8 +245,8 @@ pub fn status() -> Value {
         if o.get("ranged").is_none() { o["min"] = json!(f.lo); o["max"] = json!(f.hi); o["step"] = json!(1); o["ranged"] = json!(false); }
         vals.insert(f.key.into(), o);
     }
-    // cTGP recommended envelope from nvidia-smi (advisory only).
-    if let Some((minp, maxp)) = nvidia_power_limits() {
+    // cTGP recommended envelope from nvidia-smi (advisory, opt-in).
+    if let Some((minp, maxp)) = want_envelope.then(nvidia_power_limits).flatten() {
         let ceil = vals.get("boost_up").and_then(|v| v["value"].as_i64()).unwrap_or(25);
         out["envelope"] = json!({"gpu_min_w": minp, "gpu_max_w": maxp, "ctgp_max_w": (maxp - ceil).max(minp), "ctgp_min_w": minp});
     }
@@ -213,17 +264,35 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
     let need_acpi = values.keys().any(|k| feat(k).map(|f| f.via_acpi).unwrap_or(false));
     if need_acpi && !acpi_available() { modprobe_acpi_call(); }
 
+    // Validate the whole request first: a bad value anywhere means nothing
+    // is written, instead of a half-applied set of EC power limits.
+    let mut plan: Vec<(&String, &'static Feat, i64)> = Vec::with_capacity(values.len());
     for (key, jv) in values {
-        let r = (|| {
+        let checked = (|| {
             let f = feat(key).ok_or_else(|| format!("unknown knob '{key}'"))?;
             let v = jv.as_i64().ok_or_else(|| format!("{key}: not an integer"))?;
             if f.via_acpi {
-                if !acpi_available() { return Err("acpi_call not available".into()); }
                 // No firmware range for these; only a sanity clamp so a typo
                 // can't send something absurd to the EC. cTGP is left wide on
                 // purpose (user testing); ceiling/floor keep their 0..25.
                 let cap = if f.key == "ctgp" { CTGP_SANITY_MAX } else { f.hi };
                 if v < 0 || v > cap { return Err(format!("{} must be 0..{cap} {}", f.label, f.unit)); }
+            }
+            Ok((f, v))
+        })();
+        match checked {
+            Ok((f, v)) => plan.push((key, f, v)),
+            Err(m) => { all = false; results.push(json!({"what": key, "ok": false, "message": m})); }
+        }
+    }
+    if !all {
+        return json!({"ok": false, "results": results, "error": "request rejected; nothing was written"});
+    }
+
+    for (key, f, v) in plan {
+        let r = (|| {
+            if f.via_acpi {
+                if !acpi_available() { return Err("acpi_call not available".into()); }
                 wmae_set(f.id, v)?;
                 let back = wmae_get(f.id)?;
                 if back != v { return Err(format!("readback {back} ≠ {v}")); }

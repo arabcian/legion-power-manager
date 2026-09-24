@@ -1,4 +1,5 @@
 #include "privileged.h"
+#include <QCoreApplication>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QPointer>
@@ -25,6 +26,7 @@ void run(const QString &helper, const QJsonObject &payload, QObject *ctx, Callba
 }
 
 void run(const QString &helper, const QByteArray &payload, QObject *ctx, Callback cb, int timeoutMs) {
+    QPointer<QObject> guard(ctx);
     auto fail = [&](const QString &msg) {
         Result r; r.error = msg;
         QTimer::singleShot(0, ctx, [cb, r] { cb(r); });
@@ -36,35 +38,47 @@ void run(const QString &helper, const QByteArray &payload, QObject *ctx, Callbac
     if (pkexec.isEmpty()) return fail(QStringLiteral("pkexec was not found. Install polkit (sys-auth/polkit)."));
     if (!QFileInfo(helper).isFile()) return fail(QStringLiteral("helper not found: ") + helper);
 
-    auto *proc = new QProcess(ctx);
+    // Not parented to `ctx`: a QProcess destructor kills *and waits* for its
+    // child. Once pkexec has exec'd the root helper, our kill() is refused
+    // (EPERM), so destroying a still-running QProcess — on timeout, or when
+    // the owning tab goes away — blocked the GUI thread until the helper
+    // exited on its own. The process now lives until it has really finished
+    // and only then deletes itself; `guard` decides whether the callback runs.
+    auto *proc = new QProcess(QCoreApplication::instance());
     auto *timer = new QTimer(proc);
     timer->setSingleShot(true);
     auto done = std::make_shared<bool>(false);
-    QPointer<QObject> guard(ctx);
 
-    auto finish = [=](Result r) {
+    auto finish = [=](const Result &r) {
         if (*done) return;
         *done = true;
         timer->stop();
-        proc->deleteLater();
         if (guard) cb(r);
+    };
+    auto reap = [proc] {
+        if (proc->state() == QProcess::NotRunning) proc->deleteLater();
+        // else: deleted from the finished() handler once it really exits.
     };
 
     QObject::connect(timer, &QTimer::timeout, proc, [=] {
-        proc->kill();
+        proc->kill();  // works while pkexec still waits for authorization
         Result r;
         r.error = QStringLiteral("the helper did not finish in time. If an authorization dialog is still open, close it and try again.");
         finish(r);
+        reap();
     });
     QObject::connect(proc, &QProcess::errorOccurred, proc, [=](QProcess::ProcessError e) {
         if (e != QProcess::FailedToStart) return;
         Result r; r.error = QStringLiteral("could not start pkexec: ") + proc->errorString();
         finish(r);
+        reap();
     });
     QObject::connect(proc, &QProcess::finished, proc, [=](int code, QProcess::ExitStatus) {
+        proc->deleteLater();
+        if (*done) return;  // already reported (timeout); just clean up
         Result r;
         const QByteArray out = proc->readAllStandardOutput().trimmed();
-        const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
+        const QString err = QString::fromUtf8(proc->readAllStandardError().left(4096)).trimmed();
         // The helper prints exactly one JSON line; take the last line in case
         // anything else slipped onto stdout first.
         const QByteArray last = out.mid(out.lastIndexOf('\n') + 1);
@@ -85,11 +99,17 @@ void run(const QString &helper, const QByteArray &payload, QObject *ctx, Callbac
         }
         finish(r);
     });
+    // A runaway helper must not grow the GUI's memory without bound: helpers
+    // answer with one short JSON line, so anything past 4 MiB is garbage.
+    QObject::connect(proc, &QProcess::readyReadStandardOutput, proc, [proc] {
+        if (proc->bytesAvailable() > 4 * 1024 * 1024) proc->kill();
+    });
 
     proc->setProgram(pkexec);
     proc->setArguments({helper});
     proc->setProcessChannelMode(QProcess::SeparateChannels);
     proc->start();
+    if (proc->state() == QProcess::NotRunning) return;  // FailedToStart already handled
     proc->write(payload);
     proc->closeWriteChannel();
     timer->start(timeoutMs);

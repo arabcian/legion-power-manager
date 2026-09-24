@@ -1,0 +1,15 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/theme">
+    <file alias="check.png">theme/check.png</file>
+    <file alias="check@2x.png">theme/check@2x.png</file>
+    <file alias="chev-down.png">theme/chev-down.png</file>
+    <file alias="chev-down@2x.png">theme/chev-down@2x.png</file>
+    <file alias="chev-up.png">theme/chev-up.png</file>
+    <file alias="chev-up@2x.png">theme/chev-up@2x.png</file>
+    <file alias="chev-down-off.png">theme/chev-down-off.png</file>
+    <file alias="chev-down-off@2x.png">theme/chev-down-off@2x.png</file>
+    <file alias="chev-up-off.png">theme/chev-up-off.png</file>
+    <file alias="chev-up-off@2x.png">theme/chev-up-off@2x.png</file>
+  </qresource>
+</RCC>

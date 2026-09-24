@@ -1,5 +1,5 @@
 //! Root helper for the experimental Legion GPU power tab (pkexec).
-//!   {"op": "status"}
+//!   {"op": "status"}                      add "envelope": true for nvidia-smi's power range (wakes the dGPU)
 //!   {"op": "apply", "values": {"ctgp": 140, "boost_up": 25, ...}}
 use lpm_helpers::legion_wmi;
 use lpm_helpers::*;
@@ -9,7 +9,7 @@ fn run() -> Value {
     let req = match read_request(8192) { Ok(v) => v, Err(e) => return e };
     let Some(o) = req.as_object() else { return json!({"ok": false, "error": "payload must be an object"}) };
     match o.get("op").and_then(Value::as_str) {
-        Some("status") => legion_wmi::status(),
+        Some("status") => legion_wmi::status(o.get("envelope").and_then(Value::as_bool).unwrap_or(false)),
         Some("apply") => match o.get("values").and_then(Value::as_object) {
             Some(v) => legion_wmi::apply(v),
             None => json!({"ok": false, "error": "apply needs a 'values' object"}),
@@ -17,4 +17,4 @@ fn run() -> Value {
         other => json!({"ok": false, "error": format!("unknown op: {}", other.unwrap_or("None"))}),
     }
 }
-fn main() { std::process::exit(finish(run())); }
+fn main() { init(); std::process::exit(finish(run())); }

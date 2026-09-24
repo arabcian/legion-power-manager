@@ -7,6 +7,7 @@
 //!   stdin:  {"device": "<key>", "value": "<v>"}
 //!   keys:   charge_type            BAT*/charge_types (value must be one it offers)
 //!           fn_lock | camera_power | usb_charging   ideapad_acpi VPC*/<key>, "0"/"1"
+//!           fan_mode               ideapad_acpi VPC*/fan_mode: 0 silent, 1 standard, 2 dust cleaning, 4 efficient cooling
 //!           fan<N>_target          lenovo_wmi_other hwmon, 0 (= auto) .. fanN_max
 //!           fan_fullspeed          "1"/"0": the EC's Full Speed flag (separate from
 //!                                  fanN_target; survives reboots, e.g. set from
@@ -158,6 +159,15 @@ fn device_target(key: &str, value: &str) -> Result<PathBuf, String> {
         }
         return Err("no battery exposes charge_types".into());
     }
+    if key == "fan_mode" {
+        // ideapad fan_mode (VPCCMD_W_FAN): 0 super silent, 1 standard,
+        // 2 dust cleaning, 4 efficient thermal dissipation — nothing else.
+        if !["0", "1", "2", "4"].contains(&value) { return Err("fan_mode takes 0, 1, 2 or 4".into()); }
+        return sorted_dir(IDEAPAD_DIR).into_iter()
+            .filter(|d| d.file_name().map_or(false, |n| n.to_string_lossy().starts_with("VPC")))
+            .map(|d| d.join(key)).find(|f| f.is_file())
+            .ok_or_else(|| "ideapad_acpi does not expose fan_mode".to_string());
+    }
     if IDEAPAD_KEYS.contains(&key) {
         if value != "0" && value != "1" { return Err(format!("{key} takes 0 or 1")); }
         return sorted_dir(IDEAPAD_DIR).into_iter()
@@ -234,6 +244,7 @@ fn run() -> Value {
 }
 
 fn main() {
+    init();
     std::process::exit(finish(run()));
 }
 
@@ -260,6 +271,7 @@ mod tests {
         assert!(set_device("fn_lock", "2")["error"].as_str().unwrap().contains("0 or 1"));
         assert!(set_device("fan1_target", "abc")["ok"] == false);
         assert!(set_device("fan_fullspeed", "2")["error"].as_str().unwrap().contains("0 or 1"));
+        assert!(set_device("fan_mode", "3")["error"].as_str().unwrap().contains("0, 1, 2 or 4"));
     }
     #[test]
     fn rejects_unknown_profile() {

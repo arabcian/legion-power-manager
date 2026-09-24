@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -54,10 +54,13 @@ fn require_int(v: Option<&Value>, name: &str, lo: i64, hi: i64) -> Result<i64, I
     }
 }
 
+/// Root-owned, not group/world-writable, no setuid/setgid bit — for the
+/// binary *and every directory above it* (a user-owned /opt/ryzenadj/ would
+/// otherwise let the user swap the binary after this check), and executable.
 fn is_safe_executable(path: &str) -> bool {
+    if !trusted_path(std::path::Path::new(path)) { return false; }
     let Ok(md) = std::fs::metadata(path) else { return false };
-    if !md.is_file() || md.uid() != 0 { return false; }
-    if md.permissions().mode() & 0o6022 != 0 { return false; }
+    if md.permissions().mode() & 0o111 == 0 { return false; }
     let Ok(c) = CString::new(path) else { return false };
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
 }
@@ -198,6 +201,7 @@ fn run() -> Value {
 }
 
 fn main() {
+    init();
     std::process::exit(finish(run()));
 }
 

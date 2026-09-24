@@ -3,6 +3,9 @@
 //! One JSON object on stdin, one JSON line on stdout:
 //!   {"op":"describe"}                                  any user: tunables, live values, state, topology
 //!   {"op":"apply","values":{k:v,..},"mode":"manual"|"game","preset":"name"}
+//!       "replace":true (manual only): first restore every knob this request
+//!       does not set, so switching presets never leaves the previous one's
+//!       extra keys behind; refused while a game session holds game mode
 //!   {"op":"release"}                                   game POST: refcount-1, restore at 0
 //!   {"op":"restore"}                                   write every saved original back now
 //!   {"op":"restore_keys","keys":[k,..]}                restore only these knobs
@@ -20,8 +23,7 @@ use lpm_helpers::tune::{self, TUNABLES};
 use lpm_helpers::*;
 use serde_json::{json, Map, Value};
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -36,39 +38,6 @@ const MAX_BASELINE: usize = 16_384;
 const MAX_REFCOUNT: u32 = 64;
 
 fn is_root() -> bool { unsafe { libc::geteuid() == 0 } }
-
-/// Creates (or verifies) a root-owned, non-symlink, not group/other-writable dir.
-fn secure_dir(p: &str) -> Result<(), String> {
-    match fs::DirBuilder::new().mode(0o755).create(p) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("{p}: {e}")),
-    }
-    let m = fs::symlink_metadata(p).map_err(|e| format!("{p}: {e}"))?;
-    if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
-        return Err(format!("{p} is not a root-owned private directory; refusing to use it"));
-    }
-    Ok(())
-}
-
-/// Reads a root-owned, not group/other-writable regular file (no symlinks).
-fn read_root_file(p: &str, max: u64) -> Option<String> {
-    let m = fs::symlink_metadata(p).ok()?;
-    if !m.is_file() || m.uid() != 0 || m.mode() & 0o022 != 0 || m.len() > max { return None; }
-    fs::read_to_string(p).ok()
-}
-
-/// Atomic root-owned write: tmp (O_EXCL, no symlink) + fsync + rename.
-fn write_root_file(p: &str, body: &[u8]) -> Result<(), String> {
-    let tmp = format!("{p}.tmp");
-    let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&tmp)
-        .map_err(|e| format!("{tmp}: {e}"))?;
-    f.write_all(body).and_then(|_| f.sync_all()).map_err(|e| format!("{tmp}: {e}"))?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).ok();
-    fs::rename(&tmp, p).map_err(|e| format!("{p}: {e}"))
-}
 
 struct Lock(#[allow(dead_code)] fs::File);
 fn lock() -> Result<Lock, String> {
@@ -159,32 +128,47 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             Err(e) => { results.push(json!({"key": t.key, "ok": false, "error": e})); all_ok = false; continue; }
         };
         let (mut written, mut refused, mut errs) = (0, 0, Vec::new());
+        // Pass 1: read every original, record the fresh ones. They are
+        // persisted in ONE state save *before* any write, so a crash or kill
+        // mid-batch still leaves every touched file restorable — without
+        // re-serialising the whole state once per file (IRQ affinity and the
+        // PCI latency row touch 100+ files each).
+        let mut todo: Vec<(PathBuf, String, bool)> = Vec::new();
         for (f, data) in plan {
             let Some(orig) = tune::baseline_value(t, &f) else {
                 if tune::best_effort(t) { refused += 1; } else { errs.push(format!("{}: unreadable", f.display())); }
                 continue;
             };
             if tune::same_value(t, &orig, &data) { continue; }
-            let fresh = !st.has(&f);
+            let fresh = !st.has(&f) && !todo.iter().any(|(q, _, _)| *q == f);
             if fresh {
                 if st.baseline.len() >= MAX_BASELINE { errs.push("baseline full".into()); break; }
-                // Recorded and persisted *before* the write, so a crash or
-                // kill mid-batch still leaves the original restorable.
                 st.baseline.push((t.key.to_owned(), f.clone(), orig));
-                if let Err(e) = st.save() {
-                    st.baseline.pop();
-                    errs.push(format!("state not saved, write skipped: {e}"));
-                    break;
-                }
             }
-            match tune::write_checked(&f, &data) {
+            todo.push((f, data, fresh));
+        }
+        let fresh_n = todo.iter().filter(|x| x.2).count();
+        if fresh_n > 0 {
+            if let Err(e) = st.save() {
+                st.baseline.truncate(st.baseline.len() - fresh_n);
+                errs.push(format!("state not saved, writes skipped: {e}"));
+                todo.clear();
+            }
+        }
+        // Pass 2: write. A failed write changed nothing, so its fresh
+        // baseline entry is dropped again (saved with the rest at the end).
+        let mut unchanged: Vec<PathBuf> = Vec::new();
+        for (f, data, fresh) in todo {
+            match tune::write_value(t, &f, &data) {
                 Ok(()) => written += 1,
                 Err(e) => {
-                    // Nothing changed, so nothing to restore later.
-                    if fresh { st.baseline.pop(); }
+                    if fresh { unchanged.push(f); }
                     if tune::best_effort(t) { refused += 1; } else { errs.push(e); }
                 }
             }
+        }
+        if !unchanged.is_empty() {
+            st.baseline.retain(|(k, q, _)| !(k == t.key && unchanged.contains(q)));
         }
         let mut r = json!({"key": t.key, "value": v, "written": written});
         if refused > 0 { r["refused"] = json!(refused); }
@@ -211,7 +195,8 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
     let (mut n, mut errs) = (0, Vec::new());
     for &i in &order {
         let (key, f, orig) = &st.baseline[i];
-        match tune::write_checked(f, orig) {
+        let res = match tune::find(key) { Some(t) => tune::write_value(t, f, orig), None => tune::write_checked(f, orig) };
+        match res {
             Ok(()) => n += 1,
             // Per-policy files vanish when the pstate mode is restored first; not an error.
             Err(_) if !f.exists() => {}
@@ -248,7 +233,23 @@ fn op_apply(req: &Value) -> Value {
     let mode = req["mode"].as_str().unwrap_or("manual");
     if !["manual", "game"].contains(&mode) { return json!({"ok": false, "error": "mode must be manual or game"}); }
     let preset = valid_preset(&req["preset"]);
+    let replace = req["replace"].as_bool().unwrap_or(false);
+    if replace && mode != "manual" { return json!({"ok": false, "error": "replace is only valid in manual mode"}); }
     locked(|st| {
+        let mut restored = Value::Null;
+        if replace {
+            // A scene switch (e.g. AC → battery) must not yank a running game's tuning.
+            if st.refcount > 0 {
+                return json!({"ok": false, "applied": false, "game_active": true,
+                              "error": format!("game mode is active ({} session(s)); tuning left unchanged", st.refcount)});
+            }
+            let mut stale: Vec<String> = Vec::new();
+            for (k, _, _) in &st.baseline {
+                if !values.contains_key(k) && !stale.contains(k) { stale.push(k.clone()); }
+            }
+            if !stale.is_empty() { restored = restore_entries(st, Some(&stale)); }
+            st.preset = preset.clone();
+        }
         if mode == "game" {
             if st.refcount >= MAX_REFCOUNT { return json!({"ok": false, "error": "too many concurrent game sessions"}); }
             st.refcount += 1;
@@ -257,10 +258,12 @@ fn op_apply(req: &Value) -> Value {
                               "message": format!("game mode already active ({} games running)", st.refcount)});
             }
         }
-        st.preset = preset.clone().or(st.preset.take());
+        if !replace { st.preset = preset.clone().or(st.preset.take()); }
         st.source = Some(mode.to_owned());
-        let (results, ok) = apply_values(st, values);
-        json!({"ok": ok, "applied": true, "results": results,
+        let (results, mut ok) = apply_values(st, values);
+        if restored["errors"].as_array().map_or(false, |a| !a.is_empty()) { ok = false; }
+        if values.is_empty() && st.baseline.is_empty() { st.source = None; }
+        json!({"ok": ok, "applied": true, "results": results, "restored": restored,
                "error": (!ok).then_some("some settings could not be applied")})
     })
 }
@@ -309,14 +312,23 @@ fn op_boost(req: &Value) -> Value {
     let Some(caller) = std::env::var("PKEXEC_UID").ok().and_then(|v| v.parse::<u32>().ok()) else {
         return json!({"ok": false, "error": "boost is only available through pkexec"});
     };
-    if ppid <= 1 || proc_ruid(ppid) != Some(caller) || caller == 0 {
+    // While `ppid` is still our parent its PID cannot be recycled (a dead
+    // parent reparents us before its PID is freed), so re-checking getppid()
+    // right before each privileged step pins the target: a caller that exits
+    // mid-request can never make root renice an unrelated process that
+    // happened to reuse the number.
+    let still_parent = || unsafe { libc::getppid() } == ppid;
+    if ppid <= 1 || caller == 0 || proc_ruid(ppid) != Some(caller) || !still_parent() {
         return json!({"ok": false, "error": "caller process does not belong to the authenticated user"});
     }
     if unsafe { libc::setpriority(libc::PRIO_PROCESS, ppid as libc::id_t, nice as libc::c_int) } != 0 {
         return json!({"ok": false, "error": format!("setpriority: {}", std::io::Error::last_os_error())});
     }
-    let ag = req["autogroup"].as_bool().unwrap_or(false)
-        .then(|| fs::write(format!("/proc/{ppid}/autogroup"), nice.to_string()).is_ok());
+    let ag = req["autogroup"].as_bool().unwrap_or(false).then(|| {
+        still_parent() && fs::OpenOptions::new().write(true).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(format!("/proc/{ppid}/autogroup"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, nice.to_string().as_bytes())).is_ok()
+    });
     json!({"ok": true, "pid": ppid, "nice": nice, "autogroup": ag})
 }
 
@@ -392,6 +404,6 @@ fn run() -> Value {
 }
 
 fn main() {
-    unsafe { libc::umask(0o022) };
+    init();
     std::process::exit(finish(run()));
 }

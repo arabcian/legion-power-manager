@@ -5,6 +5,8 @@
 #include "nvidiatab.h"
 #include "optimizetab.h"
 #include "ryzentab.h"
+#include "scenes.h"
+#include "scenestab.h"
 #include "sysinfo.h"
 #include "tray.h"
 #include <QCloseEvent>
@@ -23,7 +25,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     home_ = new HomeTab;
     tabs_->addTab(home_, "Home");
-    auto *fw = new FwattrTab;
+    auto *fw = fwattr_ = new FwattrTab;
+    const int scenesAt = tabs_->count();  // Scenes sits right after Home; built last (it reads every tab)
     tabs_->addTab(fw, "Firmware Attributes");
     // Switching to Custom on Home unlocks this tab immediately (not after its poll).
     connect(home_, &HomeTab::profileChanged, fw, &FwattrTab::refreshLockState);
@@ -41,6 +44,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     }
     optimize_ = new OptimizeTab;
     tabs_->addTab(optimize_, "Optimizations");
+
+    scenes_ = new SceneEngine(this);
+    tabs_->insertTab(scenesAt, new ScenesTab(this), "Scenes");
 
     statusBar()->showMessage("Legion Power Manager " LPM_VERSION, 4000);
 }

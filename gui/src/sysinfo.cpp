@@ -1,5 +1,6 @@
 #include "sysinfo.h"
 #include <QElapsedTimer>
+#include <QMutex>
 #include <QHash>
 #include "platformprofile.h"
 #include <QDir>
@@ -103,9 +104,13 @@ struct Chip { QString name, path; };
 // hwmon chips only appear/disappear on module load or hot-plug; rescanning the
 // directory (plus every name file) for each of the 2 s Live getters is waste.
 static QList<Chip> scanChips();
+// The Live getters run on a worker thread (HomeTab::refreshLive), so the
+// shared cache is guarded.
 static QList<Chip> chips() {
+    static QMutex mu;
     static QList<Chip> cache;
     static QElapsedTimer age;
+    const QMutexLocker lock(&mu);
     if (!age.isValid() || age.elapsed() > 30000 || cache.isEmpty()) { cache = scanChips(); age.restart(); }
     return cache;
 }
@@ -120,10 +125,15 @@ static QList<Chip> scanChips() {
     return out;
 }
 
+/// N of ".../<kind>N_input" (0 if absent). Plain scan instead of a shared
+/// static QRegularExpression: runs on a worker thread, and in sort comparators.
 static int trailingIndex(const QString &file) {
-    static const QRegularExpression re(QStringLiteral("(\\d+)_input$"));
-    auto m = re.match(file);
-    return m.hasMatch() ? m.captured(1).toInt() : 0;
+    static const QLatin1String suffix("_input");
+    if (!file.endsWith(suffix)) return 0;
+    const qsizetype end = file.size() - suffix.size();
+    qsizetype b = end;
+    while (b > 0 && file.at(b - 1).isDigit()) --b;
+    return b < end ? QStringView(file).mid(b, end - b).toInt() : 0;
 }
 
 /// Sensor files `<kind>N_input` sorted by N (not lexically: temp10 > temp2).
@@ -248,6 +258,8 @@ Opt battery() {
 Opt cpuPackagePower() {
     // energy_uj is a free-running counter: power = Δenergy / Δt between two polls.
     struct Sample { long long uj = -1; qint64 ms = 0; };
+    static QMutex mu;
+    const QMutexLocker lock(&mu);
     static QHash<QString, Sample> last;
     static QElapsedTimer clock;
     if (!clock.isValid()) clock.start();

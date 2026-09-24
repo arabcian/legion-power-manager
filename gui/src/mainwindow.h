@@ -1,7 +1,9 @@
 #pragma once
 #include <QMainWindow>
 
+class FwattrTab;
 class HomeTab;
+class SceneEngine;
 class IntelTab;
 class NvidiaTab;
 class OptimizeTab;
@@ -17,6 +19,8 @@ public:
     IntelTab *intel() const { return intel_; }  // nullptr on non-Intel CPUs
     NvidiaTab *nvidia() const { return nvidia_; }
     OptimizeTab *optimize() const { return optimize_; }
+    FwattrTab *fwattr() const { return fwattr_; }
+    SceneEngine *scenes() const { return scenes_; }
     /// Set by the tray's Quit: closeEvent then really closes instead of hiding.
     void setForceQuit(bool v) { forceQuit_ = v; }
     void setHideOnClose(bool v) { hideOnClose_ = v; }
@@ -31,5 +35,7 @@ private:
     IntelTab *intel_ = nullptr;
     NvidiaTab *nvidia_;
     OptimizeTab *optimize_;
+    FwattrTab *fwattr_;
+    SceneEngine *scenes_;
     bool forceQuit_ = false, hideOnClose_ = false;
 };

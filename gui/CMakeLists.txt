@@ -25,7 +25,23 @@ add_executable(legion-power-manager
     src/nvidiatab.cpp    src/nvidiatab.h
     src/optimizetab.cpp  src/optimizetab.h
     src/tray.cpp         src/tray.h
+    src/scenes.cpp       src/scenes.h
+    src/scenestab.cpp    src/scenestab.h
 )
+# Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
+# with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the
+# AUTORCC step through /bin/sh without escaping '(' — a checkout under a path
+# like "files (1)" failed with a shell syntax error.
+qt_add_resources(legion-power-manager theme
+    PREFIX /theme
+    BASE data/theme
+    FILES
+        data/theme/check.png data/theme/check@2x.png
+        data/theme/chev-down.png data/theme/chev-down@2x.png
+        data/theme/chev-up.png data/theme/chev-up@2x.png
+        data/theme/chev-down-off.png data/theme/chev-down-off@2x.png
+        data/theme/chev-up-off.png data/theme/chev-up-off@2x.png)
+
 target_compile_definitions(legion-power-manager PRIVATE
     LPM_VERSION="${PROJECT_VERSION}"
     LPM_HELPER_DIR="${LPM_HELPER_DIR}"
@@ -65,14 +81,28 @@ if(LPM_HARDEN)
     endif()
     target_link_options(legion-power-manager PRIVATE -Wl,-z,relro,-z,now -Wl,-z,noexecstack)
 endif()
+# GCC names each .gcda after the *object's full path*, and the instrumented
+# and the final build live in different build directories (build-pgo vs
+# build): without stripping that prefix the final build looked for files the
+# training run never wrote, and -Wno-missing-profile hid that PGO was a no-op.
+set(_pgo_prefix "")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+    set(_pgo_prefix "-fprofile-prefix-path=${CMAKE_BINARY_DIR}")
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT LPM_PGO STREQUAL "")
+    message(WARNING "GCC < 12 has no -fprofile-prefix-path: PGO only works if generate and use share one build directory")
+endif()
 if(LPM_PGO STREQUAL "generate")
-    target_compile_options(legion-power-manager PRIVATE -fprofile-generate=${LPM_PGO_DIR})
+    target_compile_options(legion-power-manager PRIVATE -fprofile-generate=${LPM_PGO_DIR} ${_pgo_prefix})
     target_link_options(legion-power-manager PRIVATE -fprofile-generate=${LPM_PGO_DIR})
 elseif(LPM_PGO STREQUAL "use")
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         target_compile_options(legion-power-manager PRIVATE -fprofile-use=${LPM_PGO_DIR}/default.profdata -Wno-profile-instr-unprofiled)
     else()
-        target_compile_options(legion-power-manager PRIVATE -fprofile-use=${LPM_PGO_DIR} -fprofile-partial-training -Wno-missing-profile)
+        target_compile_options(legion-power-manager PRIVATE -fprofile-use=${LPM_PGO_DIR} ${_pgo_prefix} -fprofile-partial-training -Wno-missing-profile
+            # moc output lives under each build dir, so its functions' source
+            # locations differ between the two builds; GCC then drops the
+            # profile for that glue code (harmless) instead of failing.
+            -Wno-coverage-mismatch)
     endif()
 elseif(NOT LPM_PGO STREQUAL "")
     message(FATAL_ERROR "LPM_PGO must be '', 'generate' or 'use'")

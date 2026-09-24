@@ -74,6 +74,8 @@ pub enum Options {
     ListFile(&'static str),
     /// Options embedded in the value file: "always [madvise] never".
     Bracketed,
+    /// Space-separated list in this absolute file (e.g. cpuidle/available_governors).
+    ListAt(&'static str),
     /// Computed from hardware (min freq, C-states, CCD roles…).
     Special,
 }
@@ -121,6 +123,12 @@ pub enum Target {
     Irq,
     /// cpu*/online of one CCD (never cpu0's).
     CcdPark,
+    /// 802.11 power save of every wireless interface, through `iw` (no sysfs knob).
+    WifiPowerSave,
+    /// Per-link PCIe ASPM overrides: link/l1_aspm (+ l1_1_aspm, l1_2_aspm) of every PCI function.
+    PciAspm,
+    /// sched_ext BPF scheduler: starts / stops an scx_* binary (value = its name or "none").
+    SchedExt,
 }
 
 pub struct Tunable {
@@ -254,6 +262,9 @@ pub const TUNABLES: &[Tunable] = &[
     warn(t("cpu.cstate_max", "CPU", "Deepest C-state kept",
       "Disables every C-state deeper than the one you pick, on every CPU. Two reasons to touch this: (1) input-latency chasing - deep C-states add microseconds of wake-up jitter on the way back to full clock, so capping to a shallower state trims worst-case latency at the cost of idle power and heat; (2) Curve Optimizer validation - the transition out of a deep idle state back to boost clock is exactly where a marginal core first crashes, so capping C-states while dialing in offsets (paired with a short MCE poll interval) surfaces instability faster than gaming normally would. Day-to-day/battery use: leave at 'all enabled'. Meant to be temporary, not a permanent setting.",
       Kind::Choice, Options::Special, Target::CState)),
+    t("cpu.idle_governor", "CPU", "cpuidle governor",
+      "Which algorithm picks the C-state for an idle CPU. menu = the long-time default, predicts idle length from recent history and is tuned for older, deeper C-state tables. teo (timer events oriented) = looks at when the next timer is due and how often recent predictions were wrong; on modern CPUs with few C-states (Zen: C1/C2/C3) it usually picks the right state more often - fewer too-deep entries under light load (less wake latency) and fewer too-shallow ones at idle (less power). Takes effect immediately, safe to switch back.",
+      Kind::Choice, Options::ListAt("/sys/devices/system/cpu/cpuidle/available_governors"), Target::File("/sys/devices/system/cpu/cpuidle/current_governor")),
     // ── Memory ────────────────────────────────────────────────────────────
     t("thp.enabled", "Memory", "THP enabled",
       "Transparent HugePages: promotes small pages into 2 MB pages where possible, cutting TLB misses for large allocations. madvise = only for memory ranges the app explicitly opts into (Proton/DXVK/most game engines already do this) - the recommended default, no surprise stalls. always = the kernel tries everywhere, which can add a synchronous compaction stall the first time a large allocation needs a huge page; only worth it if you profiled a specific non-madvise-aware workload. never = off, for debugging a THP-related issue.",
@@ -267,6 +278,39 @@ pub const TUNABLES: &[Tunable] = &[
     t("thp.khugepaged_defrag", "Memory", "khugepaged defrag",
       "khugepaged periodically scans memory and compacts pages into huge pages in the background. 1 (default) = on; 0 = off, one less source of periodic background CPU/latency jitter, at the cost of huge pages building up more slowly for long-running processes. Worth setting 0 in any latency-focused preset; the memory-efficiency loss is minor over a gaming session's timescale.",
       int(0, 1), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/defrag")),
+    t("thp.mthp_16k", "Memory", "mTHP 16 KB anon",
+      "Multi-size THP (kernel 6.8+): lets anonymous memory use 16 KB folios instead of only 4 KB or 2 MB pages. Mid-size folios cut TLB misses and page-fault count for mid-size allocations while wasting far less memory than 2 MB pages. inherit = follow THP enabled above; madvise = only regions that ask for huge pages; never = off (kernel default for these sizes). A reasonable trial is madvise for 64K-256K; measure before keeping it, gains are workload-dependent.",
+      Kind::Choice, BR, Target::File("/sys/kernel/mm/transparent_hugepage/hugepages-16kB/enabled")),
+    t("thp.mthp_32k", "Memory", "mTHP 32 KB anon",
+      "Multi-size THP (kernel 6.8+): lets anonymous memory use 32 KB folios instead of only 4 KB or 2 MB pages. Mid-size folios cut TLB misses and page-fault count for mid-size allocations while wasting far less memory than 2 MB pages. inherit = follow THP enabled above; madvise = only regions that ask for huge pages; never = off (kernel default for these sizes). A reasonable trial is madvise for 64K-256K; measure before keeping it, gains are workload-dependent.",
+      Kind::Choice, BR, Target::File("/sys/kernel/mm/transparent_hugepage/hugepages-32kB/enabled")),
+    t("thp.mthp_64k", "Memory", "mTHP 64 KB anon",
+      "Multi-size THP (kernel 6.8+): lets anonymous memory use 64 KB folios instead of only 4 KB or 2 MB pages. Mid-size folios cut TLB misses and page-fault count for mid-size allocations while wasting far less memory than 2 MB pages. inherit = follow THP enabled above; madvise = only regions that ask for huge pages; never = off (kernel default for these sizes). A reasonable trial is madvise for 64K-256K; measure before keeping it, gains are workload-dependent.",
+      Kind::Choice, BR, Target::File("/sys/kernel/mm/transparent_hugepage/hugepages-64kB/enabled")),
+    t("thp.mthp_128k", "Memory", "mTHP 128 KB anon",
+      "Multi-size THP (kernel 6.8+): lets anonymous memory use 128 KB folios instead of only 4 KB or 2 MB pages. Mid-size folios cut TLB misses and page-fault count for mid-size allocations while wasting far less memory than 2 MB pages. inherit = follow THP enabled above; madvise = only regions that ask for huge pages; never = off (kernel default for these sizes). A reasonable trial is madvise for 64K-256K; measure before keeping it, gains are workload-dependent.",
+      Kind::Choice, BR, Target::File("/sys/kernel/mm/transparent_hugepage/hugepages-128kB/enabled")),
+    t("thp.mthp_256k", "Memory", "mTHP 256 KB anon",
+      "Multi-size THP (kernel 6.8+): lets anonymous memory use 256 KB folios instead of only 4 KB or 2 MB pages. Mid-size folios cut TLB misses and page-fault count for mid-size allocations while wasting far less memory than 2 MB pages. inherit = follow THP enabled above; madvise = only regions that ask for huge pages; never = off (kernel default for these sizes). A reasonable trial is madvise for 64K-256K; measure before keeping it, gains are workload-dependent.",
+      Kind::Choice, BR, Target::File("/sys/kernel/mm/transparent_hugepage/hugepages-256kB/enabled")),
+    t("thp.mthp_512k", "Memory", "mTHP 512 KB anon",
+      "Multi-size THP (kernel 6.8+): lets anonymous memory use 512 KB folios instead of only 4 KB or 2 MB pages. Mid-size folios cut TLB misses and page-fault count for mid-size allocations while wasting far less memory than 2 MB pages. inherit = follow THP enabled above; madvise = only regions that ask for huge pages; never = off (kernel default for these sizes). A reasonable trial is madvise for 64K-256K; measure before keeping it, gains are workload-dependent.",
+      Kind::Choice, BR, Target::File("/sys/kernel/mm/transparent_hugepage/hugepages-512kB/enabled")),
+    t("thp.mthp_1m", "Memory", "mTHP 1 MB anon",
+      "Multi-size THP (kernel 6.8+): lets anonymous memory use 1 MB folios instead of only 4 KB or 2 MB pages. Mid-size folios cut TLB misses and page-fault count for mid-size allocations while wasting far less memory than 2 MB pages. inherit = follow THP enabled above; madvise = only regions that ask for huge pages; never = off (kernel default for these sizes). A reasonable trial is madvise for 64K-256K; measure before keeping it, gains are workload-dependent.",
+      Kind::Choice, BR, Target::File("/sys/kernel/mm/transparent_hugepage/hugepages-1024kB/enabled")),
+    t("thp.khp_max_ptes_none", "Memory", "khugepaged max_ptes_none",
+      "How many empty (never-touched) 4 KB slots khugepaged accepts when collapsing a 2 MB range into a huge page. 511 (default) = collapse even an almost empty range, which fills in memory the program never used: with THP enabled=always this is the main source of RSS bloat. 0-64 = only collapse ranges that are really in use - much less wasted memory, huge pages still form where they help. Has no effect with THP off.",
+      int(0, 511), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none")),
+    t("thp.khp_pages_to_scan", "Memory", "khugepaged pages_to_scan",
+      "Pages khugepaged examines per wake-up. Default 4096. Lower = gentler background scanning (less periodic CPU work and lock contention), huge pages form more slowly; higher = faster promotion for long-running processes at the cost of more background work.",
+      int(8, 262_144), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/pages_to_scan")),
+    t("thp.khp_scan_sleep_ms", "Memory", "khugepaged scan_sleep_millisecs",
+      "Pause between khugepaged scan passes. Default 10000 (10 s). Longer = fewer background scan bursts (useful while gaming or on battery); shorter = huge pages form sooner.",
+      int(0, 600_000), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs")),
+    t("thp.khp_alloc_sleep_ms", "Memory", "khugepaged alloc_sleep_millisecs",
+      "How long khugepaged backs off after failing to allocate a huge page (memory fragmented). Default 60000. Longer = less futile compaction work under memory pressure.",
+      int(0, 600_000), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/alloc_sleep_millisecs")),
     t("mm.lru_gen", "Memory", "MGLRU enabled mask",
       "Multi-Gen LRU feature bitmask: 0x1 core MGLRU, 0x2 batched leaf-PTE young-bit aging (scales reclaim cost to the accessed set instead of the whole address space - what keeps reclaim cheap for a game with a huge virtual address space but a much smaller hot set), 0x4 non-leaf PMD aging. 7 (all three) is the kernel default and normally the right value; clearing 0x2 makes reclaim scan cost grow with the game's total mapped memory rather than its working set, which shows up as reclaim-related stutter under pressure. Only change this if debugging MGLRU itself.",
       int(0, 7), NO, Target::File("/sys/kernel/mm/lru_gen/enabled")),
@@ -307,6 +351,9 @@ pub const TUNABLES: &[Tunable] = &[
       "Consecutive swap pages read ahead on a swap-in, as a power of two (0 = 1 page, 3 = 8 pages, the disk-swap-era default). Readahead assumes sequential access, true for spinning disks but pointless for zram/NVMe swap where random access is just as fast - 0 avoids wasted effort on pages you will not touch next. Only raise this if you have real swap on a traditional disk.",
       int(0, 6), NO, Target::File("/proc/sys/vm/page-cluster")),
     // ── Scheduler ─────────────────────────────────────────────────────────
+    warn(t("sched.ext", "Scheduler", "sched_ext scheduler",
+      "Runs a sched_ext BPF scheduler (kernel 6.12+ with CONFIG_SCHED_CLASS_EXT, plus the scx schedulers installed) in place of the kernel's EEVDF while the setting is active; restoring stops it and EEVDF takes over again instantly. lavd = latency-criticality aware, built for gaming and interactive loads (frame pacing, input latency) and aware of big/little and X3D core differences; bpfland = prioritises interactive tasks, good general desktop choice; rusty/flash/cosmos/p2dq are more specialised. Best used as a game-mode setting. A buggy scheduler cannot hang the system: the kernel's watchdog ejects it and falls back to EEVDF. Only scx_* binaries that are root-owned in system directories are ever started.",
+      Kind::Choice, Options::Special, Target::SchedExt)),
     t("kernel.split_lock_mitigate", "Scheduler", "split_lock_mitigate",
       "The kernel detects unaligned atomic (split-lock) memory accesses and can throttle the offending core by roughly 1000x as a security/fairness mitigation. Some older x86 code compiled without alignment guarantees - a handful of Windows games under Wine/Proton, and some emulators - trigger this and get catastrophically slow for a moment. 0 disables the throttle (detection/logging still happens, it just does not slow the core down); safe to leave at 0 on a gaming system unless this machine also runs untrusted code from other users.", int(0, 1), NO,
       Target::File("/proc/sys/kernel/split_lock_mitigate")),
@@ -359,10 +406,23 @@ pub const TUNABLES: &[Tunable] = &[
     t("blk.read_ahead_kb", "Storage", "Read-ahead (KiB)",
       "How many KiB the kernel speculatively reads ahead on sequential access patterns. Default 128. Larger (e.g. 512-1024) helps games that stream assets sequentially out of large packed files (common in open-world titles) - more of the next chunk is already in cache by the time it is needed. Smaller (e.g. 32-64) helps workloads dominated by random, non-sequential reads (databases, some emulator ROM sets) where readahead just wastes IO bandwidth. If unsure, leave at 128 - this is a workload-shape bet, not a universal win either direction.",
       int(0, 16_384), NO, Target::PerBlock("read_ahead_kb")),
+    // ── Network ───────────────────────────────────────────────────────────
+    t("net.tcp_congestion", "Network", "TCP congestion control",
+      "Algorithm that decides how fast TCP sends. cubic (default) backs off on packet loss, so a lossy Wi-Fi link or a busy uplink makes it swing between too fast and too slow - visible as latency spikes in online games and uneven downloads. bbr models the path's bandwidth and round-trip time instead and keeps queues short: steadier latency and better throughput on Wi-Fi and long routes. bbr is loaded on demand (tcp_bbr module). Only affects new connections.",
+      Kind::Choice, Options::Special, Target::File("/proc/sys/net/ipv4/tcp_congestion_control")),
+    t("net.default_qdisc", "Network", "Default queueing discipline",
+      "Packet scheduler attached to network interfaces when they come up. fq = fair queueing with pacing, the pairing BBR was designed for; fq_codel = common distro default, good against bufferbloat; cake = most thorough bufferbloat control, a little more CPU. Applies to interfaces (re)initialised afterwards - reconnect Wi-Fi or the link to pick it up.",
+      Kind::Choice, Options::Special, Target::File("/proc/sys/net/core/default_qdisc")),
+    t("net.wifi_power_save", "Network", "Wi-Fi power save",
+      "802.11 power save lets the Wi-Fi radio doze between beacons. On (the usual default) saves real power on battery but adds tens of milliseconds of latency and jitter whenever the radio has to wake - the classic cause of ping spikes in online games. Off = radio always awake: steady latency, more drain. Set per interface through iw; NetworkManager may turn it back on when it reconnects (set wifi.powersave there to make it stick).",
+      Kind::Bool, NO, Target::WifiPowerSave),
     // ── Devices ───────────────────────────────────────────────────────────
     t("pci.aspm", "Devices", "PCIe ASPM policy",
       "PCIe Active State Power Management policy. 'performance' keeps every PCIe link at full power, no link-state transitions: removes the wake-up latency that shows as GPU or NVMe micro-jitter when a link drops to a power-saving state between traffic bursts - right for a plugged-in gaming session. 'powersave'/'powersupersave' let links drop to save power (better battery life, small idle power win) but on some hardware combinations actively cause dropouts on NVMe or Wi-Fi rather than just adding latency - if you see random Wi-Fi disconnects or NVMe timeouts, try 'performance' or 'default' here even outside gaming. 'default' defers to what the BIOS/ACPI tables request per device.",
       Kind::Choice, BR, Target::File("/sys/module/pcie_aspm/parameters/policy")),
+    warn(t("pci.aspm_links", "Devices", "PCIe ASPM per link",
+      "Overrides ASPM on each PCIe link where a driver or the firmware turned it off - the global policy above cannot re-enable those. l1 = allow L1 on every link; l1ss = also L1.1/L1.2 substates, the ones that matter for idle power (a Wi-Fi card or NVMe drive stuck without L1.2 can cost ~0.5-1 W at idle). Some devices disable ASPM on purpose because it breaks them (MediaTek Wi-Fi drops the connection on some firmware, older NVMe controllers stall): try it, and restore originals if a device misbehaves. Links that refuse are skipped.",
+      Kind::Choice, Options::Fixed(&["l1", "l1ss"]), Target::PciAspm)),
     t("pm.mem_sleep", "Devices", "Suspend mode (mem_sleep)",
       "What 'suspend' means. s2idle = modern standby: fast resume, firmware-managed, but the SoC and some devices stay partly powered, so overnight drain is higher and a laptop in a bag can warm up if something keeps waking it. deep = classic S3: everything but RAM powered off, lowest drain, slightly slower resume; only offered when the firmware advertises it. Put it in the boot preset to make it stick.",
       Kind::Choice, BR, Target::File("/sys/power/mem_sleep")),
@@ -584,9 +644,32 @@ pub fn size_kib(s: &str) -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ccx { pub index: usize, pub cpus: Vec<usize>, pub l3_kib: u64, pub max_khz: u64 }
 
+/// Short-lived cache of [`ccx_groups`]. One `describe` asks for the topology
+/// dozens of times (files/options/current of every per-CCD, affinity, IRQ
+/// and park row), each a walk over ~5 sysfs files per CPU. The cache lives
+/// for a fraction of a second and is dropped by every CPU hot-plug write, so
+/// long-running callers (lpm-gamemode polling for SMT/CCD parking to settle)
+/// still see the live topology.
+const TOPO_TTL: std::time::Duration = std::time::Duration::from_millis(250);
+thread_local! {
+    static TOPO: std::cell::RefCell<Option<(std::time::Instant, Vec<Ccx>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Forget the cached topology (after writing cpu*/online or smt/control).
+pub fn invalidate_topology() { TOPO.with(|t| *t.borrow_mut() = None); }
+
 /// L3 domains of the online CPUs, sorted by first CPU. A parked CCD has no
 /// online CPU and does not appear.
 pub fn ccx_groups() -> Vec<Ccx> {
+    if let Some(g) = TOPO.with(|t| t.borrow().as_ref().filter(|(at, _)| at.elapsed() < TOPO_TTL).map(|(_, g)| g.clone())) {
+        return g;
+    }
+    let g = ccx_groups_uncached();
+    TOPO.with(|t| *t.borrow_mut() = Some((std::time::Instant::now(), g.clone())));
+    g
+}
+
+fn ccx_groups_uncached() -> Vec<Ccx> {
     // Built from online CPUs only, and groups whose L3 lists overlap are merged.
     // Deduplicating by the raw shared_cpu_list string is not enough: while SMT
     // or CCD parking hot-plugs CPUs, one CPU can still report "0-7,16-23" and
@@ -817,6 +900,22 @@ fn intel_gt_files(i915: &str, xe: &str) -> Vec<PathBuf> {
     v
 }
 
+/// A kernel module is usable: loaded, built in, or present as a loadable
+/// module for the running kernel (writing the sysctl autoloads it).
+fn kmod_available(module: &str, subdir: &str) -> bool {
+    if Path::new("/sys/module").join(module).exists() { return true; }
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut u) } != 0 { return false; }
+    let rel = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }.to_string_lossy().into_owned();
+    let base = Path::new("/lib/modules").join(rel);
+    let ko = format!("{module}.ko");
+    if std::fs::read_to_string(base.join("modules.builtin")).map_or(false, |b| b.lines().any(|l| l.ends_with(&format!("/{ko}")))) {
+        return true;
+    }
+    std::fs::read_dir(base.join("kernel").join(subdir)).into_iter().flatten().flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(&ko))  // .ko, .ko.xz, .ko.zst
+}
+
 /// intel_pstate/no_turbo is the inverse of "boost".
 fn inverted(f: &Path) -> bool { f.file_name().map_or(false, |n| n == "no_turbo") }
 
@@ -835,7 +934,169 @@ fn is_irq_file(p: &Path) -> bool {
 /// Per-file refusals do not fail the knob: kernel-managed IRQs return EIO,
 /// and some PCI functions (or a locked-down kernel) refuse config writes —
 /// lutris-game-tune ran setpci with `|| true` for the same reason.
-pub fn best_effort(t: &Tunable) -> bool { matches!(t.target, Target::Irq | Target::PciLatency) }
+pub fn best_effort(t: &Tunable) -> bool { matches!(t.target, Target::Irq | Target::PciLatency | Target::PciAspm) }
+
+// ── command-backed targets (Wi-Fi power save, sched_ext) ─────────────────
+
+/// Runs a root-trusted binary with a clean environment and a hard timeout.
+/// Returns (success, stdout). Never a shell; stdin/stderr closed.
+fn run_tool(bin: &Path, args: &[&str], timeout: std::time::Duration) -> Option<(bool, String)> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(bin).args(args).env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C").current_dir("/").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().ok()?;
+    let mut out = child.stdout.take()?;
+    let reader = std::thread::spawn(move || { let mut v = Vec::new(); let _ = (&mut out).take(64 * 1024).read_to_end(&mut v); v });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => { let _ = child.kill(); let _ = child.wait(); return None; }
+        }
+    };
+    Some((status.success(), String::from_utf8_lossy(&reader.join().ok()?).into_owned()))
+}
+
+fn iw() -> Option<PathBuf> {
+    ["/usr/sbin/iw", "/sbin/iw", "/usr/bin/iw", "/bin/iw"].iter().map(PathBuf::from)
+        .find(|p| crate::trusted_path(p))
+}
+
+/// Interface name from a "/sys/class/net/<if>" target path (IFNAMSIZ, no path tricks).
+fn wifi_ifname(f: &Path) -> Option<String> {
+    let n = f.to_str()?.strip_prefix("/sys/class/net/")?;
+    (!n.is_empty() && n.len() <= 15 && n != "." && n != ".."
+        && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))).then(|| n.to_owned())
+}
+
+fn wifi_ifaces() -> Vec<PathBuf> {
+    if iw().is_none() { return vec![]; }
+    let mut v: Vec<PathBuf> = std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("wireless").is_dir() || p.join("phy80211").exists())
+        .filter(|p| wifi_ifname(p).is_some())
+        .collect();
+    v.sort();
+    v
+}
+
+/// "1"/"0" as iw reports it ("Power save: on").
+fn wifi_get(f: &Path) -> Option<String> {
+    let dev = wifi_ifname(f)?;
+    let (ok, out) = run_tool(&iw()?, &["dev", &dev, "get", "power_save"], std::time::Duration::from_secs(3))?;
+    if !ok { return None; }
+    let v = out.split(':').nth(1)?.trim().to_ascii_lowercase();
+    match v.as_str() { "on" => Some("1".into()), "off" => Some("0".into()), _ => None }
+}
+
+fn wifi_set(f: &Path, data: &str) -> Result<(), String> {
+    let dev = wifi_ifname(f).ok_or_else(|| format!("{}: not a network interface path", f.display()))?;
+    let v = match data { "1" => "on", "0" => "off", _ => return Err(format!("power save takes 0/1, got '{data}'")) };
+    let bin = iw().ok_or("iw not found (install net-wireless/iw)")?;
+    match run_tool(&bin, &["dev", &dev, "set", "power_save", v], std::time::Duration::from_secs(3)) {
+        Some((true, _)) => Ok(()),
+        Some((false, _)) => Err(format!("{dev}: iw refused power_save {v} (interface down?)")),
+        None => Err(format!("{dev}: iw timed out")),
+    }
+}
+
+// sched_ext: only these scheduler binaries are ever started, and only from
+// root-owned system directories (checked on the whole path).
+const SCX_NAMES: &[&str] = &["lavd", "bpfland", "rusty", "flash", "cosmos", "p2dq", "tickless", "layered"];
+const SCX_DIRS: &[&str] = &["/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin"];
+const SCX_STATE: &str = "/sys/kernel/sched_ext/state";
+
+fn scx_bin(name: &str) -> Option<PathBuf> {
+    if !SCX_NAMES.contains(&name) { return None; }
+    SCX_DIRS.iter().map(|d| Path::new(d).join(format!("scx_{name}"))).find(|p| crate::trusted_path(p))
+}
+
+fn scx_available() -> Vec<&'static str> {
+    if !Path::new(SCX_STATE).is_file() { return vec![]; }
+    SCX_NAMES.iter().copied().filter(|n| scx_bin(n).is_some()).collect()
+}
+
+/// Name of the running scheduler ("none" when EEVDF is in charge).
+fn scx_current() -> Option<String> {
+    let st = read(Path::new(SCX_STATE))?;
+    if st != "enabled" { return Some("none".into()); }
+    let ops = read(Path::new("/sys/kernel/sched_ext/root/ops")).unwrap_or_default();
+    // ops is the BPF scheduler's own name ("lavd", "bpfland"…), sometimes with a suffix.
+    Some(SCX_NAMES.iter().find(|n| ops == **n || ops.starts_with(&format!("{n}_"))).map_or(ops.clone(), |n| n.to_string()))
+}
+
+/// PIDs of running processes whose executable is one of our scx binaries.
+fn scx_pids() -> Vec<i32> {
+    let bins: Vec<PathBuf> = SCX_NAMES.iter().filter_map(|n| scx_bin(n)).filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+    std::fs::read_dir("/proc").into_iter().flatten().flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).map_or(false, |x| bins.contains(&x)))
+        .collect()
+}
+
+fn scx_wait(enabled: bool, secs: u64) -> bool {
+    let want = if enabled { "enabled" } else { "disabled" };
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < end {
+        if read(Path::new(SCX_STATE)).as_deref() == Some(want) { return true; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+fn scx_stop() -> Result<(), String> {
+    for pid in scx_pids() { unsafe { libc::kill(pid, libc::SIGINT); } }  // scx tools detach cleanly on SIGINT
+    if scx_wait(false, 3) || read(Path::new(SCX_STATE)).as_deref() != Some("enabled") { return Ok(()); }
+    for pid in scx_pids() { unsafe { libc::kill(pid, libc::SIGKILL); } }
+    if scx_wait(false, 3) { Ok(()) } else { Err("sched_ext scheduler did not stop".into()) }
+}
+
+fn scx_set(data: &str) -> Result<(), String> {
+    if scx_current().as_deref() == Some(data) { return Ok(()); }
+    scx_stop()?;
+    if data == "none" { return Ok(()); }
+    let bin = scx_bin(data).ok_or_else(|| format!("scx_{data} not installed in a system directory"))?;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    // Detached: its own session, no inherited pipes, so it outlives this
+    // helper and pkexec. Restore (or game-mode release) stops it again.
+    let mut cmd = Command::new(&bin);
+    cmd.env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").current_dir("/")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    cmd.spawn().map_err(|e| format!("scx_{data}: {e}"))?;
+    if scx_wait(true, 5) { Ok(()) } else { let _ = scx_stop(); Err(format!("scx_{data} did not attach within 5 s")) }
+}
+
+// ── PCIe per-link ASPM ───────────────────────────────────────────────────
+
+const ASPM_FILES: &[&str] = &["l1_aspm", "l1_1_aspm", "l1_2_aspm"];
+
+fn pci_aspm_files() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    for e in std::fs::read_dir(PCI_DEVICES).into_iter().flatten().flatten() {
+        for f in ASPM_FILES {
+            if let Some(c) = canonical_in_sysfs(&e.path().join("link").join(f)) {
+                if c.starts_with("/sys/devices") && c.is_file() { v.push(c); }
+            }
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Writes one tunable value to one concrete target, dispatching the targets
+/// that are not plain files. Everything else goes through write_checked.
+pub fn write_value(t: &Tunable, f: &Path, data: &str) -> Result<(), String> {
+    match t.target {
+        Target::WifiPowerSave => wifi_set(f, data),
+        Target::SchedExt => scx_set(data),
+        _ => write_checked(f, data),
+    }
+}
 
 // ── concrete files per tunable ────────────────────────────────────────────
 
@@ -886,6 +1147,9 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
             existing(PathBuf::from("/sys/devices/virtual/workqueue/cpumask"))
         } else { vec![] },
         Target::Irq => if has_domains() { irq_files() } else { vec![] },
+        Target::WifiPowerSave => wifi_ifaces(),
+        Target::PciAspm => pci_aspm_files(),
+        Target::SchedExt => if scx_available().is_empty() { vec![] } else { vec![PathBuf::from(SCX_STATE)] },
         Target::CcdPark => {
             // Stays available while a CCD is parked, so "none" can bring it back.
             let parked = online_cpus().len() < present_cpus().len();
@@ -905,6 +1169,29 @@ pub fn options(t: &Tunable) -> Vec<(String, String)> {
             // "custom" is what EPP reads back after a raw numeric write; it cannot be written as a string.
             same(p.and_then(|p| read(&p)).map(|s| s.split_whitespace().filter(|o| *o != "custom").map(str::to_owned).collect())
                 .unwrap_or_default())
+        }
+        (Options::ListAt(f), _) => same(read(Path::new(f)).map(|s| s.split_whitespace().map(str::to_owned).collect()).unwrap_or_default()),
+        (Options::Special, Target::SchedExt) => {
+            let mut v = vec![("none".to_string(), "none (kernel EEVDF)".to_string())];
+            v.extend(scx_available().into_iter().map(|n| (n.to_string(), format!("scx_{n}"))));
+            v
+        }
+        (Options::Special, Target::File(p)) if p.ends_with("default_qdisc") => {
+            // pfifo_fast is part of the core; the others are sch_* modules.
+            let mut v = vec!["pfifo_fast".to_string()];
+            for q in ["fq", "fq_codel", "cake"] {
+                if kmod_available(&format!("sch_{q}"), "net/sched") { v.push(q.into()); }
+            }
+            // Keep whatever is set now selectable even if we could not see its module.
+            if let Some(cur) = read(Path::new(p)) { if !v.contains(&cur) { v.push(cur); } }
+            same(v)
+        }
+        (Options::Special, Target::File(p)) if p.ends_with("tcp_congestion_control") => {
+            // Loaded algorithms, plus bbr when its module exists (writing it autoloads it).
+            let mut v: Vec<String> = read(Path::new("/proc/sys/net/ipv4/tcp_available_congestion_control"))
+                .map(|s| s.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
+            if !v.iter().any(|x| x == "bbr") && kmod_available("tcp_bbr", "net/ipv4") { v.push("bbr".into()); }
+            same(v)
         }
         (Options::Bracketed, Target::File(p)) => same(read(Path::new(p)).map(|s| parse_bracketed(&s).1).unwrap_or_default()),
         (Options::Bracketed, Target::IntelGt { .. }) =>
@@ -1023,6 +1310,18 @@ pub fn current(t: &Tunable) -> Option<String> {
             if !off.is_empty() && hybrid().map_or(false, |h| h.ecores == off) { return Some("ecore".into()); }
             return Some(if off.is_empty() { "none".into() } else { format!("offline {}", fmt_cpu_list(&off)) });
         }
+        Target::SchedExt => return scx_current(),
+        Target::WifiPowerSave => {
+            let mut vals = fs.iter().filter_map(|f| wifi_get(f));
+            let first = vals.next()?;
+            return Some(if vals.all(|v| v == first) { first } else { "mixed".into() });
+        }
+        Target::PciAspm => {
+            let on = |name: &str| fs.iter().filter(|f| f.file_name().map_or(false, |n| n == name))
+                .all(|f| read(f).as_deref() == Some("1"));
+            return Some(if on("l1_aspm") && on("l1_1_aspm") && on("l1_2_aspm") { "l1ss".into() }
+                        else if on("l1_aspm") { "l1".into() } else { "stock (per driver)".into() });
+        }
         Target::RaplWatts(_) => {
             let mut w = fs.iter().filter_map(|p| read(p)).filter_map(|r| parse_int(&r)).map(|uw| (uw / 1_000_000).to_string());
             let first = w.next()?;
@@ -1106,6 +1405,15 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
                 .map(|p| if p.is_file() { Ok((p, "0".to_owned())) } else { Err(format!("{} missing", p.display())) })
                 .collect::<Result<Vec<_>, _>>()?
         }
+        Target::PciAspm => {
+            // l1: only the L1 switch; l1ss: L1 plus both substates. Enabling a
+            // substate implies L1 in the kernel, so the order is only cosmetic.
+            let want: &[&str] = if value == "l1ss" { ASPM_FILES } else { &["l1_aspm"] };
+            fs.into_iter().filter(|f| f.file_name().and_then(|n| n.to_str()).map_or(false, |n| want.contains(&n)))
+                .map(|f| (f, "1".to_owned())).collect()
+        }
+        Target::SchedExt => vec![(fs[0].clone(), value.to_owned())],
+        Target::WifiPowerSave => fs.into_iter().map(|f| (f, value.to_owned())).collect(),
         Target::RaplWatts(_) => {
             let w: i64 = value.parse().map_err(|_| format!("'{value}' is not a wattage"))?;
             fs.into_iter().map(|f| (f, (w * 1_000_000).to_string())).collect()
@@ -1125,7 +1433,12 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
 
 /// Value to save in the baseline for one concrete file.
 pub fn baseline_value(t: &Tunable, f: &Path) -> Option<String> {
-    if matches!(t.target, Target::PciLatency) { return pci_latency_read(f).map(|b| format!("{b:02x}")); }
+    match t.target {
+        Target::PciLatency => return pci_latency_read(f).map(|b| format!("{b:02x}")),
+        Target::WifiPowerSave => return wifi_get(f),
+        Target::SchedExt => return scx_current(),
+        _ => {}
+    }
     let raw = read(f)?;
     Some(match t.kind {
         Kind::Int { .. } => parse_int(&raw).map(|n| n.to_string()).unwrap_or(raw),
@@ -1147,6 +1460,14 @@ pub fn same_value(t: &Tunable, orig: &str, data: &str) -> bool {
 /// (PCI config only as the single latency byte), fixed /proc/sys files from
 /// the table, and /proc/irq/<n>/smp_affinity_list.
 pub fn write_checked(f: &Path, data: &str) -> Result<(), String> {
+    // CPU hot-plug changes the L3 grouping: never serve a stale topology after it.
+    if f.file_name().map_or(false, |n| n == "online" || n == "control") { invalidate_topology(); }
+    let r = write_checked_inner(f, data);
+    if f.file_name().map_or(false, |n| n == "online" || n == "control") { invalidate_topology(); }
+    r
+}
+
+fn write_checked_inner(f: &Path, data: &str) -> Result<(), String> {
     let s = f.to_string_lossy();
     if s.starts_with("/proc/") {
         let ok = is_irq_file(f)
@@ -1227,6 +1548,23 @@ mod tests {
             Ccx { index: 0, cpus: (0..8).chain(16..24).collect(), l3_kib: 98304, max_khz: 5_200_000 },
             Ccx { index: 1, cpus: (8..16).chain(24..32).collect(), l3_kib: 32768, max_khz: 5_400_000 },
         ]
+    }
+    #[test]
+    fn new_targets() {
+        assert_eq!(wifi_ifname(Path::new("/sys/class/net/wlan0")).as_deref(), Some("wlan0"));
+        assert_eq!(wifi_ifname(Path::new("/sys/class/net/wlp4s0")).as_deref(), Some("wlp4s0"));
+        assert!(wifi_ifname(Path::new("/sys/class/net/../../etc")).is_none());
+        assert!(wifi_ifname(Path::new("/sys/class/net/a/b")).is_none());
+        assert!(wifi_ifname(Path::new("/sys/class/net/averyveryverylongname")).is_none());
+        assert!(wifi_ifname(Path::new("/etc/passwd")).is_none());
+        assert!(scx_bin("sh").is_none());           // not an allowlisted scheduler
+        assert!(scx_bin("../../bin/sh").is_none());
+        assert!(wifi_set(Path::new("/sys/class/net/wlan0"), "2").is_err());
+        for k in ["cpu.idle_governor", "thp.mthp_64k", "thp.khp_max_ptes_none", "net.tcp_congestion",
+                  "net.default_qdisc", "net.wifi_power_save", "pci.aspm_links", "sched.ext"] {
+            assert!(find(k).is_some(), "{k}");
+        }
+        assert!(best_effort(find("pci.aspm_links").unwrap()));
     }
     #[test]
     fn bracketed() {

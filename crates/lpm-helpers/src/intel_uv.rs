@@ -212,10 +212,27 @@ impl Msr {
         if self.f.write_at(&v.to_ne_bytes(), addr)? != 8 { return Err(io::Error::new(io::ErrorKind::WriteZero, "short MSR write")); }
         Ok(())
     }
+    /// One OC-mailbox round trip (command write → response read), atomic
+    /// against every other user of this lock (GUI helper, daemon, CLI).
     pub fn mailbox(&self, cmd: u64) -> io::Result<u64> {
+        let _g = self.txn()?;
         self.write(MSR_OC_MAILBOX, cmd)?;
         self.read(MSR_OC_MAILBOX)
     }
+    /// Write-command → read-back pair under one lock hold (voltage/IccMax
+    /// set + verify). Without it the daemon's periodic apply could slip its
+    /// own mailbox command in between and the verify would compare against
+    /// the wrong plane's reply — a spurious "voltage control locked".
+    pub fn mailbox_set_verify(&self, set: u64, verify: u64) -> io::Result<u64> {
+        let _g = self.txn()?;
+        self.write(MSR_OC_MAILBOX, set)?;
+        self.write(MSR_OC_MAILBOX, verify)?;
+        self.read(MSR_OC_MAILBOX)
+    }
+    /// flock() on the msr device descriptor: separate opens (separate
+    /// processes) conflict, so this serialises mailbox transactions system-wide
+    /// among cooperating tools without any extra lock file.
+    fn txn(&self) -> io::Result<crate::FdLock> { crate::FdLock::exclusive(&self.f) }
 }
 
 fn modprobe_msr() -> bool {
@@ -644,8 +661,7 @@ pub fn apply(p: &Profile) -> Value {
         let r = (|| {
             let ticks = mv_to_ticks_ex(mv, p.allow_positive)?;
             let cmd = uv_write_cmd(idx, ticks);
-            msr.write(MSR_OC_MAILBOX, cmd).map_err(|e| err_str(&e))?;
-            let back = msr.mailbox(uv_read_cmd(idx)).map_err(|e| err_str(&e))?;
+            let back = msr.mailbox_set_verify(cmd, uv_read_cmd(idx)).map_err(|e| err_str(&e))?;
             if back & 0xFFFF_FFFF != cmd & 0xFFFF_FFFF {
                 return Err(format!("readback {:.2} mV ≠ requested {:.2} mV (raw {back:#018x}) — voltage control \
                     locked (Plundervolt/CVE-2019-11157 BIOS lock, or no OC mailbox on this CPU)",
@@ -659,8 +675,7 @@ pub fn apply(p: &Profile) -> Value {
     for &(k, idx, a) in &p.iccmax {
         let r = (|| {
             let f = amps_to_icc_field(a)?;
-            msr.write(MSR_OC_MAILBOX, icc_write_cmd(idx, f)).map_err(|e| err_str(&e))?;
-            let resp = msr.mailbox(icc_read_cmd(idx)).map_err(|e| err_str(&e))?;
+            let resp = msr.mailbox_set_verify(icc_write_cmd(idx, f), icc_read_cmd(idx)).map_err(|e| err_str(&e))?;
             if (resp >> 32) & 0xFF != 0 { return Err(format!("mailbox status {:#04x} after write", (resp >> 32) & 0xFF)); }
             let back = resp & ICC_MAX_FIELD;
             if back != f { return Err(format!("readback {:.2} A ≠ requested {:.2} A", back as f64 / 4.0, f as f64 / 4.0)); }

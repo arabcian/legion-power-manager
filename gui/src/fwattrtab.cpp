@@ -1,4 +1,5 @@
 #include "fwattrtab.h"
+#include <QShowEvent>
 #include "platformprofile.h"
 #include "privileged.h"
 #include "theme.h"
@@ -262,7 +263,17 @@ void FwattrTab::rebuild() {
         tabs_->addTab(scroll, it.key());
     }
     setBusy(false);
-    readWmi();
+    // WMI rows are read through pkexec + acpi_call: only once the tab is
+    // actually shown. The constructor runs at login with the app hidden in the
+    // tray, where it used to cost a root helper run (and, in a session polkit
+    // does not treat as active, a password prompt out of nowhere).
+    wmiStale_ = true;
+    if (isVisible()) readWmi();
+}
+
+void FwattrTab::showEvent(QShowEvent *e) {
+    QWidget::showEvent(e);
+    if (wmiStale_) readWmi();
 }
 
 /// Value snapped onto the driver's min + k·step grid (the helper checks the
@@ -363,6 +374,7 @@ void FwattrTab::readWmi() {
     bool any = false;
     for (const Row &r : std::as_const(rows_)) any |= r.info.viaWmi();
     if (!any || busy_) return;
+    wmiStale_ = false;
     privileged::run(gpuHelperPath(), QJsonObject{{"op", "status"}}, this, [this](const privileged::Result &r) {
         wmiReady_ = r.reached && r.json.value("acpi").toBool();
         const QJsonObject vals = r.json.value("values").toObject();
@@ -385,4 +397,11 @@ void FwattrTab::readWmi() {
         }
         if (!wmiReady_ && r.reached) showStatus("acpi_call not loaded — the three WMI-handled GPU attributes are read-only (modprobe acpi_call).", 8000);
     });
+}
+
+QMap<QString, int> FwattrTab::wmiValues() const {
+    QMap<QString, int> out;
+    if (!wmiReady_ || wmiStale_) return out;
+    for (const Row &r : rows_) if (r.info.viaWmi()) out.insert(r.info.name, r.info.current);
+    return out;
 }

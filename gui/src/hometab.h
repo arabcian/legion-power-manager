@@ -63,10 +63,18 @@ private:
     QLabel *gpuLiveKey_ = nullptr, *gpuLiveValue_ = nullptr;
     QLabel *gpuHwKey_ = nullptr, *gpuHwValue_ = nullptr;
     QProcess *smiLive_ = nullptr;
+    bool liveBusy_ = false;            // a sensor sweep is running on the thread pool
+    // dGPU runtime PM: nvidia-smi wakes the GPU, so it is skipped while the
+    // GPU sleeps and throttled while it idles (see refreshGpuLive()).
+    QString dgpuRuntimeStatus_;        // <pci>/power/runtime_status of the NVIDIA dGPU
+    bool dgpuProbed_ = false;
+    qint64 nextSmiAt_ = 0;             // monotonic ms; no nvidia-smi before this
+    void refreshGpuLive();
 
     // Device box (battery charge mode, ideapad toggles, fan targets)
     QString chargeFile_, ideapadDir_, fanHwmon_;
     QComboBox *charge_ = nullptr;
+    QComboBox *fanMode_ = nullptr;   // ideapad fan_mode (silent / standard / dust cleaning / efficient)
     QHash<QString, QCheckBox *> toggles_;
     struct FanRow { QString key; QLabel *rpm; QLineEdit *target; QCheckBox *autoBox; QCheckBox *maxBox; QPushButton *set; int max; };
     QList<FanRow> fans_;

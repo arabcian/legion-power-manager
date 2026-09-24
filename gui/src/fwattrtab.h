@@ -2,6 +2,7 @@
 // Firmware Attributes tab — port of fwattr_tab.py.
 // One slider/spinbox per /sys/class/firmware-attributes/*/attributes/*
 // entry, ranges taken from the driver itself; writes via fwattr-helper.
+#include <QMap>
 #include <QWidget>
 
 class QLabel;
@@ -27,6 +28,9 @@ class FwattrTab : public QWidget {
 public:
     explicit FwattrTab(QWidget *parent = nullptr);
     static QList<FwAttr> discover();
+    /// Values of the WMI-only GPU knobs as last read back from the EC, or
+    /// empty when they have not been read this session (sysfs is stale for them).
+    QMap<QString, int> wmiValues() const;
 
 public Q_SLOTS:
     void refreshLockState();
@@ -48,4 +52,6 @@ private:
     QTabWidget *tabs_;
     QTimer *statusTimer_;
     bool locked_ = false, busy_ = false, wmiReady_ = false;
+    bool wmiStale_ = true;  // WMI rows not read since the last rebuild/apply
+    void showEvent(QShowEvent *e) override;
 };

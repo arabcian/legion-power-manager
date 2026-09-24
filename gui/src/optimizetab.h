@@ -31,6 +31,8 @@ public:
 
     /// Built-in and user presets, as shown in the combo (tray menu).
     QStringList presetNames() const;
+    /// Saved or built-in preset by name (file I/O only, no UI); {} if unknown.
+    QJsonObject presetObject(const QString &name) const;
     /// Load + apply as a manual change (tray). false if busy or unknown.
     bool applyNamedPreset(const QString &name);
     void restoreAll(bool confirm = true);
@@ -79,7 +81,6 @@ private:
 
     QJsonObject collectValues() const;
     QJsonObject collectRun() const;
-    QJsonObject presetObject(const QString &name) const;
     int loadPresetObject(const QJsonObject &p, QStringList *skipped);
     bool writeUserPreset(const QString &name, const QJsonObject &p, QString *err = nullptr);
 

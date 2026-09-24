@@ -41,7 +41,7 @@
 
 static constexpr int POLL_MS = 4000, DESCRIBE_TIMEOUT_MS = 8000, PKEXEC_TIMEOUT_MS = 120000;
 static constexpr qint64 MAX_PRESET_BYTES = 256 * 1024;
-static const char *GROUPS[] = {"CPU", "Memory", "Scheduler", "Storage", "Devices", "Stability"};
+static const char *GROUPS[] = {"CPU", "Memory", "Scheduler", "Storage", "Network", "Devices", "Stability"};
 static const QString GAMEMODE = QStringLiteral("/usr/bin/lpm-gamemode");
 // lpm-gamemode PRE/WRAP apply these curve profiles (exact name) when enabled.
 static const QString UNDERVOLT_PROFILE = QStringLiteral("GAMING");
