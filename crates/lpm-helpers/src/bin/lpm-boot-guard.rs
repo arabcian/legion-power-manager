@@ -1,9 +1,10 @@
 //! lpm-boot-guard — keeps an unstable boot preset from crash-looping the machine.
 //!
 //!   lpm-boot-guard arm      (root) start of boot: arm, or trip if the last boot died armed
-//!   lpm-boot-guard watch    (root) arm, then disarm after the stable window or on SIGTERM
-//!                                  (systemd Type=simple unit; OpenRC uses arm + a sleeper)
-//!   lpm-boot-guard disarm   (root) this boot is fine (window over / clean shutdown)
+//!   lpm-boot-guard watch    (root) arm, disarm after the stable window, stay up; SIGTERM =
+//!                                  clean shutdown (systemd Type=simple; OpenRC uses arm + stop)
+//!   lpm-boot-guard disarm   (root) this boot is fine (stable window over)
+//!   lpm-boot-guard shutdown (root) clean shutdown/reboot: disarm + record it (OpenRC stop)
 //!   lpm-boot-guard check    exit 0 = apply presets, 1 = skip (reason on stderr) — for
 //!                           systemd ExecCondition= and the OpenRC scripts
 //!   lpm-boot-guard status   print the state as JSON
@@ -43,7 +44,13 @@ fn watch() -> i32 {
     while std::time::Instant::now() < end && !STOP.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    bootguard::disarm().map_or_else(fail, |_| 0)
+    if !STOP.load(Ordering::SeqCst) {
+        if let Err(e) = bootguard::disarm() { fail(e); }
+        // Stay up until the service is stopped: SIGTERM at shutdown is how a
+        // clean end of this boot gets recorded (for the GUI's login guard).
+        while !STOP.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_secs(1)); }
+    }
+    bootguard::shutdown().map_or_else(fail, |_| 0)
 }
 
 fn main() {
@@ -52,13 +59,14 @@ fn main() {
         Some("arm") => arm(),
         Some("watch") => watch(),
         Some("disarm") => bootguard::disarm().map_or_else(fail, |_| 0),
+        Some("shutdown") => bootguard::shutdown().map_or_else(fail, |_| 0),
         Some("check") => match bootguard::should_skip() {
             None => 0,
             Some(why) => { eprintln!("lpm-boot-guard: skipping boot presets — {why}"); 1 }
         },
         Some("status") => { println!("{}", bootguard::read()); 0 }
         Some("reset") => bootguard::reset().map_or_else(fail, |v| { println!("{v}"); 0 }),
-        _ => { eprintln!("usage: lpm-boot-guard arm|watch|disarm|check|status|reset"); 2 }
+        _ => { eprintln!("usage: lpm-boot-guard arm|watch|disarm|shutdown|check|status|reset"); 2 }
     };
     std::process::exit(code);
 }

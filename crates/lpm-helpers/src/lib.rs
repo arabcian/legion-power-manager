@@ -173,6 +173,81 @@ pub fn trusted_path(path: &Path) -> bool {
     true
 }
 
+// ── kernel modules ─────────────────────────────────────────────────────────
+
+/// True if the running kernel ships `module` (loadable or built in). Unknown
+/// (no modules.dep) counts as present so that modprobe still gets its chance.
+fn module_installed(module: &str) -> bool {
+    let norm = |s: &str| s.replace('-', "_");
+    let want = norm(module);
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut u) } != 0 { return true; }
+    let rel = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }.to_string_lossy().into_owned();
+    let base = Path::new("/lib/modules").join(rel);
+    let Ok(dep) = std::fs::read_to_string(base.join("modules.dep")) else { return true };
+    let builtin = std::fs::read_to_string(base.join("modules.builtin")).unwrap_or_default();
+    dep.lines().map(|l| l.split(':').next().unwrap_or("")).chain(builtin.lines()).any(|path| {
+        let file = path.rsplit('/').next().unwrap_or("");
+        file.find(".ko").map_or(false, |i| norm(&file[..i]) == want)
+    })
+}
+
+/// Loads a kernel module at most once per process, and only when the running
+/// kernel actually has it: a status poll on a machine without (say) acpi_call
+/// no longer spawns a failing modprobe every time. Returns true if the module
+/// is loaded afterwards (or was already).
+pub fn modprobe(module: &str) -> bool {
+    static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let loaded = || Path::new("/sys/module").join(module.replace('-', "_")).exists();
+    if loaded() { return true; }
+    {
+        let mut t = TRIED.lock().unwrap_or_else(|e| e.into_inner());
+        if t.iter().any(|m| m == module) { return false; }
+        t.push(module.to_owned());
+    }
+    if !module_installed(module) { return false; }
+    for p in ["/sbin/modprobe", "/usr/sbin/modprobe", "/usr/bin/modprobe", "/bin/modprobe"] {
+        if Path::new(p).is_file() {
+            let _ = std::process::Command::new(p).arg(module).env_clear()
+                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()).status();
+            return loaded();
+        }
+    }
+    false
+}
+
+// ── game-session liveness (shared by tune-helper, lpm-gamemode) ─────────────
+
+/// Start time of `pid` (clock ticks since boot, /proc/<pid>/stat field 22).
+/// With the pid it identifies one process for its whole life: a recycled pid
+/// has a different start time.
+pub fn proc_start_time(pid: i32) -> Option<u64> {
+    if pid <= 1 { return None; }
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) may contain spaces and ')' — fields after the last ')'.
+    let rest = &s[s.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// True while the tracked process is still the one that was recorded.
+pub fn session_alive(pid: Option<i64>, start: Option<u64>) -> bool {
+    match (pid, start) {
+        (Some(p), Some(t)) => i32::try_from(p).ok().and_then(proc_start_time) == Some(t),
+        _ => true, // untracked session: only an explicit release ends it
+    }
+}
+
+/// Live game sessions in tune-helper's state.json value (dead owners are not
+/// counted even before root has pruned them). Old files: plain "refcount".
+pub fn live_game_sessions(state: &Value) -> i64 {
+    match state["sessions"].as_array() {
+        Some(a) => a.iter().filter(|s| session_alive(s["pid"].as_i64(), s["start"].as_u64())).count() as i64,
+        None => state["refcount"].as_i64().unwrap_or(0),
+    }
+}
+
 /// Exclusive advisory lock on an already-open file, released on drop.
 /// Serialises multi-step hardware transactions (MSR mailbox write → read,
 /// acpi_call write → read) between our own helpers and the daemon, which
@@ -195,6 +270,23 @@ impl Drop for FdLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_liveness() {
+        let me = std::process::id() as i32;
+        let start = proc_start_time(me).expect("own start time");
+        assert!(session_alive(Some(me as i64), Some(start)));
+        assert!(!session_alive(Some(me as i64), Some(start + 1)));   // pid reused by another process
+        assert!(session_alive(None, None));                           // untracked: only release ends it
+        let st = serde_json::json!({"sessions": [{"pid": me, "start": start}, {"pid": me, "start": start + 7},
+                                                 {"pid": null, "start": null}], "refcount": 3});
+        assert_eq!(live_game_sessions(&st), 2);
+        assert_eq!(live_game_sessions(&serde_json::json!({"refcount": 2})), 2);  // old state file
+    }
+    #[test]
+    fn module_lookup_is_quiet() {
+        assert!(!modprobe("lpm_no_such_module_xyz"));
+        assert!(!modprobe("lpm_no_such_module_xyz"));  // second call: no second spawn
+    }
     #[test]
     fn trusted_path_rejects_tmp() {
         let p = std::env::temp_dir().join(format!("lpm-trust-{}", std::process::id()));

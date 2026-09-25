@@ -144,13 +144,15 @@ fn report(tag: &str, v: &Value) -> bool {
 
 fn apply(name: Option<&str>, mode: &str) -> Result<bool, String> {
     let (name, p) = load_preset(name)?;
-    let v = pkexec(&json!({"op": "apply", "mode": mode, "preset": name, "values": p["values"]}))?;
+    let mut req = json!({"op": "apply", "mode": mode, "preset": name, "values": p["values"]});
+    if mode == "game" { req["owner_pid"] = json!(OWNER.load(Ordering::SeqCst)); }
+    let v = pkexec(&req)?;
     Ok(report(if mode == "game" { "PRE" } else { "APPLY" }, &v))
 }
 
 /// POST: release game mode; when that was the last game, leave the game scene.
 fn post() -> Result<bool, String> {
-    let v = pkexec(&json!({"op": "release"}))?;
+    let v = pkexec(&json!({"op": "release", "owner_pid": OWNER.load(Ordering::SeqCst)}))?;
     let ok = report("POST", &v);
     if v["restored"] == true { leave_game_scene(); }
     Ok(ok)
@@ -160,6 +162,9 @@ fn post() -> Result<bool, String> {
 /// undervolt), then the game-mode preset. Returns whether the helper took the
 /// game-mode reference (so POST must run) and the exit code.
 fn game_start(name: Option<&str>) -> (bool, i32) {
+    // Two games launched at the same moment must not both see "first game"
+    // and both switch scenes: serialise the start sequence per user.
+    let _start_lock = user_lock("gamemode-start.lock");
     let cfg = read_json(&config_dir().join("tune.json")).unwrap_or(Value::Null);
     let first = game_refcount() == 0;
     match cfg["game_scene"].as_str().filter(|n| valid_name(n)) {
@@ -195,9 +200,55 @@ fn write_scene_state(v: &Value) {
     if std::fs::write(&tmp, v.to_string()).is_ok() { let _ = std::fs::rename(&tmp, scene_state_file()); }
 }
 
-/// Running game sessions, from tune-helper's world-readable state.
+/// Running game sessions, from tune-helper's world-readable state (sessions
+/// whose launcher has died are not counted).
 fn game_refcount() -> i64 {
-    read_json(Path::new("/run/legion-power-manager/tune/state.json")).and_then(|v| v["refcount"].as_i64()).unwrap_or(0)
+    read_json(Path::new("/run/legion-power-manager/tune/state.json")).map_or(0, |v| lpm_helpers::live_game_sessions(&v))
+}
+
+/// Exclusive per-user lock in $XDG_RUNTIME_DIR, held until the file drops.
+fn user_lock(name: &str) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let dir = runtime_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let f = std::fs::OpenOptions::new().create(true).write(true).open(dir.join(name)).ok()?;
+    loop {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 { return Some(f); }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted { return None; }
+    }
+}
+
+// ── game-session owner ──────────────────────────────────────────────────────
+//
+// tune-helper ends a game session on its own when the owner process is gone,
+// so a launcher that was killed (or a POST hook that never ran) no longer
+// leaves game mode stuck until reboot. WRAP owns its session itself; PRE/POST
+// are short-lived hooks, so the owner is the launcher above them (the first
+// ancestor that is not a shell or a small exec wrapper).
+
+static OWNER: AtomicI32 = AtomicI32::new(0);
+
+const WRAPPER_COMMS: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "busybox", "env", "timeout",
+                                 "nice", "ionice", "stdbuf", "xargs", "setsid", "flock", "lpm-gamemode"];
+
+/// (comm, ppid) of `pid` from /proc/<pid>/stat.
+fn proc_comm_ppid(pid: i32) -> Option<(String, i32)> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (l, r) = (s.find('(')?, s.rfind(')')?);
+    let ppid = s[r + 1..].split_whitespace().nth(1)?.parse().ok()?;
+    Some((s[l + 1..r].to_owned(), ppid))
+}
+
+fn launcher_pid() -> i32 {
+    let mut pid = unsafe { libc::getppid() };
+    for _ in 0..16 {
+        if pid <= 1 { return 0; }
+        let Some((comm, ppid)) = proc_comm_ppid(pid) else { return 0 };
+        if comm == "systemd" || comm == "init" { return 0; }  // no launcher above us: untracked
+        if !WRAPPER_COMMS.contains(&comm.as_str()) { return pid; }
+        pid = ppid;
+    }
+    0
 }
 
 fn enter_game_scene(scene: &str, cpu: bool, gpu: bool) {
@@ -391,11 +442,13 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
 
     // 6. user command — as the user, no shell, detached
     if let Some(cmd) = s["command"].as_str().map(str::trim).filter(|c| !c.is_empty()) {
-        let argv: Vec<&str> = cmd.split_whitespace().collect();
-        let mut c = Command::new(argv[0]);
+        // Same quoting rules as the GUI (QProcess::splitCommand).
+        let argv = split_command(cmd);
+        if argv.is_empty() { return ok; }
+        let mut c = Command::new(&argv[0]);
         c.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
-        line("command", c.spawn().map(|_| argv[0].to_owned()).map_err(|e| format!("{}: {e}", argv[0])));
+        line("command", c.spawn().map(|_| argv[0].clone()).map_err(|e| format!("{}: {e}", argv[0])));
     }
     ok
 }
@@ -535,6 +588,32 @@ fn split_cmd(args: &[String]) -> (Option<String>, Vec<String>) {
     (name, args[i..].to_vec())
 }
 
+/// Port of QProcess::splitCommand: whitespace separates, double quotes group,
+/// and three consecutive quotes give one literal quote. The GUI starts scene
+/// commands with the Qt function, so both must split identically.
+fn split_command(cmd: &str) -> Vec<String> {
+    let (mut args, mut tmp) = (Vec::new(), String::new());
+    let (mut quotes, mut in_quote) = (0, false);
+    for c in cmd.chars() {
+        if c == '"' {
+            quotes += 1;
+            if quotes == 3 { quotes = 0; tmp.push(c); }
+            continue;
+        }
+        if quotes > 0 {
+            if quotes == 1 { in_quote = !in_quote; }
+            quotes = 0;
+        }
+        if !in_quote && c.is_whitespace() {
+            if !tmp.is_empty() { args.push(std::mem::take(&mut tmp)); }
+        } else {
+            tmp.push(c);
+        }
+    }
+    if !tmp.is_empty() { args.push(tmp); }
+    args
+}
+
 static CHILD: AtomicI32 = AtomicI32::new(0);
 extern "C" fn forward(sig: libc::c_int) {
     let pid = CHILD.load(Ordering::SeqCst);
@@ -542,6 +621,7 @@ extern "C" fn forward(sig: libc::c_int) {
 }
 
 fn wrap(args: &[String]) -> i32 {
+    OWNER.store(std::process::id() as i32, Ordering::SeqCst);
     let (name, cmd) = split_cmd(args);
     if cmd.is_empty() { log!("lpm-gamemode WRAP: no command"); return 2; }
     let (pname, preset) = match load_preset(name.as_deref()) { Ok(p) => p, Err(e) => { log!("lpm-gamemode: {e}"); return 2 } };
@@ -552,10 +632,21 @@ fn wrap(args: &[String]) -> i32 {
     // `as *const ()` first: casting a function item straight to an integer type is
     // deprecated (function pointers aren't guaranteed integer-representable), even
     // though it's always fine in practice on the platforms this runs on.
+    // Signals are held back until the child's pid is known: one that arrived
+    // in between used to be dropped (nothing to forward to yet). The child
+    // itself starts with an empty mask (std resets it before exec).
+    let mut held: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut held);
+        for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] { libc::sigaddset(&mut held, s); }
+        libc::sigprocmask(libc::SIG_BLOCK, &held, std::ptr::null_mut());
+    }
     for s in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] { unsafe { libc::signal(s, forward as *const () as libc::sighandler_t) }; }
-    let code = match Command::new(&cmd[0]).args(&cmd[1..]).spawn() {
+    let spawned = Command::new(&cmd[0]).args(&cmd[1..]).spawn();
+    if let Ok(c) = &spawned { CHILD.store(c.id() as i32, Ordering::SeqCst); }
+    unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &held, std::ptr::null_mut()); }
+    let code = match spawned {
         Ok(mut c) => {
-            CHILD.store(c.id() as i32, Ordering::SeqCst);
             loop {
                 match c.wait() {
                     Ok(st) => break st.code().unwrap_or(1),
@@ -654,8 +745,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let fail = |e: String| { log!("lpm-gamemode: {e}"); 1 };
     let code = match args.first().map(|s| s.to_ascii_uppercase()).as_deref() {
-        Some("PRE") => pre(args.get(1).map(String::as_str)),
-        Some("POST") => post().map_or_else(fail, |ok| (!ok) as i32),
+        Some("PRE") => { OWNER.store(launcher_pid(), Ordering::SeqCst); pre(args.get(1).map(String::as_str)) }
+        Some("POST") => { OWNER.store(launcher_pid(), Ordering::SeqCst); post().map_or_else(fail, |ok| (!ok) as i32) }
         Some("APPLY") if args.len() == 2 => apply(Some(&args[1]), "manual").map_or_else(fail, |ok| (!ok) as i32),
         Some("RESTORE") => pkexec(&json!({"op": "restore"})).map_or_else(fail, |v| (!report("RESTORE", &v)) as i32),
         Some("UNDERVOLT") => (!undervolt(true)) as i32,
@@ -685,6 +776,14 @@ mod tests {
         assert!(!valid_name("/usr/bin/wine"));
         assert!(!valid_name(""));
         assert!(!valid_name("a..b"));
+    }
+    #[test]
+    fn split_like_qt() {
+        assert_eq!(split_command(r#"kscreen-doctor output.eDP-1.mode.2560x1600@240"#),
+                   vec!["kscreen-doctor", "output.eDP-1.mode.2560x1600@240"]);
+        assert_eq!(split_command(r#"notify-send "Game mode" 'x'"#), vec!["notify-send", "Game mode", "'x'"]);
+        assert_eq!(split_command(r#"a """b""" c"#), vec!["a", "\"b\"", "c"]);
+        assert!(split_command("   ").is_empty());
     }
     #[test]
     fn split() {

@@ -69,6 +69,22 @@ pub fn on_ac() -> bool {
 
 impl BootConfig {
     pub fn for_source(&self, ac: bool) -> Option<&Profile> { if ac { self.ac.as_ref() } else { self.battery.as_ref() } }
+
+    /// What a full apply for `ac` must write: the source's own profile plus
+    /// 0 mV for every voltage plane the *other* source offsets but this one
+    /// leaves out. Without that, AC → battery kept the AC undervolt on every
+    /// plane the battery profile did not name — and a source without any
+    /// profile kept the whole previous undervolt. Power limits, IccMax, TCC
+    /// are left as they are (their stock values are the firmware's, unknown).
+    pub fn full_apply(&self, ac: bool) -> Option<Profile> {
+        let mine = self.for_source(ac);
+        let other = self.for_source(!ac);
+        let mut p = mine.cloned().unwrap_or_default();
+        for &(k, idx, _) in other.map(|o| o.voltage.as_slice()).unwrap_or(&[]) {
+            if !p.voltage.iter().any(|v| v.0 == k) { p.voltage.push((k, idx, 0.0)); }
+        }
+        (mine.is_some() || !p.voltage.is_empty()).then_some(p)
+    }
 }
 
 // ── hwphint (intel-undervolt scaling.c / stat.c / power.c) ─────────────────
@@ -202,12 +218,40 @@ fn clock(id: libc::clockid_t) -> f64 {
 }
 fn suspended_s() -> f64 { clock(libc::CLOCK_BOOTTIME) - clock(libc::CLOCK_MONOTONIC) }
 
-fn report(tag: &str, v: &Value, quiet_ok: bool) {
-    if let Some(e) = v["error"].as_str() { eprintln!("lpm-intel-uv: {tag}: {e}"); return; }
-    for r in v["results"].as_array().into_iter().flatten() {
-        if r["ok"] != true || !quiet_ok {
-            eprintln!("lpm-intel-uv: {tag}: {} {} {}", if r["ok"] == true { "OK " } else { "ERR" },
-                      r["what"].as_str().unwrap_or(""), r["message"].as_str().unwrap_or(""));
+/// `periodic`: the every-interval re-apply. Its failures are usually
+/// permanent (a limit locked by firmware) and used to be logged every few
+/// seconds forever; now a failure is logged when it first appears or its text
+/// changes, and once more when it clears.
+fn report(tag: &str, v: &Value, periodic: bool) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    // One line per result: (dedup key, ok, text).
+    let mut lines: Vec<(String, bool, String)> = Vec::new();
+    match v["error"].as_str() {
+        Some(e) => lines.push((tag.to_owned(), false, format!("lpm-intel-uv: {tag}: {e}"))),
+        None => {
+            lines.push((tag.to_owned(), true, String::new()));  // a whole-request error is gone
+            for r in v["results"].as_array().into_iter().flatten() {
+                let ok = r["ok"] == true;
+                let what = r["what"].as_str().unwrap_or("");
+                lines.push((format!("{tag} {what}"), ok, format!("lpm-intel-uv: {tag}: {} {} {}",
+                    if ok { "OK " } else { "ERR" }, what, r["message"].as_str().unwrap_or(""))));
+            }
+        }
+    }
+    if !periodic {
+        for (_, _, l) in lines.iter().filter(|x| !x.2.is_empty()) { eprintln!("{l}"); }
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    for (key, ok, line) in lines {
+        let pos = seen.iter().position(|(k, _)| *k == key);
+        match (ok, pos) {
+            (true, Some(i)) => { seen.remove(i); eprintln!("lpm-intel-uv: {key}: OK again"); }
+            (true, None) => {}
+            (false, Some(i)) if seen[i].1 == line => {}
+            (false, Some(i)) => { seen[i].1 = line.clone(); eprintln!("{line}"); }
+            (false, None) => { eprintln!("{line}"); seen.push((key, line)); }
         }
     }
 }
@@ -246,9 +290,9 @@ pub fn run_daemon() -> i32 {
             let ac = on_ac();
             let src = if ac { "AC" } else { "BATTERY" };
             match c.for_source(ac) {
-                Some(p) if applied != Some(ac) => {
+                Some(_) if applied != Some(ac) => {
                     if applied.is_some() { eprintln!("lpm-intel-uv: power source → {src}"); }
-                    report(src, &intel_uv::apply(p), false);
+                    if let Some(full) = c.full_apply(ac) { report(src, &intel_uv::apply(&full), false); }
                     applied = Some(ac);
                 }
                 Some(p) => {
@@ -262,7 +306,17 @@ pub fn run_daemon() -> i32 {
                     for l in hwp.update(&p.hwphint) { eprintln!("lpm-intel-uv: hwphint: {l}"); }
                 }
                 None => {
-                    if applied != Some(ac) { eprintln!("lpm-intel-uv: no profile for {src}, nothing applied"); applied = Some(ac); }
+                    if applied != Some(ac) {
+                        match c.full_apply(ac) {
+                            // Only the other source's voltage planes, back to 0 mV.
+                            Some(reset) => {
+                                eprintln!("lpm-intel-uv: no profile for {src} — voltage offsets back to 0 mV");
+                                report(src, &intel_uv::apply(&reset), false);
+                            }
+                            None => eprintln!("lpm-intel-uv: no profile for {src}, nothing applied"),
+                        }
+                        applied = Some(ac);
+                    }
                 }
             }
         }
@@ -281,8 +335,8 @@ pub fn apply_boot() -> Value {
     match load_boot() {
         Ok(None) => json!({"ok": true, "message": "no boot profile set"}),
         Err(e) => json!({"ok": false, "error": e}),
-        Ok(Some(c)) => match c.for_source(on_ac()) {
-            Some(p) => intel_uv::apply(p),
+        Ok(Some(c)) => match c.full_apply(on_ac()) {
+            Some(p) => intel_uv::apply(&p),
             None => json!({"ok": true, "message": format!("no profile for {}", if on_ac() { "AC" } else { "battery" })}),
         },
     }
@@ -291,6 +345,22 @@ pub fn apply_boot() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_switch_zeroes_foreign_planes() {
+        let c = parse_boot(&json!({"ac": {"voltage": {"core": -80, "cache": -80}}, "battery": {"voltage": {"core": -50}}})).unwrap();
+        let bat = c.full_apply(false).unwrap();
+        let mv = |p: &Profile, k: &str| p.voltage.iter().find(|v| v.0 == k).map(|v| v.2);
+        assert_eq!(mv(&bat, "core"), Some(-50.0));
+        assert_eq!(mv(&bat, "cache"), Some(0.0));   // AC's cache offset is undone
+        assert_eq!(mv(&bat, "gpu"), None);          // never touched by either: left alone
+        let only_ac = parse_boot(&json!({"ac": {"voltage": {"core": -80}}, "battery": null})).unwrap();
+        let reset = only_ac.full_apply(false).unwrap();
+        assert_eq!(mv(&reset, "core"), Some(0.0));
+        assert!(reset.pl1.is_none() && reset.tjoffset.is_none());
+        let none = parse_boot(&json!({"ac": {"power": {"pl1": {"watts": 45}}}, "battery": null})).unwrap();
+        assert!(none.full_apply(false).is_none());  // nothing to undo
+    }
     #[test]
     fn boot_formats() {
         let legacy = parse_boot(&json!({"voltage": {"core": -50, "cache": -50}})).unwrap();

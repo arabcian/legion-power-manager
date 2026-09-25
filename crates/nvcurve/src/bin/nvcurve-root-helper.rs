@@ -273,7 +273,13 @@ fn run() -> Value {
         return json!({"ok": false, "error": "root_helper must run as root"});
     }
     // pkexec passes the caller's umask through; pin it once for every op.
-    unsafe { libc::umask(0o022) };
+    // No core dumps either (same as lpm_helpers::init): a crash must not leave
+    // root memory (NvAPI session state) in a file other tools might pick up.
+    unsafe {
+        libc::umask(0o022);
+        let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
     logging::init(log::Level::Info, true);
 
     let mut raw = Vec::new();

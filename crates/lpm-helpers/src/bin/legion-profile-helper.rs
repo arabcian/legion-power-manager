@@ -14,6 +14,8 @@
 //!                                  lenovo_wmi_other pwm1_enable (0 = full, 2 = auto),
 //!                                  legion_laptop PNP0C09:*/fan_fullspeed (1/0),
 //!                                  Lenovo WMAE feature 0x04020000 (EC FNST) via acpi_call
+//!   stdin:  {"wmae_toggle": "get"} | {"wmae_toggle": "set", "key": k, "on": bool}
+//!           keys: instant_boot_ac, instant_boot_usbpd, fnq_custom (Lenovo WMAE)
 //!   stdin:  {"fan_fullspeed": "get"}
 //!   stdout: {"ok": true, "on": bool, "backend": "pwm1_enable" | "fan_fullspeed" | "wmae"}
 //!   stdout: {"ok": true, "device": .., "effective": ..} | {"ok": false, "error": ..}
@@ -24,6 +26,8 @@
 //!
 //! Memory SPD (read-only, any DDR5 machine; see lpm_helpers::memory_spd):
 //!   stdin:  {"memory": "spd"} | {"memory": "all"} (SPD + live UMC timings via ryzen_smu)
+//!   stdin:  {"memory": "aod_get"}  BIOS DRAM timing overrides, read-only here (16AFR10H only);
+//!           writes (aod_set / aod_restore) are in legion-firmware-helper
 //!   stdout: {"ok": true, "modules": [{slot, part, speed_mts, tAA{ns,clk}, ...}]}
 //!
 //! Writes the per-handler class interface because the legacy
@@ -254,14 +258,26 @@ fn run() -> Value {
         Some("spd") => return lpm_helpers::memory_spd::read_all(),
         Some("all") => return lpm_helpers::memory_spd::read_everything(),
         Some("aod_get") => return lpm_helpers::memory_spd::aod_get(),
-        Some("aod_set") => return lpm_helpers::memory_spd::aod_set(obj.get("values")),
-        Some(_) => return json!({"ok": false, "error": "'memory' must be \"spd\" or \"all\""}),
+        // BIOS variable writes: legion-firmware-helper (always password-protected).
+        Some(op @ ("aod_set" | "aod_restore")) => return json!({"ok": false,
+            "error": format!("{op} is handled by legion-firmware-helper (administrator password required)")}),
+        Some(_) => return json!({"ok": false, "error": "'memory' must be one of spd, all, aod_get"}),
         None => {}
     }
     if let Some(op) = obj.get("fan_table") {
         return match op.as_str() {
             Some(op) => lpm_helpers::fan_table::handle(op, obj.get("levels")),
             None => json!({"ok": false, "error": "'fan_table' must be a string"}),
+        };
+    }
+    if let Some(op) = obj.get("wmae_toggle") {
+        return match op.as_str() {
+            Some("get") => lpm_helpers::legion_wmi::wmae_toggles_get(),
+            Some("set") => match (obj.get("key").and_then(Value::as_str), obj.get("on").and_then(Value::as_bool)) {
+                (Some(k), Some(on)) => lpm_helpers::legion_wmi::wmae_toggle_set(k, on),
+                _ => json!({"ok": false, "error": "'key' (string) and 'on' (bool) required"}),
+            },
+            _ => json!({"ok": false, "error": "'wmae_toggle' must be \"get\" or \"set\""}),
         };
     }
     if let Some(op) = obj.get("fan_fullspeed") {

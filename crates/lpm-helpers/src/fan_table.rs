@@ -21,7 +21,6 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const ACPI_CALL: &str = "/proc/acpi/call";
@@ -30,35 +29,17 @@ const WMI_DEVICES: &str = "/sys/bus/wmi/devices";
 const DSDT: &str = "/sys/firmware/acpi/tables/DSDT";
 const LEVELS: usize = 10;
 
-fn modprobe_acpi_call() {
-    for p in ["/sbin/modprobe", "/usr/sbin/modprobe", "/usr/bin/modprobe", "/bin/modprobe"] {
-        if Path::new(p).is_file() {
-            let _ = std::process::Command::new(p).arg("acpi_call").env_clear()
-                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()).status();
-            return;
-        }
-    }
-}
 
+/// One acpi_call transaction through legion_wmi::acpi_raw: a single
+/// descriptor and an exclusive flock around the write→read pair. The module has
+/// one global result buffer, so an unlocked caller could read the reply of a
+/// concurrent WMAE/WMAA call (Home tab polls) — or have its own reply stolen.
 fn acpi_call(cmd: &str) -> Result<String, String> {
-    if !Path::new(ACPI_CALL).exists() { modprobe_acpi_call(); }
+    if !Path::new(ACPI_CALL).exists() { crate::modprobe("acpi_call"); }
     if !Path::new(ACPI_CALL).exists() {
         return Err("/proc/acpi/call missing — install the acpi_call module (sys-power/acpi_call)".into());
     }
-    fs::OpenOptions::new().write(true).open(ACPI_CALL)
-        .and_then(|mut f| f.write_all(cmd.as_bytes()))
-        .map_err(|e| format!("acpi_call write: {e}"))?;
-    // One large read(): acpi_call clears its result buffer after every read, and
-    // read_to_string() starts with a 32-byte probe read, so the second read came back
-    // empty. Python's buffered read() does a single 8 KiB read, which is why it worked.
-    let mut buf = vec![0u8; 8192];
-    let n = fs::File::open(ACPI_CALL).and_then(|mut f| f.read(&mut buf))
-        .map_err(|e| format!("acpi_call read: {e}"))?;
-    let out = String::from_utf8_lossy(&buf[..n]).trim_matches(char::from(0)).trim().to_string();
-    if out.starts_with("Error") { return Err(format!("ACPI: {out}")); }
-    Ok(out)
+    crate::legion_wmi::acpi_raw(cmd)
 }
 
 /// ACPI path of the LENOVO_FAN_METHOD block's method, e.g. `\_SB.GZFD.WMAB`.

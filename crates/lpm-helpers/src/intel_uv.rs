@@ -238,17 +238,7 @@ impl Msr {
     fn txn(&self) -> io::Result<crate::FdLock> { crate::FdLock::exclusive(&self.f) }
 }
 
-fn modprobe_msr() -> bool {
-    for p in ["/sbin/modprobe", "/usr/sbin/modprobe", "/usr/bin/modprobe", "/bin/modprobe"] {
-        if Path::new(p).is_file() {
-            return std::process::Command::new(p).arg("msr").env_clear()
-                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-        }
-    }
-    false
-}
+fn modprobe_msr() -> bool { crate::modprobe("msr") }
 
 /// throttled's set_msr_allow_writes(): writes stay allowed with "default"
 /// but every 0x150 write then logs a kernel warning.

@@ -1299,8 +1299,11 @@ fn parse_int(raw: &str) -> Option<i64> {
 }
 
 /// Current value in preset terms; "mixed" if per-file values differ; None if unreadable.
-pub fn current(t: &Tunable) -> Option<String> {
-    let fs = files(t);
+pub fn current(t: &Tunable) -> Option<String> { current_with(t, files(t)) }
+
+/// `current` for a caller that already resolved `files(t)` (describe: the
+/// file walk — PCI config, IRQs, Wi-Fi via iw — then runs once per tunable).
+fn current_with(t: &Tunable, fs: Vec<PathBuf>) -> Option<String> {
     if fs.is_empty() { return None; }
     match t.target {
         Target::CState => {
@@ -1535,12 +1538,49 @@ fn write_checked_inner(f: &Path, data: &str) -> Result<(), String> {
 }
 
 /// amd_x3d_mode goes through a synchronous ACPI _DSM that stalls forever on
-/// some BIOS/AGESA versions (lutris-game-tune wraps it in `timeout 3`). A
-/// stuck write is abandoned so the rest of the batch and the reply still happen.
+/// some BIOS/AGESA versions (lutris-game-tune wraps it in `timeout 3`).
+///
+/// The write runs in a forked child that closes every inherited descriptor
+/// first. A thread (the old approach) that hangs in the kernel keeps the whole
+/// helper from exiting — and with it the tune lock, so every later tune-helper
+/// call blocked behind it. A stuck child only holds its own open of the sysfs
+/// file; this process answers and exits normally.
 fn write_with_timeout(p: PathBuf, data: String) -> Result<(), String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || { let _ = tx.send(sysfs_write(&p, data.as_bytes()).map_err(|e| e.to_string())); });
-    rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap_or_else(|_| Err("timed out after 3 s (ACPI _DSM stall?)".into()))
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| "bad path".to_string())?;
+    let bytes = data.into_bytes();
+    // After fork only async-signal-safe calls: open, close, write, _exit.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 { return Err(format!("fork: {}", std::io::Error::last_os_error())); }
+    if pid == 0 {
+        unsafe {
+            let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            if fd < 0 { libc::_exit(*libc::__errno_location() & 0xFF); }
+            for other in 0..4096 { if other != fd { libc::close(other); } }
+            let n = libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+            if n < 0 { libc::_exit(*libc::__errno_location() & 0xFF); }
+            libc::_exit(if n as usize == bytes.len() { 0 } else { 255 });
+        }
+    }
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let mut st = 0;
+        let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+        if r == pid {
+            if !libc::WIFEXITED(st) { return Err("writer terminated abnormally".into()); }
+            return match libc::WEXITSTATUS(st) {
+                0 => Ok(()),
+                255 => Err("short write".into()),
+                e => Err(std::io::Error::from_raw_os_error(e).to_string()),
+            };
+        }
+        if r < 0 { return Err(format!("waitpid: {}", std::io::Error::last_os_error())); }
+        if std::time::Instant::now() >= end {
+            // Left behind: init reaps it whenever the firmware call returns.
+            return Err("timed out after 3 s (ACPI _DSM stall?)".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// CCD topology for the GUI and lpm-gamemode STATUS.
@@ -1576,8 +1616,8 @@ pub fn describe() -> Value {
             // debugfs is root-only (0700): unprivileged callers cannot tell; root checks at write time.
             "available": !fs.is_empty() || t.debugfs,
             "debugfs": t.debugfs, "caution": t.caution, "hotplug": is_hotplug(t.key),
-            "current": current(t),
             "files": fs.len(),
+            "current": current_with(t, fs),
         })
     }).collect();
     let mut m = Map::new();
@@ -1736,6 +1776,16 @@ mod tests {
         assert!(same_value(irq, "0-3", "0,1,2,3"));
         let b = find("wq.power_efficient").unwrap();
         assert!(same_value(b, "Y", "1") && !same_value(b, "Y", "N"));
+    }
+    #[test]
+    fn forked_writer() {
+        let p = std::env::temp_dir().join(format!("lpm-x3d-{}", std::process::id()));
+        std::fs::write(&p, b"").unwrap();
+        write_with_timeout(p.clone(), "cache".into()).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "cache");
+        std::fs::remove_file(&p).unwrap();
+        let e = write_with_timeout(p.clone(), "x".into()).unwrap_err();
+        assert!(e.contains("No such file"), "{e}");
     }
     #[test]
     fn write_guard() {

@@ -6,7 +6,8 @@
 //!       "replace":true (manual only): first restore every knob this request
 //!       does not set, so switching presets never leaves the previous one's
 //!       extra keys behind; refused while a game session holds game mode
-//!   {"op":"release"}                                   game POST: refcount-1, restore at 0
+//!   {"op":"release","owner_pid":N}                     game POST: end one session, restore at 0
+//!   {"op":"prune"}                                     end sessions whose launcher died
 //!   {"op":"restore"}                                   write every saved original back now
 //!   {"op":"restore_keys","keys":[k,..]}                restore only these knobs
 //!   {"op":"boost","nice":-5,"autogroup":true}          renice the process that ran pkexec
@@ -57,7 +58,10 @@ fn lock() -> Result<Lock, String> {
 struct State {
     /// (key, path, original) in first-write order.
     baseline: Vec<(String, PathBuf, String)>,
-    refcount: u32,
+    /// Running game sessions: (owner pid, owner start time). The owner is the
+    /// process that stays alive for the whole game (lpm-gamemode WRAP, or the
+    /// launcher that ran PRE); None = untracked, ended only by a release.
+    sessions: Vec<(Option<i32>, Option<u64>)>,
     preset: Option<String>,
     /// "manual" | "game" | "boot" — who applied last.
     source: Option<String>,
@@ -72,9 +76,17 @@ impl State {
             tune::find(key)?; // drop anything the table no longer knows
             Some((key.to_owned(), PathBuf::from(e[1].as_str()?), e[2].as_str()?.to_owned()))
         }).take(MAX_BASELINE).collect()).unwrap_or_default();
+        let sessions: Vec<(Option<i32>, Option<u64>)> = match v["sessions"].as_array() {
+            Some(a) => a.iter().take(MAX_REFCOUNT as usize).map(|e| {
+                let pid = e["pid"].as_i64().and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 1);
+                (pid, pid.and(e["start"].as_u64()))
+            }).collect(),
+            // state written by an older helper: untracked sessions
+            None => vec![(None, None); v["refcount"].as_u64().unwrap_or(0).min(MAX_REFCOUNT as u64) as usize],
+        };
         State {
             baseline,
-            refcount: v["refcount"].as_u64().unwrap_or(0).min(MAX_REFCOUNT as u64) as u32,
+            sessions,
             preset: v["preset"].as_str().map(str::to_owned),
             source: v["source"].as_str().map(str::to_owned),
         }
@@ -83,18 +95,29 @@ impl State {
     fn save(&self) -> Result<(), String> {
         let v = json!({
             "baseline": self.baseline.iter().map(|(k, p, v)| json!([k, p, v])).collect::<Vec<_>>(),
-            "refcount": self.refcount, "preset": self.preset, "source": self.source,
+            "refcount": self.refcount(), "preset": self.preset, "source": self.source,
+            "sessions": self.sessions.iter().map(|(p, t)| json!({"pid": p, "start": t})).collect::<Vec<_>>(),
         });
         write_root_file(STATE_FILE, &serde_json::to_vec_pretty(&v).unwrap())
     }
 
     fn has(&self, p: &Path) -> bool { self.baseline.iter().any(|(_, q, _)| q == p) }
+
+    fn refcount(&self) -> u32 { self.sessions.len() as u32 }
+
+    /// Drops sessions whose owner has exited (launcher killed, crash, POST
+    /// hook never ran). Returns how many were dropped.
+    fn prune(&mut self) -> usize {
+        let before = self.sessions.len();
+        self.sessions.retain(|&(p, t)| session_alive(p.map(i64::from), t));
+        before - self.sessions.len()
+    }
 }
 
 fn summary(st: &State) -> Value {
     let mut keys: Vec<&str> = Vec::new();
     for (k, _, _) in &st.baseline { if !keys.contains(&k.as_str()) { keys.push(k); } }
-    json!({"active": !st.baseline.is_empty(), "refcount": st.refcount, "preset": st.preset,
+    json!({"active": !st.baseline.is_empty(), "refcount": st.refcount(), "preset": st.preset,
            "source": st.source, "saved_files": st.baseline.len(), "keys": keys})
 }
 
@@ -200,6 +223,10 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
     let mut order: Vec<usize> = (0..st.baseline.len()).filter(|&i| selected(&st.baseline[i].0)).collect();
     order.sort_by_key(|&i| (!tune::is_hotplug(&st.baseline[i].0), i));
     let (mut n, mut errs) = (0, Vec::new());
+    // Entries whose original could not be written back stay in the baseline:
+    // dropping them would lose the only record of the original value while the
+    // knob is still changed. A later restore (GUI, POST, service stop) retries.
+    let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for &i in &order {
         let (key, f, orig) = &st.baseline[i];
         let res = match tune::find(key) { Some(t) => tune::write_value(t, f, orig), None => tune::write_checked(f, orig) };
@@ -208,20 +235,30 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
             // Per-policy files vanish when the pstate mode is restored first; not an error.
             Err(_) if !f.exists() => {}
             Err(_) if tune::find(key).map_or(false, tune::best_effort) => {}
-            Err(e) => errs.push(json!({"key": key, "error": e})),
+            Err(e) => { failed.insert(i); errs.push(json!({"key": key, "error": e})); }
         }
     }
-    let drop: std::collections::HashSet<usize> = order.into_iter().collect();
+    let drop: std::collections::HashSet<usize> = order.into_iter().filter(|i| !failed.contains(i)).collect();
     let mut i = 0;
     st.baseline.retain(|_| { let keep = !drop.contains(&i); i += 1; keep });
-    if st.baseline.is_empty() { st.refcount = 0; st.preset = None; st.source = None; }
+    // A full restore ends game mode even if some originals could not be
+    // written back (those stay recorded for the next restore attempt).
+    if only.is_none() { st.sessions.clear(); }
+    if st.baseline.is_empty() { st.sessions.clear(); st.preset = None; st.source = None; }
     json!({"restored": n, "errors": errs})
 }
 
 fn locked<F: FnOnce(&mut State) -> Value>(f: F) -> Value {
     let _l = match lock() { Ok(l) => l, Err(e) => return json!({"ok": false, "error": e}) };
     let mut st = State::load();
+    // A game whose launcher was killed never sends POST: end its session here,
+    // and when it was the last one, restore exactly as the last POST would.
+    let mut stale = Value::Null;
+    if st.prune() > 0 && st.sessions.is_empty() && st.source.as_deref() == Some("game") {
+        stale = restore_entries(&mut st, None);
+    }
     let mut out = f(&mut st);
+    if !stale.is_null() && out.is_object() { out["stale_game_released"] = stale; }
     if let Err(e) = st.save() {
         out["ok"] = json!(false);
         out["error"] = json!(e);
@@ -242,13 +279,14 @@ fn op_apply(req: &Value) -> Value {
     let preset = valid_preset(&req["preset"]);
     let replace = req["replace"].as_bool().unwrap_or(false);
     if replace && mode != "manual" { return json!({"ok": false, "error": "replace is only valid in manual mode"}); }
+    let owner = if mode == "game" { session_owner(req) } else { (None, None) };
     locked(|st| {
         let mut restored = Value::Null;
         if replace {
             // A scene switch (e.g. AC → battery) must not yank a running game's tuning.
-            if st.refcount > 0 {
+            if st.refcount() > 0 {
                 return json!({"ok": false, "applied": false, "game_active": true,
-                              "error": format!("game mode is active ({} session(s)); tuning left unchanged", st.refcount)});
+                              "error": format!("game mode is active ({} session(s)); tuning left unchanged", st.refcount())});
             }
             let mut stale: Vec<String> = Vec::new();
             for (k, _, _) in &st.baseline {
@@ -258,11 +296,11 @@ fn op_apply(req: &Value) -> Value {
             st.preset = preset.clone();
         }
         if mode == "game" {
-            if st.refcount >= MAX_REFCOUNT { return json!({"ok": false, "error": "too many concurrent game sessions"}); }
-            st.refcount += 1;
-            if st.refcount > 1 {
+            if st.refcount() >= MAX_REFCOUNT { return json!({"ok": false, "error": "too many concurrent game sessions"}); }
+            st.sessions.push(owner);
+            if st.refcount() > 1 {
                 return json!({"ok": true, "applied": false,
-                              "message": format!("game mode already active ({} games running)", st.refcount)});
+                              "message": format!("game mode already active ({} games running)", st.refcount())});
             }
         }
         if !replace { st.preset = preset.clone().or(st.preset.take()); }
@@ -275,11 +313,14 @@ fn op_apply(req: &Value) -> Value {
     })
 }
 
-fn op_release() -> Value {
+fn op_release(req: &Value) -> Value {
+    let owner = session_owner(req);
     locked(|st| {
-        if st.refcount > 1 {
-            st.refcount -= 1;
-            return json!({"ok": true, "restored": false, "message": format!("{} game(s) still running", st.refcount)});
+        if st.refcount() > 1 {
+            // This game's own session if it can be identified, else the oldest.
+            let i = st.sessions.iter().position(|s| owner.0.is_some() && *s == owner).unwrap_or(0);
+            st.sessions.remove(i);
+            return json!({"ok": true, "restored": false, "message": format!("{} game(s) still running", st.refcount())});
         }
         let r = restore_entries(st, None);
         let ok = r["errors"].as_array().map_or(true, |a| a.is_empty());
@@ -305,6 +346,20 @@ fn op_restore(req: &Value) -> Value {
 fn proc_ruid(pid: i32) -> Option<u32> {
     let s = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     s.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace().next()?.parse().ok()
+}
+
+/// Owner of a game session: `owner_pid` from the request (lpm-gamemode sends
+/// the process that lives as long as the game), accepted only if it belongs to
+/// the user pkexec authenticated. Anything else is an untracked session, which
+/// behaves exactly like the old plain refcount.
+fn session_owner(req: &Value) -> (Option<i32>, Option<u64>) {
+    let Some(pid) = req["owner_pid"].as_i64().and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 1) else { return (None, None) };
+    let caller = match std::env::var("PKEXEC_UID") {
+        Ok(v) => match v.parse::<u32>() { Ok(u) => Some(u), Err(_) => return (None, None) },
+        Err(_) => None, // run by root directly (tests, scripts)
+    };
+    if let Some(uid) = caller { if proc_ruid(pid) != Some(uid) { return (None, None); } }
+    match proc_start_time(pid) { Some(t) => (Some(pid), Some(t)), None => (None, None) }
 }
 
 fn op_boost(req: &Value) -> Value {
@@ -401,7 +456,9 @@ fn run() -> Value {
     if !is_root() { return json!({"ok": false, "error": format!("'{op}' needs root (run through pkexec)")}); }
     match op {
         "apply" => op_apply(&req),
-        "release" => op_release(),
+        "release" => op_release(&req),
+        // Ends game sessions whose launcher died (pruning runs in every locked op).
+        "prune" => locked(|_| json!({"ok": true})),
         "restore" | "restore_keys" => op_restore(&req),
         "boost" => op_boost(&req),
         "set_boot" => op_set_boot(&req),

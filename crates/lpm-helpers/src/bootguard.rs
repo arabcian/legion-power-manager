@@ -11,7 +11,8 @@
 //!
 //! State (root-owned, world-readable so the GUI can show it):
 //!   /var/lib/legion-power-manager/boot-guard.json
-//!   {"boot_id", "state": "armed"|"ok"|"paused", "tripped": bool, "reason", "tripped_at"}
+//!   {"boot_id", "state": "armed"|"ok"|"paused", "tripped": bool, "reason", "tripped_at",
+//!    "clean_shutdown": boot id of the last boot that shut down cleanly}
 
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +88,20 @@ pub fn disarm() -> Result<(), String> {
         write(&v)?;
     }
     Ok(())
+}
+
+/// Clean shutdown / reboot (OpenRC `stop`, systemd SIGTERM to `watch`):
+/// disarms if still armed and records this boot id as having ended cleanly.
+/// The GUI's login guard reads `clean_shutdown` so that a normal reboot soon
+/// after login is not mistaken for a crash.
+pub fn shutdown() -> Result<(), String> {
+    let mut v = read();
+    let cur = boot_id();
+    if cur.is_empty() { return Err("no boot_id".into()); }
+    if v["boot_id"] == json!(cur) && v["state"] == "armed" { v["state"] = json!("ok"); }
+    if v["boot_id"].is_null() { v["boot_id"] = json!(cur); }
+    v["clean_shutdown"] = json!(cur);
+    write(&v)
 }
 
 /// User resumed the presets (GUI "Resume" / `lpm-boot-guard reset`).

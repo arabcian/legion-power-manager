@@ -119,31 +119,26 @@ fn sysfs_write(attr: &str, value: i64) -> Result<(), String> {
 
 fn acpi_available() -> bool { Path::new(ACPI_CALL).exists() }
 
-fn modprobe_acpi_call() {
-    for p in ["/sbin/modprobe", "/usr/sbin/modprobe", "/usr/bin/modprobe", "/bin/modprobe"] {
-        if Path::new(p).is_file() {
-            let _ = std::process::Command::new(p).arg("acpi_call").env_clear()
-                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-            return;
-        }
-    }
-}
+fn modprobe_acpi_call() { crate::modprobe("acpi_call"); }
 
 /// One acpi_call transaction. The module keeps a single global result
 /// buffer: two concurrent callers (the GUI's status poll and an apply, or a
 /// second tool) can read each other's result. The write→read pair is
 /// therefore done under an exclusive flock on the proc file, and the reply
 /// is bounded (the module's buffer is small; a runaway read never grows).
-fn acpi_raw(expr: &str) -> Result<String, String> {
+pub(crate) fn acpi_raw(expr: &str) -> Result<String, String> {
     use std::io::{Read, Write};
-    const MAX_REPLY: u64 = 64 * 1024;
+    const MAX_REPLY: u64 = 4096;
     let mut f = OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC).open(ACPI_CALL)
         .map_err(|e| format!("{ACPI_CALL}: {e}"))?;
     let _lock = crate::FdLock::exclusive(&f).map_err(|e| format!("{ACPI_CALL} lock: {e}"))?;
     f.write_all(expr.as_bytes()).map_err(|e| format!("acpi_call write: {e}"))?;
-    let mut raw = Vec::new();
-    (&mut f).take(MAX_REPLY).read_to_end(&mut raw).map_err(|e| format!("acpi_call read: {e}"))?;
+    // One large read(): acpi_call clears its result after the first read, and
+    // read_to_end's small probe read loses any reply longer than the probe
+    // (buffers such as WQA6 came back empty; short integers happened to fit).
+    let mut raw = vec![0u8; MAX_REPLY as usize];
+    let n = f.read(&mut raw).map_err(|e| format!("acpi_call read: {e}"))?;
+    raw.truncate(n);
     let out = String::from_utf8_lossy(&raw);
     let out = out.trim_matches(char::from(0)).trim().to_owned();
     if out.starts_with("Error") { return Err(format!("acpi_call: {out}")); }
@@ -171,20 +166,27 @@ fn wmae_set(id: u32, value: i64) -> Result<(), String> {
 
 // ── GPU mode (MUX) ──────────────────────────────────────────────────────────
 //
-// From the DSDT of BIOS N20 (WinSMCN20WW), \_SB.GZFD.WMAA = the GameZone WMI
-// interface 887B54E3-DDDC-4B2C-8B88-68A26A8835D0 (what Legion Space calls):
-//   0x28 IsSupportGSync  → 2 on this machine
+// \_SB.GZFD.WMAA = GameZone WMI interface 887B54E3-DDDC-4B2C-8B88-68A26A8835D0.
+// From the DSDT of SMCN19WW (and 20WW):
+//   0x28 IsSupportGSync  → constant 2
 //   0x29 GetGSyncStatus  → EC MSMF bit: 1 = dGPU direct (MUX to NVIDIA), 0 = hybrid
-//   0x2A SetGSyncStatus  → SMI 0xCA via port 0xB0, sub-command 0x26 (1) / 0x25 (0)
-// The firmware switches the MUX at the next boot. What runs *now* is visible
-// on the PCI bus: in dGPU mode the AMD iGPU is hidden.
-// WMAE feature 0x00210000 (EC GMDM, 3 states) is reported read-only: its
-// meaning lives in EC firmware and is not verified yet.
+//   0x2A SetGSyncStatus  → only queues SMI 0xCA sub-command 0x26 (1) / 0x25 (0) and
+//                          returns 0; MSMF is NOT touched.
+// Verified on the 16AFR10H: the SMI request does switch the MUX at the next boot,
+// but MSMF keeps describing the *running* mode until then. The firmware exposes
+// no readable "pending" value, so the requested mode is remembered here
+// (root-owned, tagged with the boot id) and reported as next_boot until the
+// reboot happens. Reading MSMF back right after the set — as before — always
+// looked like a failure, and the GUI reverted to the running mode.
+// WMAE 0x00210000 (EC GMDM) does not select the MUX (tested: GMDM=1 + reboot
+// left dGPU mode); it is only reported, raw.
 
 const GZ_GSYNC_SUPPORTED: u8 = 0x28;
 const GZ_GSYNC_GET: u8 = 0x29;
 const GZ_GSYNC_SET: u8 = 0x2A;
 const FEAT_GMDM: u32 = 0x0021_0000;
+const PENDING_DIR: &str = "/var/lib/legion-power-manager";
+const PENDING_FILE: &str = "/var/lib/legion-power-manager/gpu-mode-pending.json";
 
 fn wmaa(method: u8, arg: u64) -> Result<u64, String> {
     let out = acpi_raw(&format!("\\_SB.GZFD.WMAA 0x0 0x{method:x} 0x{arg:x}"))?;
@@ -201,28 +203,40 @@ fn amd_igpu_present() -> bool {
 
 fn mode_name(dgpu: bool) -> &'static str { if dgpu { "dgpu" } else { "hybrid" } }
 
+/// Running mode: the PCI bus is authoritative (the iGPU is hidden in dGPU
+/// mode); MSMF only when the bus cannot tell.
+fn active_is_dgpu() -> bool { !amd_igpu_present() }
+
+/// Mode requested for the next boot during *this* boot, if any.
+fn pending_request() -> Option<bool> {
+    let v: Value = serde_json::from_str(&crate::read_root_file(PENDING_FILE, 4096)?).ok()?;
+    if v["boot_id"].as_str()? != crate::bootguard::boot_id() { return None; }  // a reboot happened: done
+    match v["mode"].as_str()? { "dgpu" => Some(true), "hybrid" => Some(false), _ => None }
+}
+
 pub fn gpu_mode_status() -> Value {
     if !acpi_available() { modprobe_acpi_call(); }
+    let active_dgpu = active_is_dgpu();
     if !acpi_available() {
-        return json!({"ok": false, "error": "acpi_call is not loaded (modprobe acpi_call)", "active": mode_name(!amd_igpu_present())});
+        return json!({"ok": false, "error": "acpi_call is not loaded (modprobe acpi_call)", "active": mode_name(active_dgpu)});
     }
     let supported = wmaa(GZ_GSYNC_SUPPORTED, 0).map(|v| v != 0).unwrap_or(false);
-    let active_dgpu = !amd_igpu_present();
-    let next = wmaa(GZ_GSYNC_GET, 0).ok().map(|v| v == 1);
+    let next = pending_request().unwrap_or(active_dgpu);
     json!({
         "ok": true,
         "supported": supported,
         "active": mode_name(active_dgpu),
-        "next_boot": next.map(mode_name),
-        "reboot_pending": next.map_or(false, |n| n != active_dgpu),
+        "next_boot": mode_name(next),
+        "reboot_pending": next != active_dgpu,
         "amdgpu_driver": crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu"),
+        "msmf": wmaa(GZ_GSYNC_GET, 0).ok(),
         "gmdm_raw": wmae_get(FEAT_GMDM).ok(),
     })
 }
 
 /// `mode`: "hybrid" | "dgpu". Hybrid puts the internal panel on the iGPU, so
 /// it is refused when the running kernel has no amdgpu driver (black screen
-/// at the next boot) unless `force` is set.
+/// at the next boot) unless `force` is set. Takes effect at the next boot.
 pub fn set_gpu_mode(mode: &str, force: bool) -> Value {
     let dgpu = match mode { "dgpu" => true, "hybrid" => false, _ => return json!({"ok": false, "error": "mode must be 'hybrid' or 'dgpu'"}) };
     if !acpi_available() { modprobe_acpi_call(); }
@@ -234,13 +248,20 @@ pub fn set_gpu_mode(mode: &str, force: bool) -> Value {
         return json!({"ok": false, "needs_force": true,
             "error": "this kernel has no amdgpu driver: in hybrid mode the internal display is driven by the AMD iGPU and would stay black. Build amdgpu (CONFIG_DRM_AMDGPU) first."});
     }
-    if let Err(e) = wmaa(GZ_GSYNC_SET, dgpu as u64) { return json!({"ok": false, "error": e}); }
-    let next = wmaa(GZ_GSYNC_GET, 0).ok().map(|v| v == 1);
-    if next != Some(dgpu) {
-        return json!({"ok": false, "error": "the firmware did not take the new mode (read-back differs)", "next_boot": next.map(mode_name)});
+    match wmaa(GZ_GSYNC_SET, dgpu as u64) {
+        Ok(0) => {}
+        Ok(v) => return json!({"ok": false, "error": format!("the firmware rejected the request (SetGSyncStatus returned {v})")}),
+        Err(e) => return json!({"ok": false, "error": e}),
     }
-    let active_dgpu = !amd_igpu_present();
-    json!({"ok": true, "active": mode_name(active_dgpu), "next_boot": mode_name(dgpu), "reboot_pending": dgpu != active_dgpu})
+    // Remember the request: the firmware has no readable pending state.
+    let rec = json!({"mode": mode_name(dgpu), "boot_id": crate::bootguard::boot_id()});
+    let saved = crate::secure_dir(PENDING_DIR)
+        .and_then(|_| crate::write_root_file(PENDING_FILE, rec.to_string().as_bytes()));
+    let active_dgpu = active_is_dgpu();
+    let mut out = json!({"ok": true, "active": mode_name(active_dgpu), "next_boot": mode_name(dgpu),
+                         "reboot_pending": dgpu != active_dgpu});
+    if let Err(e) = saved { out["note"] = json!(format!("requested, but the pending state could not be recorded ({e}); the menu may show the running mode until reboot")); }
+    out
 }
 
 // ── platform profile ────────────────────────────────────────────────────────
@@ -331,7 +352,11 @@ pub fn status(want_envelope: bool) -> Value {
         if !f.via_acpi && f.id != 0 && sys.is_some() && acpi_available() {
             if let Ok(w) = wmae_get(f.id) { o["wmae"] = json!(w); }
         }
-        match read_value(f) {
+        // Same channel rule as read_value(), reusing the sysfs read above.
+        let value = if f.via_acpi || (f.id != 0 && sys.is_none()) { wmae_get(f.id) } else {
+            sys.as_ref().map(|r| r.cur).ok_or_else(|| format!("{}: not present", f.attr))
+        };
+        match value {
             Ok(v) => { o["value"] = json!(v); }
             Err(e) => { o["error"] = json!(e); }
         }
@@ -375,6 +400,13 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
                 // something absurd to the EC. cTGP is left wide on purpose.
                 let cap = if f.key == "ctgp" { CTGP_SANITY_MAX } else { f.hi };
                 if v < f.lo || v > cap { return Err(format!("{} must be {}..{cap} {}", f.label, f.lo, f.unit)); }
+            } else {
+                // Same check sysfs_write() does at write time, done here too so
+                // a bad sysfs value rejects the whole request before any WMAE
+                // knob (sorted earlier, e.g. ctgp before spl) has been written.
+                let r = sysfs_read(f.attr).ok_or_else(|| format!("{}: attribute not present", f.attr))?;
+                let (lo, hi) = if r.ranged { (r.min, r.max) } else { (f.lo, f.hi) };
+                if v < lo || v > hi { return Err(format!("{}: {v} outside {lo}..{hi} {}", f.label, f.unit)); }
             }
             Ok((f, v))
         })();
@@ -466,8 +498,21 @@ pub fn set_panel_od(on: bool) -> Value {
     }
 }
 
-pub fn set_igpu_mode(mode: u64) -> Value {
+pub fn set_igpu_mode(mode: u64, force: bool) -> Value {
     if mode > 2 { return json!({"ok": false, "error": "mode must be 0 (default), 1 (iGPU only) or 2 (auto)"}); }
+    // iGPU-only cuts the dGPU off. In dGPU (MUX direct) mode the panel hangs on
+    // the dGPU, and without amdgpu nothing can drive it: a black screen either
+    // way. Same guard as set_gpu_mode, overridable with force.
+    if mode == 1 && !force {
+        if !amd_igpu_present() {
+            return json!({"ok": false, "needs_force": true,
+                "error": "the machine is running in dGPU (MUX direct) mode: the display is on the NVIDIA GPU, and \"iGPU only\" would cut it off. Switch the GPU mode to hybrid and reboot first."});
+        }
+        if !crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu") {
+            return json!({"ok": false, "needs_force": true,
+                "error": "this kernel has no amdgpu driver: with the dGPU cut off nothing could drive the display."});
+        }
+    }
     if !acpi_available() { modprobe_acpi_call(); }
     match wmaa(0x3F, 0) {
         Ok(3) => {}
@@ -510,4 +555,91 @@ pub fn fan_fullspeed_set(on: bool) -> Result<bool, String> {
     let now = fan_fullspeed_get()?;
     if now != on { return Err(format!("EC kept full speed {} after the write", if now { "on" } else { "off" })); }
     Ok(now)
+}
+
+// ── Simple on/off WMAE features (names from LLT's CapabilityID) ─────────────
+// Only 0/1 features whose setters are plain EC bits (+ SMI for Instant Boot).
+pub const WMAE_TOGGLES: &[(&str, u32)] = &[
+    ("instant_boot_ac", 0x0301_0001),    // power on when AC is plugged in
+    ("instant_boot_usbpd", 0x0301_0002), // power on from a USB-PD charger
+    ("fnq_custom", 0x0010_0000),         // Custom mode in the Fn+Q cycle
+];
+
+/// {"ok":true,"toggles":{key:bool}} — only features whose getter answers 0/1.
+pub fn wmae_toggles_get() -> Value {
+    if !acpi_available() { modprobe_acpi_call(); }
+    if !acpi_available() { return json!({"ok": false, "error": "acpi_call is not loaded"}); }
+    let mut m = serde_json::Map::new();
+    for (k, id) in WMAE_TOGGLES {
+        if let Ok(v @ (0 | 1)) = wmae_get(*id) { m.insert((*k).into(), json!(v == 1)); }
+    }
+    json!({"ok": true, "toggles": m})
+}
+
+pub fn wmae_toggle_set(key: &str, on: bool) -> Value {
+    let Some(&(_, id)) = WMAE_TOGGLES.iter().find(|(k, _)| *k == key) else {
+        return json!({"ok": false, "error": format!("unknown toggle '{key}'")});
+    };
+    if !acpi_available() { modprobe_acpi_call(); }
+    match wmae_get(id) { Ok(0 | 1) => {}, Ok(v) => return json!({"ok": false, "error": format!("{key}: unsupported (getter {v})")}), Err(e) => return json!({"ok": false, "error": e}) }
+    if let Err(e) = wmae_set(id, on as i64) { return json!({"ok": false, "error": e}); }
+    match wmae_get(id) {
+        Ok(v) if (v == 1) == on => json!({"ok": true, "key": key, "on": on}),
+        Ok(v) => json!({"ok": false, "error": format!("{key}: read-back {v}")}),
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+// ── Firmware CPU OC (PBO scalar, boost override, all-core CO) ───────────────
+// LENOVO_CPU_METHOD CPU_Set_OC_Data = \_SB.GZFD.WMAC 0x0E {u32 mode, u32 TuneID,
+// u32 value}; value is a plain integer, CO sign-magnitude (bit31 = negative).
+// Current/min/max come from WQA6(0..2) as IEEE floats at +0x0C/+0x10/+0x14.
+// Verified on the 16AFR10H: the store is the BIOS's own (PBO 5 set in setup
+// reads back 5.0); values take effect at the next boot. GameZone WMAA 0x38
+// GetBIOSOCMode: 0 = OC off in setup (values ignored).
+const OC_TUNES: &[(&str, u32)] = &[("pbo_scalar", 0x414D_4401), ("boost_mhz", 0x414D_4402), ("curve_optimizer", 0x414D_4403)];
+
+fn parse_buf(s: &str) -> Vec<u8> {
+    s.trim_matches(|c| c == '{' || c == '}').split(',').filter_map(|t| parse_u64(t.trim()).map(|v| v as u8)).collect()
+}
+fn f32_at(b: &[u8], o: usize) -> Option<f32> { b.get(o..o + 4).map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]])) }
+
+pub fn fw_oc_status() -> Value {
+    if !acpi_available() { modprobe_acpi_call(); }
+    if !acpi_available() { return json!({"ok": false, "error": "acpi_call is not loaded"}); }
+    let mode = wmaa(0x38, 0).ok();
+    let mut tunes = serde_json::Map::new();
+    let mut why = Vec::new();
+    for (i, (k, id)) in OC_TUNES.iter().enumerate() {
+        let raw = match acpi_raw(&format!("\\_SB.GZFD.WQA6 0x{i:x}")) { Ok(r) => r, Err(e) => { why.push(format!("{k}: {e}")); continue } };
+        let b = parse_buf(&raw);
+        if b.len() < 0x18 || u32::from_le_bytes([b[4], b[5], b[6], b[7]]) != *id {
+            why.push(format!("{k}: unexpected reply '{}'", raw.chars().take(60).collect::<String>()));
+            continue;
+        }
+        let (cur, min, max) = (f32_at(&b, 0x0C).unwrap(), f32_at(&b, 0x10).unwrap(), f32_at(&b, 0x14).unwrap());
+        let cur = if cur == 0.0 { 0.0 } else { cur }; // -0.0 = CO off
+        tunes.insert((*k).into(), json!({"value": cur.round() as i64, "min": min.round() as i64, "max": max.round() as i64}));
+    }
+    if tunes.is_empty() { return json!({"ok": false, "error": format!("firmware has no CPU OC tunes (WQA6): {}", why.join("; "))}); }
+    json!({"ok": true, "bios_oc_mode": mode, "tunes": tunes})
+}
+
+pub fn set_fw_oc(key: &str, value: i64) -> Value {
+    let Some(&(_, id)) = OC_TUNES.iter().find(|(k, _)| *k == key) else { return json!({"ok": false, "error": format!("unknown tune '{key}'")}) };
+    let st = fw_oc_status();
+    let Some(t) = st.get("tunes").and_then(|t| t.get(key)) else { return json!({"ok": false, "error": format!("{key} not reported by firmware")}) };
+    let (lo, hi) = (t["min"].as_i64().unwrap_or(0), t["max"].as_i64().unwrap_or(0));
+    if value < lo || value > hi { return json!({"ok": false, "error": format!("{key}: {value} outside {lo}..{hi}")}); }
+    let raw: u32 = if value < 0 { 0x8000_0000 | value.unsigned_abs() as u32 } else { value as u32 };
+    let mut b = Vec::with_capacity(12);
+    b.extend_from_slice(&0x11u32.to_le_bytes());
+    b.extend_from_slice(&id.to_le_bytes());
+    b.extend_from_slice(&raw.to_le_bytes());
+    let hex: String = b.iter().map(|x| format!("{x:02X}")).collect();
+    if let Err(e) = acpi_raw(&format!("\\_SB.GZFD.WMAC 0x0 0x0E b{hex}")) { return json!({"ok": false, "error": e}); }
+    let now = fw_oc_status();
+    let got = now.get("tunes").and_then(|t| t.get(key)).and_then(|t| t["value"].as_i64());
+    if got != Some(value) { return json!({"ok": false, "error": format!("{key}: read-back {got:?}")}); }
+    json!({"ok": true, "key": key, "value": value, "reboot_required": true})
 }

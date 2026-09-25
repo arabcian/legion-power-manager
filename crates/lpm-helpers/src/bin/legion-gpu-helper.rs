@@ -2,9 +2,11 @@
 //!   {"op": "status"}                      add "envelope": true for nvidia-smi's power range (wakes the dGPU)
 //!   {"op": "apply", "values": {"ctgp": 140, "boost_up": 25, ...}}
 //!   {"op": "panel_extras"}   Over Drive + iGPU-mode state (only what the firmware supports)
-//!   {"op": "set_panel_od", "on": bool}   {"op": "set_igpu_mode", "mode": 0|1|2}
+//!   {"op": "set_panel_od", "on": bool}   {"op": "set_igpu_mode", "mode": 0|1|2}  (guarded; force → legion-firmware-helper)
 //!   {"op": "gpu_mode"}                     MUX state: active now / next boot
-//!   {"op": "set_gpu_mode", "mode": "hybrid"|"dgpu", "force": false}   takes effect at the next boot
+//!   {"op": "fw_oc"}                        firmware CPU OC values (read-only)
+//! Writes that persist in firmware (set_gpu_mode, set_fw_oc, forced set_igpu_mode)
+//! live in legion-firmware-helper, which always asks for the administrator password.
 use lpm_helpers::legion_wmi;
 use lpm_helpers::*;
 use serde_json::{json, Value};
@@ -19,12 +21,21 @@ fn run() -> Value {
             None => json!({"ok": false, "error": "apply needs a 'values' object"}),
         },
         Some("gpu_mode") => legion_wmi::gpu_mode_status(),
+        Some("fw_oc") => legion_wmi::fw_oc_status(),
         Some("panel_extras") => legion_wmi::panel_extras(),
         Some("set_panel_od") => legion_wmi::set_panel_od(o.get("on").and_then(Value::as_bool).unwrap_or(false)),
-        Some("set_igpu_mode") => legion_wmi::set_igpu_mode(o.get("mode").and_then(Value::as_u64).unwrap_or(99)),
-        Some("set_gpu_mode") => legion_wmi::set_gpu_mode(o.get("mode").and_then(Value::as_str).unwrap_or(""),
-                                                         o.get("force").and_then(Value::as_bool).unwrap_or(false)),
+        // The guarded path only: the forced override (black-screen risk) needs
+        // the password and goes through legion-firmware-helper.
+        Some("set_igpu_mode") if o.get("force").and_then(Value::as_bool).unwrap_or(false) => moved("set_igpu_mode with force"),
+        Some("set_igpu_mode") => legion_wmi::set_igpu_mode(o.get("mode").and_then(Value::as_u64).unwrap_or(99), false),
+        Some(op @ ("set_gpu_mode" | "set_fw_oc")) => moved(op),
         other => json!({"ok": false, "error": format!("unknown op: {}", other.unwrap_or("None"))}),
     }
 }
+/// Firmware-persistent operations moved to legion-firmware-helper (always
+/// password-protected); refused here so they have no silent path.
+fn moved(op: &str) -> Value {
+    json!({"ok": false, "error": format!("{op} is handled by legion-firmware-helper (administrator password required)")})
+}
+
 fn main() { init(); std::process::exit(finish(run())); }

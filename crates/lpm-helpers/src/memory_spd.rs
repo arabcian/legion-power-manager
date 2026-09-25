@@ -11,17 +11,7 @@ use std::path::Path;
 
 const DRV: &str = "/sys/bus/i2c/drivers/spd5118";
 
-fn modprobe(m: &str) {
-    for p in ["/sbin/modprobe", "/usr/sbin/modprobe", "/usr/bin/modprobe", "/bin/modprobe"] {
-        if Path::new(p).is_file() {
-            let _ = std::process::Command::new(p).arg(m).env_clear()
-                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()).status();
-            return;
-        }
-    }
-}
+fn modprobe(m: &str) { crate::modprobe(m); }
 
 fn maker(bank: u8, id: u8) -> &'static str {
     match ((bank & 0x7F) as u16) << 8 | id as u16 {
@@ -45,7 +35,8 @@ fn cycles(t_ps: u32, tck_ps: u32) -> u32 {
 }
 
 pub fn decode(b: &[u8]) -> Result<Value, String> {
-    if b.len() < 551 { return Err(format!("SPD too short ({} bytes)", b.len())); }
+    // Highest byte used below is 553 (DRAM manufacturer ID).
+    if b.len() < 554 { return Err(format!("SPD too short ({} bytes)", b.len())); }
     if b[2] != 0x12 { return Err(format!("not DDR5 SPD (type byte {:#04x})", b[2])); }
     let w = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u32;
     let tck = w(20);
@@ -144,13 +135,22 @@ const UMC_FIELDS: &[(&str, u32, u32, u32)] = &[
     ("tRFC1", 0x260, 0, 11), ("tRFC2", 0x260, 16, 11),
 ];
 
+/// One SMN read: address write + value read on ONE descriptor under an
+/// exclusive flock. ryzen_smu keeps the SMN address in a single driver-global
+/// slot, so two unsynchronised readers (two helper calls, a monitor) could read
+/// each other's register — and aod_verify trusts these values before an EFI write.
 fn smn_read(addr: u32) -> Result<u32, String> {
-    use std::io::{Read, Write};
-    fs::OpenOptions::new().write(true).open(SMN)
-        .and_then(|mut f| f.write_all(&addr.to_le_bytes()))
-        .map_err(|e| format!("smn write: {e}"))?;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let f = fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC).open(SMN)
+        .map_err(|e| format!("smn open: {e}"))?;
+    let _lock = crate::FdLock::exclusive(&f).map_err(|e| format!("smn lock: {e}"))?;
+    if f.write_at(&addr.to_le_bytes(), 0).map_err(|e| format!("smn write: {e}"))? != 4 {
+        return Err("smn write: short write".into());
+    }
     let mut b = [0u8; 4];
-    fs::File::open(SMN).and_then(|mut f| f.read_exact(&mut b)).map_err(|e| format!("smn read: {e}"))?;
+    if f.read_at(&mut b, 0).map_err(|e| format!("smn read: {e}"))? != 4 {
+        return Err("smn read: short read".into());
+    }
     Ok(u32::from_le_bytes(b))
 }
 
@@ -325,7 +325,8 @@ pub fn aod_get() -> Value {
         let (mode, v) = rec(&b, i);
         json!({"name": n, "manual": mode == 1, "value": v, "min": lo, "max": hi})
     }).collect();
-    json!({"ok": true, "editable": true, "speed_mts": rec(&b, 0).1, "fields": fields, "protected": protection()})
+    json!({"ok": true, "editable": true, "speed_mts": rec(&b, 0).1, "fields": fields, "protected": protection(),
+           "backup": latest_backup().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))})
 }
 
 fn set_immutable(path: &str, on: bool) -> Result<(), String> {
@@ -340,6 +341,53 @@ fn set_immutable(path: &str, on: bool) -> Result<(), String> {
         flags = if on { flags | IMM } else { flags & !IMM };
         if libc::ioctl(f.as_raw_fd(), SET as _, &flags) != 0 { return Err("FS_IOC_SETFLAGS failed".into()); }
     }
+    Ok(())
+}
+
+/// Backups: AodSetupRpl-<secs>-<nanos>.bin (+ .json with the BIOS version).
+fn backup_files() -> Vec<std::path::PathBuf> {
+    let mut v: Vec<_> = fs::read_dir(BACKUP_DIR).into_iter().flatten().flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str())
+            .map_or(false, |n| n.starts_with("AodSetupRpl-") && n.ends_with(".bin") && !n.contains(".prerestore")))
+        .filter(|p| fs::symlink_metadata(p).map_or(false, |m| m.is_file() && m.len() == AOD_SIZE as u64))
+        .collect();
+    // Names sort by time: seconds are zero-padded in new names; old names
+    // (AodSetupRpl-<secs>.bin) have the same digit count until 2286.
+    v.sort();
+    v
+}
+
+fn latest_backup() -> Option<std::path::PathBuf> { backup_files().pop() }
+
+/// Saves `data` as a new, never-overwritten backup, synced to disk before the
+/// caller touches the variable (the machine may not boot again afterwards).
+fn save_backup(data: &[u8], tag: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    crate::secure_dir(BACKUP_DIR)?;
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let stem = format!("{BACKUP_DIR}/AodSetupRpl-{:010}-{:09}", t.as_secs(), t.subsec_nanos());
+    let bin = format!("{stem}{tag}.bin");
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&bin).map_err(|e| format!("backup {bin}: {e}"))?;
+    f.write_all(data).and_then(|_| f.sync_all()).map_err(|e| format!("backup {bin}: {e}"))?;
+    let meta = json!({"bios_version": dmi("bios_version"), "product": dmi("product_version")});
+    crate::write_root_file(&format!("{stem}{tag}.json"), meta.to_string().as_bytes())?;
+    Ok(bin)
+}
+
+/// Writes the whole variable (attributes + data), clearing and restoring the
+/// immutable flag efivarfs puts on it, then reads it back.
+fn aod_write(b: &[u8], backup: &str) -> Result<(), String> {
+    set_immutable(AOD_VAR, false)?;
+    let w = fs::OpenOptions::new().write(true).open(AOD_VAR)
+        .and_then(|mut f| { use std::io::Write; f.write_all(b) });
+    let _ = set_immutable(AOD_VAR, true);
+    w.map_err(|e| if e.raw_os_error() == Some(libc::EROFS) || e.raw_os_error() == Some(libc::EPERM) {
+        "the firmware refused the write: AMD Variable Protection is on. Disable it in the BIOS \
+         (advanced menu) and try again — it cannot be turned off from the OS. Nothing changed.".to_string()
+    } else { format!("writing AodSetupRpl failed ({e}); nothing changed, backup at {backup}") })?;
+    if aod_load()? != b { return Err(format!("read-back differs; backup at {backup}")); }
     Ok(())
 }
 
@@ -361,22 +409,50 @@ pub fn aod_set(values: Option<&Value>) -> Value {
         }
         let g = |n: &str| AOD_FIELDS.iter().find(|f| f.0 == n).map(|f| rec(&b, f.1).1).unwrap_or(0);
         if g("tRC") < g("tRAS") + g("tRP") { return Err("tRC must be ≥ tRAS + tRP".into()); }
+        // Refresh ordering, only between records that are actually in use
+        // (manual); an Auto record's stored number is not what the BIOS runs.
+        let manual = |n: &str| AOD_FIELDS.iter().find(|f| f.0 == n).map_or(false, |f| rec(&b, f.1).0 == 1);
+        for (hi, lo) in [("tRFC1", "tRFC2"), ("tRFC2", "tRFCsb"), ("tRFC1", "tRFCsb")] {
+            if manual(hi) && manual(lo) && g(hi) < g(lo) { return Err(format!("{hi} must be ≥ {lo}")); }
+        }
         if b == orig { return Ok(json!({"ok": true, "changed": false})); }
-        // Backup the current variable (with attributes) before touching it.
-        fs::create_dir_all(BACKUP_DIR).map_err(|e| format!("{BACKUP_DIR}: {e}"))?;
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let backup = format!("{BACKUP_DIR}/AodSetupRpl-{ts}.bin");
-        fs::write(&backup, &orig).map_err(|e| format!("backup: {e}"))?;
-        set_immutable(AOD_VAR, false)?;
-        let w = fs::OpenOptions::new().write(true).open(AOD_VAR)
-            .and_then(|mut f| { use std::io::Write; f.write_all(&b) });
-        let _ = set_immutable(AOD_VAR, true);
-        w.map_err(|e| if e.raw_os_error() == Some(libc::EROFS) || e.raw_os_error() == Some(libc::EPERM) {
-            "the firmware refused the write: AMD Variable Protection is on. Disable it in the BIOS \
-             (advanced menu) and try again — it cannot be turned off from the OS. Nothing changed.".to_string()
-        } else { format!("writing AodSetupRpl failed ({e}); nothing changed, backup at {backup}") })?;
-        if aod_load()? != b { return Err(format!("read-back differs; backup at {backup}")); }
+        let backup = save_backup(&orig, "")?;
+        aod_write(&b, &backup)?;
         Ok(json!({"ok": true, "changed": true, "backup": backup}))
+    })();
+    res.unwrap_or_else(|e| json!({"ok": false, "error": e}))
+}
+
+/// Writes the newest backup back (the variable as it was before the last
+/// edit). The current variable is backed up first, so this is reversible too.
+pub fn aod_restore() -> Value {
+    let res = (|| -> Result<Value, String> {
+        aod_supported()?;
+        let src = latest_backup().ok_or("no backup in /var/lib/legion-power-manager")?;
+        let data = fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let cur = aod_load()?;
+        if data.len() != AOD_SIZE || data[..4] != cur[..4] {
+            return Err("the backup does not match this variable's layout/attributes; refusing".into());
+        }
+        // A backup taken under another BIOS version may use another layout.
+        let meta = fs::read_to_string(src.with_extension("json")).ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        if let Some(bios) = meta.as_ref().and_then(|m| m["bios_version"].as_str()) {
+            if bios != dmi("bios_version") {
+                return Err(format!("the backup was taken under BIOS {bios}, this is {} — refusing", dmi("bios_version")));
+            }
+        }
+        if data == cur {
+            return Ok(json!({"ok": true, "changed": false, "restored": src.display().to_string()}));
+        }
+        // Kept out of the restore chain (.prerestore): a second Restore steps
+        // further back instead of undoing the first one.
+        let backup = save_backup(&cur, ".prerestore")?;
+        aod_write(&data, &backup)?;
+        // The restored image is now current: retire it so a second restore
+        // steps back further instead of re-applying the same file.
+        let _ = fs::rename(&src, src.with_extension("bin.restored"));
+        Ok(json!({"ok": true, "changed": true, "restored": src.display().to_string(), "backup": backup}))
     })();
     res.unwrap_or_else(|e| json!({"ok": false, "error": e}))
 }
