@@ -1,4 +1,5 @@
 #include "hometab.h"
+#include "fancurvedialog.h"
 #include "scenes.h"
 #include "privileged.h"
 #include "sysinfo.h"
@@ -595,8 +596,19 @@ QGroupBox *HomeTab::buildDeviceBox() {
         maxAllBtn_ = new QPushButton("Max all fans");
         maxAllBtn_->setToolTip("Set every fan to its maximum RPM. Controls lock until you press Disable max fans.");
         connect(maxAllBtn_, &QPushButton::clicked, this, &HomeTab::setAllFansMax);
+        QPushButton *curveBtn = nullptr;
+        if (fanCurveSupported()) {
+        curveBtn = new QPushButton("Fan curve…");
+        curveBtn->setToolTip("Edit the Custom-mode fan curve the EC follows (all fans, 10 temperature steps).");
+        connect(curveBtn, &QPushButton::clicked, this, [this] {
+            const auto prof = currentProfile();
+            auto *dlg = new FanCurveDialog(helperPath(), prof.value_or(QStringLiteral("unknown")), this);
+            dlg->show();
+        });
+        }
         auto *mh = new QHBoxLayout;
         mh->addStretch(1);
+        if (curveBtn) mh->addWidget(curveBtn);
         mh->addWidget(maxAllBtn_);
         g->addLayout(mh, row++, 0, 1, 5);
     }
