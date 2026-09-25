@@ -1,4 +1,5 @@
 #include "hometab.h"
+#include <memory>
 #include "fancurvedialog.h"
 #include "memorydialog.h"
 #include "scenes.h"
@@ -503,6 +504,7 @@ QGroupBox *HomeTab::buildDeviceBox() {
             if (!r.ok()) return;
             if (r.json.value("igpu_supported").toBool() && r.json.value("igpu_mode").isDouble()) {
                 ig->setCurrentIndex(ig->findData(r.json.value("igpu_mode").toInt()));
+                ig->setProperty("applied", ig->currentIndex());
                 igLabel->show(); ig->show();
             }
             if (r.json.value("od_supported").toBool()) {
@@ -510,11 +512,26 @@ QGroupBox *HomeTab::buildDeviceBox() {
                 od->show();
             }
         });
-        connect(ig, &QComboBox::activated, this, [this, ig, gh](int i) {
-            privileged::run(gh, QJsonObject{{"op", "set_igpu_mode"}, {"mode", ig->itemData(i).toInt()}}, this,
-                            [this](const privileged::Result &r) {
-                if (!r.ok()) QMessageBox::warning(this, "iGPU mode", r.message()); });
-        });
+        // The helper refuses "iGPU only" where it would black the screen
+        // (dGPU/MUX mode, no amdgpu); the user can still insist.
+        auto setIgpu = std::make_shared<std::function<void(int, bool)>>();
+        *setIgpu = [this, ig, gh, weak = std::weak_ptr<std::function<void(int, bool)>>(setIgpu)](int i, bool force) {
+            // The forced override is a firmware-helper call: it asks for the password.
+            privileged::run(force ? privileged::helperPath(privileged::FIRMWARE_HELPER) : gh,
+                            QJsonObject{{"op", "set_igpu_mode"}, {"mode", ig->itemData(i).toInt()}, {"force", force}}, this,
+                            [this, ig, i, weak](const privileged::Result &r) {
+                if (r.ok()) { ig->setProperty("applied", i); return; }
+                ig->setCurrentIndex(ig->property("applied").toInt());
+                if (r.reached && r.json.value("needs_force").toBool()
+                    && QMessageBox::warning(this, "iGPU mode", r.message() + "\n\nApply anyway? (asks for the administrator password)",
+                                            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes) {
+                    if (auto f = weak.lock()) { ig->setCurrentIndex(i); (*f)(i, true); }
+                    return;
+                }
+                if (!r.reached || !r.json.value("needs_force").toBool()) QMessageBox::warning(this, "iGPU mode", r.message());
+            }, force ? privileged::FIRMWARE_TIMEOUT_MS : 60000);
+        };
+        connect(ig, &QComboBox::activated, this, [setIgpu](int i) { (*setIgpu)(i, false); });
         connect(od, &QCheckBox::clicked, this, [this, od, gh](bool on) {
             privileged::run(gh, QJsonObject{{"op", "set_panel_od"}, {"on", on}}, this, [this, od, on](const privileged::Result &r) {
                 if (!r.ok()) { od->setChecked(!on); QMessageBox::warning(this, "Panel Over Drive", r.message()); } });
@@ -696,6 +713,46 @@ QGroupBox *HomeTab::buildDeviceBox() {
         fanWarn_->setTextFormat(Qt::RichText);
         fanWarn_->hide();
         g->addWidget(fanWarn_, row++, 0, 1, 5);
+    }
+
+    // Lenovo WMAE on/off features (Instant Boot, Fn+Q Custom): probed through the
+    // helper, shown only for what the firmware answers.
+    {
+        auto *wrap = new QWidget;
+        auto *wl = new QHBoxLayout(wrap);
+        wl->setContentsMargins(0, 0, 0, 0);
+        wl->setSpacing(12);
+        auto *wLabel = label("Firmware");
+        wrap->hide(); wLabel->hide();
+        g->addWidget(wLabel, row, 0);
+        g->addWidget(wrap, row++, 1, 1, 4);
+        privileged::run(helperPath(), QJsonObject{{"wmae_toggle", "get"}}, this, [this, wrap, wl, wLabel](const privileged::Result &r) {
+            if (!r.ok()) return;
+            const QJsonObject t = r.json.value("toggles").toObject();
+            static const struct { const char *key, *text, *tip; } DEFS[] = {
+                {"instant_boot_ac", "Boot on AC", "Power on automatically when the charger is plugged in (lid open)."},
+                {"instant_boot_usbpd", "Boot on USB-PD", "Power on automatically from a USB-C PD charger."},
+                {"fnq_custom", "Custom in Fn+Q", "Include the Custom profile in the Fn+Q cycle."},
+            };
+            for (const auto &d : DEFS) {
+                if (!t.contains(d.key)) continue;
+                auto *cb = new QCheckBox(d.text);
+                cb->setToolTip(d.tip);
+                cb->setChecked(t.value(d.key).toBool());
+                const QString key = d.key;
+                connect(cb, &QCheckBox::clicked, this, [this, cb, key](bool on) {
+                    cb->setEnabled(false);
+                    privileged::run(helperPath(), QJsonObject{{"wmae_toggle", "set"}, {"key", key}, {"on", on}}, this,
+                                    [this, cb, key, on](const privileged::Result &r) {
+                        cb->setEnabled(true);
+                        if (!r.ok()) { QSignalBlocker b(cb); cb->setChecked(!on); showStatus(key + " failed: " + r.message(), 8000); }
+                        else showStatus(QStringLiteral("%1 → %2").arg(key, on ? "on" : "off"));
+                    });
+                });
+                wl->addWidget(cb);
+            }
+            if (wl->count()) { wl->addStretch(1); wrap->show(); wLabel->show(); }
+        });
     }
 
     if (row == 0) { delete box; return nullptr; }
@@ -1110,7 +1167,8 @@ void HomeTab::setGpuMode(const QString &mode, bool force) {
         if (QMessageBox::question(this, "GPU mode", msg) != QMessageBox::Yes) { readGpuMode(); return; }
     }
     gpuMode_->setEnabled(false);
-    privileged::run(privileged::helperPath("legion-gpu-helper"), QJsonObject{{"op", "set_gpu_mode"}, {"mode", mode}, {"force", force}}, this,
+    // A MUX change persists in firmware: legion-firmware-helper, password every time.
+    privileged::run(privileged::helperPath(privileged::FIRMWARE_HELPER), QJsonObject{{"op", "set_gpu_mode"}, {"mode", mode}, {"force", force}}, this,
                     [this, mode](const privileged::Result &r) {
         gpuMode_->setEnabled(true);
         if (r.reached && r.json.value("needs_force").toBool()) {
@@ -1120,8 +1178,10 @@ void HomeTab::setGpuMode(const QString &mode, bool force) {
             if (a == QMessageBox::Yes) setGpuMode(mode, true); else readGpuMode();
             return;
         }
-        if (!r.ok()) { showStatus("GPU mode: " + r.message(), 10000); readGpuMode(); return; }
+        // A dialog, not the 10 s status line: after a password prompt a failure
+        // that only flashes by looks as if the switch was silently ignored.
+        if (!r.ok()) { QMessageBox::warning(this, "GPU mode", "The GPU mode was not changed:\n\n" + r.message()); readGpuMode(); return; }
         showStatus(r.json.value("reboot_pending").toBool() ? "GPU mode set — reboot to switch." : "GPU mode unchanged.", 8000);
         readGpuMode();
-    }, 60000);
+    }, privileged::FIRMWARE_TIMEOUT_MS);
 }

@@ -22,6 +22,9 @@
 #include <QTabWidget>
 #include <QThread>
 #include <QTimer>
+#include <QSocketNotifier>
+#include <csignal>
+#include <fcntl.h>
 #include <cstdio>
 #include <unistd.h>
 
@@ -72,6 +75,30 @@ static void installTray(MainWindow *win, bool showWindow, int attempt = 0) {
     win->show();
 }
 
+// SIGTERM (shutdown, `kill`), SIGHUP (terminal/session gone) and SIGINT used
+// to end the process on the spot, skipping aboutToQuit: the login guard was
+// then left "applying" and the next login reported a crash that never was.
+// Self-pipe: the handler only writes a byte; the event loop does the quit.
+static int g_sigPipe[2] = {-1, -1};
+static void onQuitSignal(int) {
+    const char c = 1;
+    [[maybe_unused]] const auto n = ::write(g_sigPipe[1], &c, 1);
+}
+static void installQuitSignals(QCoreApplication &app) {
+    if (::pipe2(g_sigPipe, O_CLOEXEC | O_NONBLOCK) != 0) return;
+    auto *sn = new QSocketNotifier(g_sigPipe[0], QSocketNotifier::Read, &app);
+    QObject::connect(sn, &QSocketNotifier::activated, &app, [&app] {
+        char buf[16];
+        while (::read(g_sigPipe[0], buf, sizeof buf) > 0) {}
+        app.quit();
+    });
+    struct sigaction sa {};
+    sa.sa_handler = onQuitSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    for (int s : {SIGTERM, SIGHUP, SIGINT}) ::sigaction(s, &sa, nullptr);
+}
+
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
     app.setApplicationName("Legion Power Manager");
@@ -102,6 +129,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    installQuitSignals(app);
     theme::apply(app);
     MainWindow win;
 

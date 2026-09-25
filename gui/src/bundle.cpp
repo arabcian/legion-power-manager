@@ -155,12 +155,40 @@ void importFrom(const QString &path, QWidget *parent, std::function<void(const Q
     if (box.clickedButton() != overwrite && box.clickedButton() != keep && box.clickedButton() != go) { done({}); return; }
     const bool replace = box.clickedButton() != keep;
 
+    // Scene "command" fields are programs this app starts on its own (at
+    // login, on every AC/battery switch, from game hooks). One arriving in a
+    // file from somewhere else must be seen and accepted explicitly.
+    QStringList commands;
+    for (const Entry &e : entries)
+        if (QLatin1String(e.cat.key) == QLatin1String("scenes") && !(e.exists && !replace)) {
+            const QString c = e.obj.value("command").toString().trimmed();
+            if (!c.isEmpty()) commands << QStringLiteral("%1:  %2").arg(e.name, c);
+        }
+    bool keepCommands = true;
+    if (!commands.isEmpty()) {
+        QMessageBox cb(QMessageBox::Warning, "Import settings",
+                       QStringLiteral("%1 scene(s) in this bundle run a command when the scene is applied — "
+                                      "automatically at login, on AC/battery changes or at game start:").arg(commands.size()),
+                       QMessageBox::NoButton, parent);
+        cb.setInformativeText("Only keep them if you know exactly what they do.");
+        cb.setDetailedText(commands.join('\n'));
+        QPushButton *strip = cb.addButton("Import without commands", QMessageBox::AcceptRole);
+        QPushButton *withCmd = cb.addButton("Import with commands", QMessageBox::DestructiveRole);
+        cb.addButton(QMessageBox::Cancel);
+        cb.setDefaultButton(strip);
+        cb.exec();
+        if (cb.clickedButton() != strip && cb.clickedButton() != withCmd) { done({}); return; }
+        keepCommands = cb.clickedButton() == withCmd;
+    }
+
     int written = 0, skipped = 0, failed = 0;
     QList<Entry> nvidia;
     for (const Entry &e : entries) {
         if (e.exists && !replace) { ++skipped; continue; }
         if (e.cat.root) { nvidia.append(e); continue; }
-        writeObj(e.cat.dir + '/' + e.name + ".json", e.obj) ? ++written : ++failed;
+        QJsonObject obj = e.obj;
+        if (!keepCommands && QLatin1String(e.cat.key) == QLatin1String("scenes")) obj.remove("command");
+        writeObj(e.cat.dir + '/' + e.name + ".json", obj) ? ++written : ++failed;
     }
     for (auto [file, o] : singleWrites) {
         const bool ex = o.take("__exists").toBool();

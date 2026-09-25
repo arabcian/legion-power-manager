@@ -193,7 +193,8 @@ void MemoryDialog::openEditor() {
             "corrupt data, or damage hardware; this is not covered by warranty and you do it at your own risk.<br><br>"
             "If it does not boot: hold the power button 8–15 s to restore default overclocking settings. A backup of the "
             "variable is saved in /var/lib/legion-power-manager before every write.<br>"
-            "<b>AMD Variable Protection must be disabled in the BIOS</b>, or the change is ignored.").arg(theme::DANGER));
+            "<b>AMD Variable Protection must be disabled in the BIOS</b>, or the change is ignored.<br>"
+            "Writing asks for the administrator password every time.").arg(theme::DANGER));
         warn->setWordWrap(true);
         warn->setTextFormat(Qt::RichText);
         v->addWidget(warn);
@@ -231,19 +232,46 @@ void MemoryDialog::openEditor() {
         apply->setObjectName("btnDanger");
         apply->setEnabled(false);
         auto *cancel = new QPushButton("Cancel");
+        // Undo of the last write: puts the backup taken before it back.
+        if (const QString bk = r.json.value("backup").toString(); !bk.isEmpty()) {
+            auto *restore = new QPushButton("Restore previous…");
+            restore->setToolTip("Write back the variable as it was before the last change (" + bk + ").\n"
+                                "The current state is backed up first. Takes effect on the next boot.");
+            h->addWidget(restore);
+            connect(restore, &QPushButton::clicked, dlg, [dlg, restore, bk] {
+                if (QMessageBox::question(dlg, "Restore timings",
+                        "Write back the BIOS timing variable saved in\n" + bk + "\n\nIt takes effect on the next boot.",
+                        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+                restore->setEnabled(false);
+                privileged::run(privileged::helperPath(privileged::FIRMWARE_HELPER), QJsonObject{{"op", "aod_restore"}}, dlg,
+                                [dlg, restore](const privileged::Result &w) {
+                    if (w.ok()) {
+                        QMessageBox::information(dlg, "Restore timings", w.json.value("changed").toBool()
+                            ? QStringLiteral("Restored. Reboot to apply.")
+                            : QStringLiteral("The variable already matches that backup — nothing changed."));
+                        dlg->close();
+                    } else {
+                        QMessageBox::warning(dlg, "Restore timings", w.message());
+                        restore->setEnabled(true);
+                    }
+                }, privileged::FIRMWARE_TIMEOUT_MS);
+            });
+        }
         h->addStretch(1);
         h->addWidget(apply);
         h->addWidget(cancel);
         v->addLayout(h);
         connect(ack, &QCheckBox::toggled, apply, &QPushButton::setEnabled);
         connect(cancel, &QPushButton::clicked, dlg, &QDialog::close);
-        connect(apply, &QPushButton::clicked, dlg, [this, dlg, spins, orig, apply] {
+        connect(apply, &QPushButton::clicked, dlg, [dlg, spins, orig, apply] {
             QJsonObject vals;
             for (const auto &[n, sp] : spins)
                 if (sp->value() != orig.value(n)) vals[n] = sp->value();
             if (vals.isEmpty()) { dlg->close(); return; }
             apply->setEnabled(false);
-            privileged::run(helper_, QJsonObject{{"memory", "aod_set"}, {"values", vals}}, dlg, [dlg, apply](const privileged::Result &w) {
+            // BIOS variable write: legion-firmware-helper asks for the password every time.
+            privileged::run(privileged::helperPath(privileged::FIRMWARE_HELPER), QJsonObject{{"op", "aod_set"}, {"values", vals}}, dlg,
+                            [dlg, apply](const privileged::Result &w) {
                 if (w.ok()) {
                     QMessageBox::information(dlg, "Edit timings", w.json.value("changed").toBool()
                         ? "Written. Reboot to apply, then check the Running column.\n\nBackup: " + w.json.value("backup").toString()
@@ -253,7 +281,7 @@ void MemoryDialog::openEditor() {
                     QMessageBox::warning(dlg, "Edit timings", w.message());
                     apply->setEnabled(true);
                 }
-            });
+            }, privileged::FIRMWARE_TIMEOUT_MS);
         });
         dlg->show();
     });

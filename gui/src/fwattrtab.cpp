@@ -153,6 +153,62 @@ FwattrTab::FwattrTab(QWidget *parent) : QWidget(parent) {
     banner_->hide();
     lay->addWidget(banner_);
 
+    // Firmware CPU OC (LENOVO_CPU_METHOD via legion-gpu-helper). Same store as the
+    // BIOS setup page; applied by the firmware at the next boot.
+    {
+        auto *oc = new QGroupBox(QStringLiteral("CPU overclocking (firmware, next boot)"));
+        auto *ol = new QHBoxLayout(oc);
+        ol->setSpacing(10);
+        auto *note = new QLabel;
+        note->setProperty("role", "muted");
+        oc->hide();
+        lay->addWidget(oc);
+        privileged::run(gpuHelperPath(), QJsonObject{{"op", "fw_oc"}}, this, [this, oc, ol, note](const privileged::Result &r) {
+            if (!r.ok()) {
+                if (r.message().contains(QLatin1String("unknown"))) return;  // not a Legion / old helper
+                ol->addWidget(note); note->setWordWrap(true);
+                note->setText(QStringLiteral("Firmware OC unavailable: ") + r.message());
+                oc->show();
+                return;
+            }
+            const QJsonObject t = r.json.value("tunes").toObject();
+            const int mode = r.json.value("bios_oc_mode").toInt(-1);
+            static const struct { const char *key, *text, *tip; } DEFS[] = {
+                {"pbo_scalar", "PBO scalar", "Precision Boost Overdrive scalar (x)."},
+                {"boost_mhz", "Boost override (MHz)", "Max CPU boost clock override, added to stock fmax."},
+                {"curve_optimizer", "All-core CO", "Firmware all-core Curve Optimizer; negative = undervolt.\nRuntime per-core CO stays in the Ryzen tab."},
+            };
+            for (const auto &d : DEFS) {
+                if (!t.contains(d.key)) continue;
+                const QJsonObject v = t.value(d.key).toObject();
+                auto *lbl = new QLabel(d.text);
+                auto *sb = new QSpinBox;
+                sb->setRange(v.value("min").toInt(), v.value("max").toInt());
+                sb->setValue(v.value("value").toInt());
+                sb->setToolTip(d.tip);
+                auto *btn = new QPushButton("Set");
+                btn->setFixedWidth(46);
+                btn->setToolTip("Stored in the BIOS, applied at the next boot. Asks for the administrator password.");
+                const QString key = d.key;
+                connect(btn, &QPushButton::clicked, this, [this, sb, btn, key, note] {
+                    btn->setEnabled(false);
+                    privileged::run(privileged::helperPath(privileged::FIRMWARE_HELPER),
+                                    QJsonObject{{"op", "set_fw_oc"}, {"key", key}, {"value", sb->value()}}, this,
+                                    [btn, note, key](const privileged::Result &r) {
+                        btn->setEnabled(true);
+                        note->setText(r.ok() ? key + QStringLiteral(" saved — reboot to apply") : key + QStringLiteral(" failed: ") + r.message());
+                    }, privileged::FIRMWARE_TIMEOUT_MS);
+                });
+                ol->addWidget(lbl); ol->addWidget(sb); ol->addWidget(btn); ol->addSpacing(8);
+            }
+            ol->addStretch(1);
+            ol->addWidget(note);
+            note->setText(mode == 0 ? QStringLiteral("OC is disabled in BIOS setup — values are ignored")
+                                    : QStringLiteral("Takes effect after reboot"));
+            oc->show();
+        });
+    }
+
     auto *top = new QHBoxLayout;
     auto *src = new QLabel(BASE);
     src->setProperty("role", "muted");

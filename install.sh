@@ -68,9 +68,14 @@ if (( BUILD )); then
         gui_cmake gui/build-pgo generate
         echo ">> PGO training run (offscreen, every tab)…"
         # Private runtime dir: the single-instance lock must not see a running GUI.
+        # Private HOME/config too: the training run must not read (or write)
+        # the user's real scenes, presets and guards. The GUI itself also keeps
+        # every root helper and automatic scene off while LPM_PGO_TRAIN is set.
         rt=$(as_user mktemp -d)
-        as_user env QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$rt" LPM_PGO_TRAIN=5 \
-            timeout 180 gui/build-pgo/legion-power-manager >/dev/null 2>&1 || true
+        as_user mkdir -p "$rt/home" "$rt/run" && as_user chmod 700 "$rt/run"
+        as_user env QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$rt/run" HOME="$rt/home" \
+            XDG_CONFIG_HOME="$rt/home/.config" XDG_CACHE_HOME="$rt/home/.cache" XDG_DATA_HOME="$rt/home/.local/share" \
+            LPM_PGO_TRAIN=5 timeout 180 gui/build-pgo/legion-power-manager >/dev/null 2>&1 || true
         rm -rf "$rt"
         prof=gui/build-pgo/profile
         if compgen -G "$prof/*.profraw" >/dev/null; then    # clang
@@ -90,7 +95,7 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/lpm-boot-guard" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lpm-boot-guard" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$DESTDIR$PREFIX/bin/"
@@ -143,10 +148,12 @@ if [[ -z "$DESTDIR" ]]; then
     echo "after a boot that crashed right after applying them):"
     if [[ -d /run/systemd/system ]]; then
         systemctl daemon-reload || true
+        echo "  systemctl enable lpm-boot-guard.service     # records clean shutdowns (login-scene guard)"
         echo "  systemctl enable nvcurve-autoload.service   # GPU V/F profile"
         echo "  systemctl enable lpm-tune.service           # Optimizations boot preset"
         grep -q GenuineIntel /proc/cpuinfo && echo "  systemctl enable lpm-intel-uv.service       # Intel undervolt boot/resume profile (or lpm-intel-uv-daemon)"
     else
+        echo "  rc-update add lpm-boot-guard default     # records clean shutdowns (login-scene guard)"
         echo "  rc-update add nvcurve-autoload default   # GPU V/F profile"
         echo "  rc-update add lpm-tune boot              # Optimizations boot preset"
         grep -q GenuineIntel /proc/cpuinfo && echo "  rc-update add lpm-intel-uv boot          # Intel undervolt boot profile (or lpm-intel-uv-daemon default)"

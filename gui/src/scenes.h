@@ -111,6 +111,7 @@ private:
     void next();
     void finish();
     void pollPower();
+    void checkGameEnd();
     void applyForSource(bool onAc);
     void startupApply();
     void helper(const QString &name, const QJsonObject &req, Done done,
@@ -127,4 +128,6 @@ private:
     QTimer *powerTimer_;
     std::optional<bool> ac_, candidate_;
     int stableReads_ = 0;
+    int gameGoneReads_ = 0;
+    bool sawGameScene_ = false;
 };

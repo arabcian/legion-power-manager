@@ -1,15 +1,3 @@
-                                                            Screenshots                                                                                                                    
-                                                            
-<img width="1114" height="843" alt="Screenshot_20260925_182124" src="https://github.com/user-attachments/assets/a86a0f70-ac8d-47d9-b39a-13cc245b9414" />
-<img width="1114" height="843" alt="Screenshot_20260925_182105" src="https://github.com/user-attachments/assets/49a080e8-8ee2-476c-85df-1590b2e005b0" />
-<img width="1114" height="843" alt="Screenshot_20260925_182136" src="https://github.com/user-attachments/assets/d495d653-a22f-41e2-8c60-110e20b657dc" />
-<img width="1114" height="843" alt="Screenshot_20260925_182150" src="https://github.com/user-attachments/assets/90820436-aac8-4749-8a13-7d172afef7f1" />
-<img width="1114" height="843" alt="Screenshot_20260925_182202" src="https://github.com/user-attachments/assets/e03a8ae8-119e-4e48-b70b-fdb3297de19c" />
-<img width="1114" height="989" alt="Screenshot_20260925_182224" src="https://github.com/user-attachments/assets/a658cc1b-a93d-49b5-b4f3-22d15f381e8a" />
-<img width="1114" height="989" alt="Screenshot_20260925_182237" src="https://github.com/user-attachments/assets/fb339538-fd23-44ab-ad72-750c7f88f801" />
-<img width="1186" height="1144" alt="Screenshot_20260925_182256" src="https://github.com/user-attachments/assets/1c7f768c-563c-4428-bc13-5007da9846e5" />
-
-
 # Legion Power Manager 2 — Rust + C++/Qt6
 
 > ⚠️ **This tool writes low-level hardware and firmware settings. Read [DISCLAIMER.md](DISCLAIMER.md) before using it.**
@@ -107,7 +95,8 @@ preset from the GUI — enabling the service early is harmless.
     /usr/bin/lpm-intel-uv                            standalone Intel undervolt CLI (root)
     /usr/libexec/legion-power-manager/
         legion-profile-helper  fwattr-helper  ryzen-co-helper
-        tune-helper  intel-uv-helper                            (root:root 0755)
+        tune-helper  intel-uv-helper  legion-gpu-helper
+        legion-firmware-helper  lpm-boot-guard                  (root:root 0755)
         nvcurve-root-helper                                     (root:root 0700)
     /usr/share/polkit-1/actions/com.legion-power-manager.policy
     /etc/polkit-1/rules.d/49-legion-power-manager.rules
@@ -116,6 +105,19 @@ preset from the GUI — enabling the service early is harmless.
     /etc/init.d/lpm-tune                             OpenRC (tuning boot preset, runlevel boot)
     /usr/lib/systemd/system/nvcurve-autoload.service systemd (GPU profile)
     /usr/lib/systemd/system/lpm-tune.service         systemd (tuning boot preset)
+
+Authorization (polkit): a `wheel` member at the machine (local, active
+session) runs the everyday helpers without a password — profiles, fan table,
+firmware-attribute limits, tuning, curves, undervolt. Everyone else (SSH,
+other seats) is asked for the administrator password.
+`legion-firmware-helper` is the exception: it writes settings that persist in
+firmware and can keep the laptop from booting — BIOS memory timings
+(AodSetupRpl, including restoring a backup), BIOS CPU overclocking (PBO scalar,
+boost override, all-core CO), the GPU MUX mode, and the forced "iGPU only"
+override. Its action `com.legion-power-manager.firmware.write` asks for the
+administrator password on every use (no caching, no silent grant), so no
+program running as the user can change these unnoticed. The other helpers
+refuse these operations.
 
 Unchanged data locations: `/etc/nvcurve/{config.json,profiles/}` (GPU),
 `~/.config/ryzen-curve-optimizer/profiles/` (CPU). New: `~/.config/legion-power-manager/
@@ -457,9 +459,10 @@ Security: the tune-helper request carries only keys and values. Every path is
 derived from the table and re-checked before writing (realpath inside /sys,
 fixed `/proc/sys` files from the table, `/proc/irq/<n>/smp_affinity_list`);
 values are revalidated against live option lists and ranges. The polkit rule
-grants it without a prompt like the other helpers — any process running as
-the active user can therefore retune the kernel; tighten
-`49-legion-power-manager.rules` as described in that file if that matters.
+grants it without a prompt like the other everyday helpers — any process running
+as the active user can therefore retune the kernel (all of it reverts on reboot);
+tighten `49-legion-power-manager.rules` as described in that file if that
+matters. Firmware-persistent writes are never password-less (see Install).
 
 Dev aids: `LPM_TUNE_FAKE=/path/describe.json` renders canned data,
 `LPM_OPT_SUBTAB=N` and `LPM_OPT_LOAD=<preset>` pick the sub-tab and preset

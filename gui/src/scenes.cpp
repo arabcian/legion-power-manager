@@ -18,6 +18,11 @@
 #include <QStandardPaths>
 #include <QCoreApplication>
 #include <QTimer>
+#include <QGuiApplication>
+#include <QSessionManager>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace scenes {
 
@@ -167,9 +172,54 @@ void setActiveScene(const QString &name) {
     writeObject(stateFile(), o, nullptr);
 }
 
+/// /proc/<pid>/stat field 22 (start time): pid + start identify one process.
+static std::optional<quint64> procStart(qint64 pid) {
+    if (pid <= 1) return std::nullopt;
+    QFile f(QStringLiteral("/proc/%1/stat").arg(pid));
+    if (!f.open(QIODevice::ReadOnly)) return std::nullopt;
+    const QByteArray s = f.readAll();
+    const int r = s.lastIndexOf(')');
+    if (r < 0) return std::nullopt;
+    const QList<QByteArray> fields = s.mid(r + 1).simplified().split(' ');
+    if (fields.size() < 20) return std::nullopt;
+    bool ok = false;
+    const quint64 v = fields.at(19).toULongLong(&ok);
+    return ok ? std::optional<quint64>(v) : std::nullopt;
+}
+
 int gameSessions() {
     // /run/legion-power-manager/tune/state.json is root-owned but world-readable.
-    return readObject(QStringLiteral("/run/legion-power-manager/tune/state.json")).value("refcount").toInt();
+    // Sessions whose launcher has exited are not counted: tune-helper ends
+    // them itself at its next call (same rule as lpm_helpers::live_game_sessions).
+    const QJsonObject st = readObject(QStringLiteral("/run/legion-power-manager/tune/state.json"));
+    const QJsonValue ss = st.value("sessions");
+    if (!ss.isArray()) return st.value("refcount").toInt();
+    int n = 0;
+    for (const QJsonValue &v : ss.toArray()) {
+        const QJsonObject o = v.toObject();
+        if (!o.value("pid").isDouble() || !o.value("start").isDouble()) { ++n; continue; }  // untracked
+        const auto start = procStart(o.value("pid").toInteger());
+        if (start && *start == quint64(o.value("start").toInteger())) ++n;
+    }
+    return n;
+}
+
+/// lpm-gamemode has switched to a game scene and not switched back yet.
+static bool gameSceneActive() {
+    const QJsonValue v = readObject(stateFile()).value("game_scene");
+    return v.isString() && !v.toString().isEmpty();
+}
+
+/// lpm-gamemode holds this lock while a game is starting (scene + preset).
+static bool gameStarting() {
+    const QString path = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation)
+                         + QStringLiteral("/legion-power-manager/gamemode-start.lock");
+    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool busy = ::flock(fd, LOCK_EX | LOCK_NB) != 0;
+    if (!busy) ::flock(fd, LOCK_UN);
+    ::close(fd);
+    return busy;
 }
 
 static QString bootId() {
@@ -206,12 +256,16 @@ void resumeLoginGuard() { writeObject(loginGuardFile(), {{"state", "ok"}, {"boot
 using namespace scenes;
 
 static constexpr int POWER_POLL_MS = 3000, STABLE_READS = 2, STARTUP_DELAY_MS = 4000;
+static constexpr int GAME_ORPHAN_READS = 5;  // ~15 s without a game while the game scene is still set
 
 SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadAuto()) {
     powerTimer_ = new QTimer(this);
     powerTimer_->setInterval(POWER_POLL_MS);
     connect(powerTimer_, &QTimer::timeout, this, &SceneEngine::pollPower);
     ac_ = onAc();
+    // No automatic scenes in install.sh's PGO training run (it uses the real
+    // GUI, and privileged::run is disabled there anyway).
+    if (qEnvironmentVariableIsSet("LPM_PGO_TRAIN")) return;
     powerTimer_->start();  // cheap: a handful of sysfs reads every 3 s
     // Session start: bring the machine to the scene for the current source,
     // after the tabs have finished their own startup reads.
@@ -230,8 +284,15 @@ void SceneEngine::startupApply() {
     const QString file = loginGuardFile();
     QJsonObject g = readObject(file);
     const QString cur = bootId();
+    // A login that was still inside its window when the machine went down
+    // trips the guard -- unless that boot is known to have shut down cleanly
+    // (lpm-boot-guard records it at service stop): a normal reboot or poweroff
+    // soon after login is not a crash.
+    const QString prevBoot = g.value("boot_id").toString();
+    const bool cleanEnd = !prevBoot.isEmpty() && readObject(QStringLiteral("/var/lib/legion-power-manager/boot-guard.json"))
+                                                     .value("clean_shutdown").toString() == prevBoot;
     if (!g.value("tripped").toBool() && g.value("state").toString() == QLatin1String("applying")
-        && g.value("boot_id").toString() != cur) {
+        && prevBoot != cur && !cleanEnd) {
         g["tripped"] = true;
         g["reason"] = QStringLiteral("the last login ended without a clean shutdown within 2 minutes of applying its scene");
         writeObject(file, g, nullptr);
@@ -245,10 +306,14 @@ void SceneEngine::startupApply() {
     writeObject(file, {{"state", "applying"}, {"boot_id", cur}}, nullptr);
     // Cleared after the window, and on a clean quit (logout / shutdown / Quit).
     QTimer::singleShot(LOGIN_WINDOW_MS, this, [file, cur] { writeObject(file, {{"state", "ok"}, {"boot_id", cur}}, nullptr); });
-    connect(qApp, &QCoreApplication::aboutToQuit, this, [file, cur] {
+    const auto markOk = [file, cur] {
         const QJsonObject o = readObject(file);
         if (o.value("state").toString() == QLatin1String("applying")) writeObject(file, {{"state", "ok"}, {"boot_id", cur}}, nullptr);
-    });
+    };
+    connect(qApp, &QCoreApplication::aboutToQuit, this, markOk);
+    // X11 session managers announce logout/shutdown here before the app is
+    // killed; SIGTERM/SIGHUP end in aboutToQuit (main.cpp).
+    connect(qGuiApp, &QGuiApplication::commitDataRequest, this, [markOk](QSessionManager &) { markOk(); });
     applyForSource(*ac_);
 }
 
@@ -261,6 +326,7 @@ bool SceneEngine::setAuto(const Auto &a, QString *err) {
 }
 
 void SceneEngine::pollPower() {
+    checkGameEnd();
     const auto now = onAc();
     if (!now) return;
     if (!ac_) { ac_ = now; return; }
@@ -273,6 +339,48 @@ void SceneEngine::pollPower() {
     stableReads_ = 0;
     Q_EMIT powerSourceChanged(*ac_);
     if (auto_.enabled) applyForSource(*ac_);
+}
+
+// After a game: lpm-gamemode's last POST returns to the right scene itself.
+// Two cases were left hanging before and are handled here:
+//  * no game scene configured: a power-source change during the game was
+//    deferred and then never applied;
+//  * the launcher died without POST: the game scene (and, until tune-helper's
+//    next call, the game tuning) stayed active indefinitely.
+void SceneEngine::checkGameEnd() {
+    const bool sceneOn = gameSceneActive();
+    if (sceneOn) sawGameScene_ = true;
+    if (!deferred_ && !sceneOn) { gameGoneReads_ = 0; sawGameScene_ = false; return; }
+    if (busy_ || gameSessions() > 0 || gameStarting()) { gameGoneReads_ = 0; return; }
+    ++gameGoneReads_;
+    if (!sceneOn) {
+        if (sawGameScene_) {  // POST left the game scene and applied the right one itself
+            deferred_ = sawGameScene_ = false;
+            gameGoneReads_ = 0;
+            return;
+        }
+        // No game scene: nobody else will apply the deferred switch.
+        if (gameGoneReads_ < STABLE_READS) return;
+        gameGoneReads_ = 0;
+        deferred_ = false;
+        if (auto_.enabled && ac_) applyForSource(*ac_);
+        return;
+    }
+    // Game scene still set with no game left: give a normal POST time to
+    // switch back (it clears game_scene first), then clean up ourselves.
+    if (gameGoneReads_ < GAME_ORPHAN_READS) return;
+    gameGoneReads_ = 0;
+    deferred_ = sawGameScene_ = false;
+    QJsonObject st = readObject(stateFile());
+    const QString before = st.value("before_game").toString();
+    st["game_scene"] = QJsonValue::Null;
+    st["before_game"] = QJsonValue::Null;
+    writeObject(stateFile(), st, nullptr);
+    Q_EMIT finished(QString(), true, {QStringLiteral("the game launcher exited without its POST hook — leaving the game scene")});
+    const QString target = auto_.enabled && ac_ ? (*ac_ ? auto_.onAc : auto_.onBattery) : before;
+    // Ends the dead session and restores the game tuning (tune-helper prune).
+    privileged::run(privileged::helperPath("tune-helper"), QJsonObject{{"op", "prune"}}, this,
+                    [this, target](const privileged::Result &) { if (validName(target)) apply(target); }, 120000);
 }
 
 void SceneEngine::applyForSource(bool onAc) {

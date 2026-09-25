@@ -27,6 +27,13 @@
  * The .policy defaults are auth_admin_keep: if this file is missing or not
  * loaded, nobody gets a silent grant.
  *
+ * Exception: legion-firmware-helper (com.legion-power-manager.firmware.write).
+ * It writes settings that persist in firmware -- BIOS memory timings, BIOS CPU
+ * overclocking, the GPU MUX mode -- where one bad value can stop the machine
+ * from booting. Any process running as the user could otherwise trigger that
+ * without the user noticing, so it always gets AUTH_ADMIN (password every
+ * time, no keep), for wheel members at the machine too.
+ *
  * Distributions without a `wheel` group (Debian/Ubuntu use `sudo`): add
  * `|| subject.isInGroup("sudo")` to the condition below.
  */
@@ -37,8 +44,15 @@ var HELPERS = ["fwattr-helper", "legion-profile-helper", "ryzen-co-helper",
                "tune-helper", "nvcurve-root-helper", "intel-uv-helper", "legion-gpu-helper"].map(function (h) {
     return "@LIBEXEC@/" + h;
 });
+var FIRMWARE_ACTION = "com.legion-power-manager.firmware.write";
+var FIRMWARE_HELPER = "@LIBEXEC@/legion-firmware-helper";
 
 polkit.addRule(function (action, subject) {
+    // Firmware-persistent writes: always the password, never cached.
+    if (action.id === FIRMWARE_ACTION ||
+        (action.id === "org.freedesktop.policykit.exec" && action.lookup("program") === FIRMWARE_HELPER)) {
+        return polkit.Result.AUTH_ADMIN;
+    }
     var ours = action.id.indexOf("com.legion-power-manager.") === 0 ||
         (action.id === "org.freedesktop.policykit.exec" &&
          HELPERS.indexOf(action.lookup("program")) >= 0);

@@ -30,8 +30,13 @@ rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-
       /etc/xdg/autostart/legion-power-manager.desktop \
       /etc/polkit-1/rules.d/49-legion-power-manager.rules /etc/init.d/nvcurve-autoload
 rm -f "$UNITDIR/nvcurve-autoload.service" "$UNITDIR/lpm-tune.service" "$UNITDIR/lpm-intel-uv.service" "$UNITDIR/lpm-intel-uv-daemon.service" "$UNITDIR/lpm-boot-guard.service"
-rm -rf /var/lib/legion-power-manager
+# Boot-guard state goes; the BIOS memory-timing backups (AodSetupRpl-*) stay:
+# they are the only copy of the variable from before an edit.
+rm -f /var/lib/legion-power-manager/boot-guard.json /var/lib/legion-power-manager/boot-guard.json.tmp \
+      /var/lib/legion-power-manager/gpu-mode-pending.json /var/lib/legion-power-manager/gpu-mode-pending.json.tmp
+rmdir /var/lib/legion-power-manager 2>/dev/null || true
 [[ -d /run/systemd/system ]] && systemctl daemon-reload 2>/dev/null || true
 [[ -L /run/legion-power-manager ]] && rm -f /run/legion-power-manager || rm -rf /run/legion-power-manager
 echo "Removed. Kept: /etc/nvcurve, /etc/legion-power-manager (boot preset),"
+[[ -d /var/lib/legion-power-manager ]] && echo "/var/lib/legion-power-manager (BIOS memory-timing backups),"
 echo "~/.config/ryzen-curve-optimizer and ~/.config/legion-power-manager (tuning presets)."

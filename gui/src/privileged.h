@@ -16,6 +16,12 @@ inline constexpr const char *INSTALL_PREFIX = LPM_HELPER_DIR;
 /// Installed helper path (the one the polkit actions pin).
 QString helperPath(const QString &relative);
 
+/// legion-firmware-helper: settings that persist in firmware (BIOS memory
+/// timings, BIOS CPU OC, GPU MUX mode). polkit asks for the administrator
+/// password on every call, so callers give the user time to type it.
+inline constexpr const char *FIRMWARE_HELPER = "legion-firmware-helper";
+inline constexpr int FIRMWARE_TIMEOUT_MS = 180000;
+
 struct Result {
     bool reached = false;   // false: pkexec/auth failure; `error` explains
     QJsonObject json;       // helper's own reply (ok/error/...) when reached

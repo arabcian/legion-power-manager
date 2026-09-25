@@ -31,6 +31,9 @@ void run(const QString &helper, const QByteArray &payload, QObject *ctx, Callbac
         Result r; r.error = msg;
         QTimer::singleShot(0, ctx, [cb, r] { cb(r); });
     };
+    // install.sh's PGO training run walks every tab of a real GUI build: it
+    // must never reach a root helper (hardware writes during a compile).
+    if (qEnvironmentVariableIsSet("LPM_PGO_TRAIN")) return fail(QStringLiteral("disabled during the PGO training run"));
     // Fixed locations, like the Rust side: never resolve pkexec through $PATH.
     QString pkexec;
     for (const char *c : {"/usr/bin/pkexec", "/bin/pkexec"})
