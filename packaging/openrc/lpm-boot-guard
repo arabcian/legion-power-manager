@@ -1,0 +1,27 @@
+#!/sbin/openrc-run
+# Legion Power Manager boot guard. Pulled in by the preset services (need).
+# Arms at boot, disarms after 3 minutes of stable uptime or on a clean
+# shutdown (stop); a boot that dies armed pauses the preset services until
+# they are resumed in the app (Home) or with `lpm-boot-guard reset`.
+
+description="Pause Legion Power Manager boot presets after a crashed boot"
+GUARD="@LIBEXEC@/lpm-boot-guard"
+
+depend() {
+	need localmount
+	before lpm-tune nvcurve-autoload lpm-intel-uv lpm-intel-uv-daemon
+}
+
+start() {
+	ebegin "Arming Legion Power Manager boot guard"
+	"${GUARD}" arm
+	eend $?
+	# Disarm once the boot has been stable for the window (180 s).
+	( sleep 180; "${GUARD}" disarm ) >/dev/null 2>&1 &
+}
+
+stop() {
+	# Clean shutdown / reboot: this boot did not crash.
+	"${GUARD}" disarm >/dev/null 2>&1
+	return 0
+}

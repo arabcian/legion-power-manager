@@ -90,7 +90,7 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/lpm-boot-guard" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$DESTDIR$PREFIX/bin/"
@@ -104,16 +104,16 @@ sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/49-legion-power-manager.rules > "$
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"; chmod 0644 "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 # Service files carry @BINDIR@/@LIBEXEC@ so a non-/usr PREFIX points at the right binaries.
 subst() { sed -e "s|@BINDIR@|$PREFIX/bin|g" -e "s|@LIBEXEC@|$LIBEXEC|g" "$1"; }
-for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon; do
+for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard; do
     subst "packaging/openrc/$s" > "$DESTDIR/etc/init.d/$s"
     chmod 0755 "$DESTDIR/etc/init.d/$s"
 done
 install -d "${own[@]}" -m 0755 "$DESTDIR$UNITDIR"
-for u in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon; do
+for u in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard; do
     subst "packaging/systemd/$u.service" > "$DESTDIR$UNITDIR/$u.service"
     chmod 0644 "$DESTDIR$UNITDIR/$u.service"
 done
-[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR"/etc/init.d/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon} "$DESTDIR$UNITDIR"/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon}.service
+[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR"/etc/init.d/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon,lpm-boot-guard} "$DESTDIR$UNITDIR"/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon,lpm-boot-guard}.service
 # elogind resume hook (re-applies the Intel undervolt boot profile; systemd uses the unit's sleep targets).
 ELOGIND_SLEEP=${ELOGIND_SLEEP:-}
 if [[ -z $ELOGIND_SLEEP ]]; then
@@ -139,7 +139,8 @@ fi
 if [[ -z "$DESTDIR" ]]; then
     command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$PREFIX/share/icons/hicolor" || true
     echo
-    echo "Installed. Optional boot services:"
+    echo "Installed. Optional boot services (each pulls in lpm-boot-guard, which pauses them"
+    echo "after a boot that crashed right after applying them):"
     if [[ -d /run/systemd/system ]]; then
         systemctl daemon-reload || true
         echo "  systemctl enable nvcurve-autoload.service   # GPU V/F profile"

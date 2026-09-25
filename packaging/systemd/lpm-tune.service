@@ -9,15 +9,18 @@
 #   systemctl enable --now lpm-tune.service
 
 [Unit]
+Wants=lpm-boot-guard.service
 Description=Legion Power Manager boot tuning preset
 Documentation=file:///usr/share/doc/legion-power-manager/README.md
 ConditionPathExists=/etc/legion-power-manager/tune-boot.json
 # After sysctl so our values win over /etc/sysctl.d; after module loading so
 # module parameters (snd_hda_intel, usbcore, amd_pstate) exist.
-After=local-fs.target systemd-modules-load.service systemd-sysctl.service systemd-udev-trigger.service
+After=local-fs.target systemd-modules-load.service systemd-sysctl.service systemd-udev-trigger.service lpm-boot-guard.service
 Before=display-manager.service
 
 [Service]
+# Skipped (not failed) while lpm-boot-guard has the boot presets paused.
+ExecCondition=@LIBEXEC@/lpm-boot-guard check
 Type=oneshot
 RemainAfterExit=yes
 # The helper takes one JSON request on stdin (StandardInputText would feed the

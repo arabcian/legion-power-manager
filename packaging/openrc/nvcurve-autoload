@@ -6,11 +6,15 @@ description="Apply the nvcurve auto-load GPU profile"
 command="@BINDIR@/nvcurve"
 
 depend() {
-	need localmount
+	need localmount lpm-boot-guard
 	after modules udev nvidia-persistenced
 }
 
 start() {
+	if ! "@LIBEXEC@/lpm-boot-guard" check 2>/dev/null; then
+		ewarn "Legion Power Manager boot presets are paused after a crashed boot — resume them in the app (Home)"
+		return 0
+	fi
 	ebegin "Applying nvcurve auto-load profile"
 	NVCURVE_LOG=info "${command}" autoload
 	eend $?

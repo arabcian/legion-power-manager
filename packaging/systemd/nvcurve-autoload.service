@@ -5,15 +5,18 @@
 #   systemctl enable --now nvcurve-autoload.service
 
 [Unit]
+Wants=lpm-boot-guard.service
 Description=Apply the nvcurve auto-load GPU profile
 Documentation=file:///usr/share/doc/legion-power-manager/README.md
 ConditionPathExists=/etc/nvcurve/config.json
-After=local-fs.target systemd-modules-load.service systemd-udev-trigger.service nvidia-persistenced.service
+After=local-fs.target systemd-modules-load.service systemd-udev-trigger.service nvidia-persistenced.service lpm-boot-guard.service
 Wants=nvidia-persistenced.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
+# Skipped (not failed) while lpm-boot-guard has the boot presets paused.
+ExecCondition=@LIBEXEC@/lpm-boot-guard check
 Type=oneshot
 RemainAfterExit=yes
 Environment=NVCURVE_LOG=info

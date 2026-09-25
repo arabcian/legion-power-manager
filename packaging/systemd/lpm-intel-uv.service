@@ -8,11 +8,14 @@
 #   systemctl enable lpm-intel-uv.service
 
 [Unit]
+Wants=lpm-boot-guard.service
 Description=Legion Power Manager Intel undervolt profile
 ConditionPathExists=/etc/legion-power-manager/intel-uv-boot.json
-After=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+After=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target lpm-boot-guard.service
 
 [Service]
+# Skipped (not failed) while lpm-boot-guard has the boot presets paused.
+ExecCondition=@LIBEXEC@/lpm-boot-guard check
 Type=oneshot
 ExecStart=/bin/sh -c "echo '{\"op\":\"boot\"}' | @LIBEXEC@/intel-uv-helper"
 # Needs /dev/cpu/*/msr, /dev/mem (MCHBAR) and /sys/module/msr: no device or

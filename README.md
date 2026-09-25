@@ -162,6 +162,45 @@ active scene is shared with lpm-gamemode in
 `$XDG_RUNTIME_DIR/legion-power-manager/scene.json`. The tray
 has a *Scene* menu with every scene and the auto-switch toggle.
 
+## Boot guard
+
+`lpm-boot-guard` (pulled in by every preset service: `lpm-tune`,
+`nvcurve-autoload`, `lpm-intel-uv`, `lpm-intel-uv-daemon`, and the elogind
+resume hook) keeps an unstable preset from crash-looping the machine. Each
+boot is *armed* until it has run for 3 minutes or shuts down cleanly. A boot
+that ends while armed (panic, hang, forced power-off) trips the guard: the
+preset services are skipped — not failed — on every following boot until you
+press *Resume boot presets* on Home (or run `lpm-boot-guard reset` as root).
+The automatic login scene has the same protection at user level.
+State: `/var/lib/legion-power-manager/boot-guard.json`
+(`lpm-boot-guard status`).
+
+## GPU mode (Home → Device)
+
+Switches the MUX through the firmware's own GameZone WMI call
+(`\_SB.GZFD.WMAA` 0x29 / 0x2A — the SMI Legion Space uses); the change takes
+effect at the next boot. *Hybrid*: the AMD iGPU drives the panel and the
+NVIDIA GPU can power off; *dGPU only*: the panel is wired to NVIDIA. Hybrid
+is refused when the running kernel has no `amdgpu` (the panel would stay
+black) unless you confirm a second warning; the BIOS setup (F2) has the same
+switch as a way back. Needs `acpi_call`.
+
+## Boot options (Optimizations → Boot options)
+
+Read-only advisor for kernel command-line and NVIDIA module options: shows
+what is already in effect, explains each, and builds a copyable command-line
+addition and `/etc/modprobe.d/nvidia-lpm.conf`. It never edits the
+bootloader.
+
+## Export / import (Scenes tab)
+
+One JSON file with scenes, automatic switching, Optimizations presets,
+game-launch settings, Ryzen / Intel profiles and NVIDIA curve profiles.
+Import shows what is inside, warns when the file comes from another model or
+BIOS (curve offsets are chip-specific), and asks whether to overwrite or keep
+existing items. NVIDIA profiles are written through `nvcurve-root-helper`,
+which validates them.
+
 ## Components
 
 Cargo workspace:

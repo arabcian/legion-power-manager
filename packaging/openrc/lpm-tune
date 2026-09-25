@@ -12,12 +12,16 @@ description="Apply the Legion Power Manager boot tuning preset"
 HELPER="@LIBEXEC@/tune-helper"
 
 depend() {
-	need localmount
+	need localmount lpm-boot-guard
 	after modules sysctl
 	before xdm display-manager
 }
 
 start() {
+	if ! "@LIBEXEC@/lpm-boot-guard" check 2>/dev/null; then
+		ewarn "Legion Power Manager boot presets are paused after a crashed boot — resume them in the app (Home)"
+		return 0
+	fi
 	[ -f /etc/legion-power-manager/tune-boot.json ] || { einfo "No boot preset set"; return 0; }
 	ebegin "Applying Legion Power Manager boot tuning"
 	printf '%s' '{"op":"boot"}' | "${HELPER}" >/dev/null

@@ -1,0 +1,26 @@
+# Legion Power Manager boot guard (systemd). Pulled in by the preset units.
+# Arms at boot, disarms after 3 minutes of stable uptime or on a clean
+# shutdown; a boot that dies armed pauses the preset units (ExecCondition)
+# until they are resumed in the app (Home) or with `lpm-boot-guard reset`.
+
+[Unit]
+Description=Legion Power Manager boot guard
+Documentation=file:///usr/share/doc/legion-power-manager/README.md
+After=local-fs.target
+Before=lpm-tune.service nvcurve-autoload.service lpm-intel-uv.service lpm-intel-uv-daemon.service
+
+[Service]
+Type=simple
+ExecStartPre=@LIBEXEC@/lpm-boot-guard arm
+ExecStart=@LIBEXEC@/lpm-boot-guard watch
+TimeoutStopSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/legion-power-manager
+StateDirectory=legion-power-manager
+
+[Install]
+WantedBy=multi-user.target

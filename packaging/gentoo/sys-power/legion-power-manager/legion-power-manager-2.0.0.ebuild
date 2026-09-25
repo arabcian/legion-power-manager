@@ -51,7 +51,7 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper,legion-gpu-helper}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper,legion-gpu-helper,lpm-boot-guard}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
 	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv}
@@ -64,7 +64,7 @@ src_install() {
 	insinto /etc/polkit-1/rules.d
 	doins packaging/polkit/49-legion-power-manager.rules
 	local s
-	for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon; do
+	for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard; do
 		sed -e "s|@BINDIR@|${EPREFIX}/usr/bin|g" \
 			-e "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" \
 			packaging/openrc/${s} > "${T}"/${s}.initd || die

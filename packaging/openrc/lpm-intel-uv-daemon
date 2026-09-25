@@ -18,7 +18,7 @@ error_log="/var/log/lpm-intel-uv.log"
 extra_started_commands="reload"
 
 depend() {
-	need localmount
+	need localmount lpm-boot-guard
 	after modules
 }
 
@@ -26,4 +26,10 @@ reload() {
 	ebegin "Reloading ${RC_SVCNAME}"
 	start-stop-daemon --signal HUP --pidfile "${pidfile}"
 	eend $?
+}
+
+start_pre() {
+	"@LIBEXEC@/lpm-boot-guard" check 2>/dev/null && return 0
+	ewarn "Legion Power Manager boot presets are paused after a crashed boot — resume them in the app (Home)"
+	return 1
 }

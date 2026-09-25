@@ -4,11 +4,14 @@
 #   systemctl enable --now lpm-intel-uv-daemon.service
 
 [Unit]
+Wants=lpm-boot-guard.service
 Description=Legion Power Manager Intel undervolt daemon
 Conflicts=lpm-intel-uv.service
-After=systemd-modules-load.service
+After=systemd-modules-load.service lpm-boot-guard.service
 
 [Service]
+# Skipped (not failed) while lpm-boot-guard has the boot presets paused.
+ExecCondition=@LIBEXEC@/lpm-boot-guard check
 Type=simple
 ExecStart=@BINDIR@/lpm-intel-uv daemon
 ExecReload=/bin/kill -HUP $MAINPID

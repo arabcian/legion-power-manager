@@ -1,7 +1,9 @@
 #!/bin/sh
 # elogind system-sleep hook (same idea as intel-undervolt.elogind):
 # re-apply the Intel undervolt boot profile after resume.
-if [ "$1" = "post" ] && [ -f /etc/legion-power-manager/intel-uv-boot.json ]; then
+# Not while lpm-boot-guard has the boot presets paused after a crashed boot.
+if [ "$1" = "post" ] && [ -f /etc/legion-power-manager/intel-uv-boot.json ] \
+   && @LIBEXEC@/lpm-boot-guard check 2>/dev/null; then
 	printf '%s' '{"op":"boot"}' | @LIBEXEC@/intel-uv-helper >/dev/null 2>&1
 fi
 exit 0
