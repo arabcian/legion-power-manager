@@ -32,6 +32,7 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
         mem_offset_mhz: p.mem_offset_mhz,
         mem_locked_min_mhz: p.mem_locked_min_mhz,
         mem_locked_max_mhz: p.mem_locked_max_mhz,
+        gpu_clock_cap_mhz: p.gpu_clock_cap_mhz,
     };
     for e in validate_limits(idx, &lim) {
         out.warnings.push(format!("Rejected: {}", e.message));
@@ -39,6 +40,7 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
             LimitField::PowerLimit => p.power_limit_w = None,
             LimitField::MemOffset => p.mem_offset_mhz = None,
             LimitField::MemLocked => { p.mem_locked_min_mhz = None; p.mem_locked_max_mhz = None; }
+            LimitField::GpuCap => p.gpu_clock_cap_mhz = None,
         }
     }
 
@@ -47,6 +49,14 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
         if let Err(e) = limits::set_mem_locked_clocks(min, max, idx) {
             out.warnings.push(format!("Mem locked clocks: {e}"));
         }
+    }
+    // The profile defines the cap: set it, or remove one left by another
+    // profile (resetting an absent cap is harmless; errors there are noise).
+    match p.gpu_clock_cap_mhz.and_then(to_u32) {
+        Some(cap) => if let Err(e) = limits::set_gpu_locked_clocks(0, cap, idx) {
+            out.warnings.push(format!("Core clock cap: {e}"));
+        },
+        None => { let _ = limits::reset_gpu_locked_clocks(idx); }
     }
     if let Some(off) = p.mem_offset_mhz.and_then(to_i32) {
         if let Err(e) = limits::set_clock_offsets(None, Some(off), idx) {

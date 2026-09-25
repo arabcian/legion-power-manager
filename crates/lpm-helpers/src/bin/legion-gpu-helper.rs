@@ -1,6 +1,8 @@
 //! Root helper for the experimental Legion GPU power tab (pkexec).
 //!   {"op": "status"}                      add "envelope": true for nvidia-smi's power range (wakes the dGPU)
 //!   {"op": "apply", "values": {"ctgp": 140, "boost_up": 25, ...}}
+//!   {"op": "gpu_mode"}                     MUX state: active now / next boot
+//!   {"op": "set_gpu_mode", "mode": "hybrid"|"dgpu", "force": false}   takes effect at the next boot
 use lpm_helpers::legion_wmi;
 use lpm_helpers::*;
 use serde_json::{json, Value};
@@ -14,6 +16,9 @@ fn run() -> Value {
             Some(v) => legion_wmi::apply(v),
             None => json!({"ok": false, "error": "apply needs a 'values' object"}),
         },
+        Some("gpu_mode") => legion_wmi::gpu_mode_status(),
+        Some("set_gpu_mode") => legion_wmi::set_gpu_mode(o.get("mode").and_then(Value::as_str).unwrap_or(""),
+                                                         o.get("force").and_then(Value::as_bool).unwrap_or(false)),
         other => json!({"ok": false, "error": format!("unknown op: {}", other.unwrap_or("None"))}),
     }
 }

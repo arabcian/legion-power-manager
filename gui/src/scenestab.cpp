@@ -1,4 +1,5 @@
 #include "scenestab.h"
+#include "bundle.h"
 #include "fwattrtab.h"
 #include "hometab.h"
 #include "inteltab.h"
@@ -8,6 +9,9 @@
 #include "ryzentab.h"
 #include "theme.h"
 #include <QCheckBox>
+#include <QDate>
+#include <QDir>
+#include <QFileDialog>
 #include <QComboBox>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -72,6 +76,33 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     ll->addWidget(list_, 1);
     auto *add = new QPushButton("New scene…");
     ll->addWidget(add);
+    auto *io = new QHBoxLayout;
+    io->setSpacing(4);
+    auto *exp = new QPushButton("Export…");
+    auto *imp = new QPushButton("Import…");
+    exp->setToolTip("Save scenes, Optimizations presets, game-launch settings and every CPU / GPU curve profile to one file");
+    imp->setToolTip("Load a file made with Export… (backup, reinstall, another machine of the same model)");
+    for (QPushButton *b : {exp, imp}) { b->setObjectName("btnMini"); io->addWidget(b); }
+    ll->addLayout(io);
+    connect(exp, &QPushButton::clicked, this, [this] {
+        const QString def = QDir::homePath() + "/legion-power-manager-" + QDate::currentDate().toString(Qt::ISODate) + ".lpm.json";
+        const QString path = QFileDialog::getSaveFileName(this, "Export settings", def, "Legion Power Manager bundle (*.lpm.json *.json)");
+        if (path.isEmpty()) return;
+        QString err;
+        const QString r = bundle::exportTo(path, &err);
+        setStatus(r.isEmpty() ? "Export failed: " + err : r + "  →  " + path, r.isEmpty() ? theme::DANGER : theme::OK);
+    });
+    connect(imp, &QPushButton::clicked, this, [this] {
+        const QString path = QFileDialog::getOpenFileName(this, "Import settings", QDir::homePath(), "Legion Power Manager bundle (*.lpm.json *.json)");
+        if (path.isEmpty()) return;
+        bundle::importFrom(path, this, [this](const QString &r) {
+            if (r.isEmpty()) return;  // cancelled
+            setStatus(r, r.startsWith("Import failed") ? theme::DANGER : theme::OK);
+            loaded_ = {};
+            reloadList();
+            reloadAuto();
+        });
+    });
     dup_ = new QPushButton("Copy…");
     dup_->setToolTip("Duplicate this scene under a new name");
     del_ = new QPushButton("Delete");

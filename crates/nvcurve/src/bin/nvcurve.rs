@@ -401,6 +401,7 @@ fn cmd_profile(a: &Args, cfg: &Config) {
                 power_limit_w: limits::get_power_limit(idx as u32).power_limit_w.map(i64::from),
                 mem_locked_min_mhz: existing.as_ref().and_then(|e| e.mem_locked_min_mhz),
                 mem_locked_max_mhz: existing.as_ref().and_then(|e| e.mem_locked_max_mhz),
+                gpu_clock_cap_mhz: existing.as_ref().and_then(|e| e.gpu_clock_cap_mhz),
             };
             match save_profile(&cfg.profile_dir, &data) {
                 Ok(p) => println!("Saved profile '{n}' to {}", p.display()),

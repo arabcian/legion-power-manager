@@ -182,6 +182,16 @@ pub fn reset_mem_locked_clocks(gpu_index: u32) -> Result<(), String> {
     n.reset_memory_locked_clocks(n.handle(gpu_index)?)
 }
 
+pub fn set_gpu_locked_clocks(min_mhz: u32, max_mhz: u32, gpu_index: u32) -> Result<(), String> {
+    let n = nvml::ready()?;
+    n.set_gpu_locked_clocks(n.handle(gpu_index)?, min_mhz, max_mhz)
+}
+
+pub fn reset_gpu_locked_clocks(gpu_index: u32) -> Result<(), String> {
+    let n = nvml::ready()?;
+    n.reset_gpu_locked_clocks(n.handle(gpu_index)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::raw_mem_to_effective as f;

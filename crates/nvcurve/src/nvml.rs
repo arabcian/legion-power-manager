@@ -258,4 +258,16 @@ impl Nvml {
         let f: unsafe extern "C" fn(usize) -> u32 = self.func("nvmlDeviceResetMemoryLockedClocks")?;
         self.check(unsafe { f(h.0) })
     }
+
+    /// Core clock window (MHz). With a flattened / undervolted curve, capping
+    /// the max here makes the GPU run the lowest-voltage point that reaches it.
+    pub fn set_gpu_locked_clocks(&self, h: Handle, min: u32, max: u32) -> Result<(), String> {
+        let f: unsafe extern "C" fn(usize, u32, u32) -> u32 = self.func("nvmlDeviceSetGpuLockedClocks")?;
+        self.check(unsafe { f(h.0, min, max) })
+    }
+
+    pub fn reset_gpu_locked_clocks(&self, h: Handle) -> Result<(), String> {
+        let f: unsafe extern "C" fn(usize) -> u32 = self.func("nvmlDeviceResetGpuLockedClocks")?;
+        self.check(unsafe { f(h.0) })
+    }
 }

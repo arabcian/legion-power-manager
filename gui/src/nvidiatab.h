@@ -72,6 +72,8 @@ private:
     QLabel *temp_, *power_, *clock_, *memClock_;
     QLabel *selLabel_, *voltLabel_, *freqLabel_, *offLabel_;
     QSpinBox *pointSpin_, *flattenSpin_, *coreSpin_, *memSpin_, *lockMinSpin_, *lockMaxSpin_;
+    QSpinBox *coreCapSpin_ = nullptr;  // NVML core clock cap (MHz, 0 = none)
+    void reportClamping(const QVector<QPointF> &baseBefore, const QHash<int, int> &requested);
     QComboBox *profiles_;
     QPlainTextEdit *log_;
     QList<QPushButton *> actionButtons_;

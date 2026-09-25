@@ -69,6 +69,14 @@ void setActiveScene(const QString &name);
 /// Game sessions currently holding game mode (tune-helper's state).
 int gameSessions();
 
+/// lpm-boot-guard state (/var/lib/legion-power-manager/boot-guard.json):
+/// non-empty reason = boot presets paused after a crashed boot.
+QString bootGuardReason();
+/// Login guard: the automatic scene at login is paused because the last
+/// login's scene apply was followed by a crash. Empty = not paused.
+QString loginGuardReason();
+void resumeLoginGuard();
+
 } // namespace scenes
 
 class SceneEngine : public QObject {
@@ -104,6 +112,7 @@ private:
     void finish();
     void pollPower();
     void applyForSource(bool onAc);
+    void startupApply();
     void helper(const QString &name, const QJsonObject &req, Done done,
                 std::function<QString(const QJsonObject &)> describe = {});
 

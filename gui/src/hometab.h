@@ -36,8 +36,21 @@ Q_SIGNALS:
     /// Emitted after a successful switch (Firmware Attributes tab unlocks on "custom").
     void profileChanged(const QString &profile);
 
+protected:
+    void showEvent(QShowEvent *e) override;
+
 private:
     void rebuild();
+    // GPU mode (MUX): read once on first show, switched through legion-gpu-helper.
+    void readGpuMode();
+    void setGpuMode(const QString &mode, bool force);
+    QComboBox *gpuMode_ = nullptr;
+    bool gpuModeRead_ = false;
+    // Banner when lpm-boot-guard / the login guard paused presets after a crash.
+    void refreshGuard();
+    QFrame *guardBanner_ = nullptr;
+    QLabel *guardText_ = nullptr;
+    QPushButton *resumeBoot_ = nullptr, *resumeLogin_ = nullptr;
     void refreshSelection();
     void refreshLive();
     void showStatus(const QString &msg, int timeoutMs = 4000);

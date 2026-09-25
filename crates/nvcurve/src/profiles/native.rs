@@ -40,10 +40,14 @@ pub struct ProfileData {
     pub power_limit_w: Option<i64>,
     pub mem_locked_min_mhz: Option<i64>,
     pub mem_locked_max_mhz: Option<i64>,
+    /// NVML core clock cap. A flattened curve needs it: the driver keeps no
+    /// point more than ~1000 MHz below stock, whatever freqDelta it stores, so
+    /// only a cap holds the flat top. None = no cap (an active one is removed).
+    pub gpu_clock_cap_mhz: Option<i64>,
 }
 
 const KNOWN: &[&str] = &["name", "curve_deltas", "gpu_name", "mem_offset_mhz", "power_limit_w",
-                         "mem_locked_min_mhz", "mem_locked_max_mhz"];
+                         "mem_locked_min_mhz", "mem_locked_max_mhz", "gpu_clock_cap_mhz"];
 const OBSOLETE: &[&str] = &["gpu_locked_min_mhz", "gpu_locked_max_mhz", "vram_p0_offset_mhz"];
 
 fn opt_int(m: &Map<String, Value>, k: &str) -> Result<Option<i64>, String> {
@@ -81,6 +85,7 @@ impl ProfileData {
             power_limit_w: opt_int(&m, "power_limit_w")?,
             mem_locked_min_mhz: opt_int(&m, "mem_locked_min_mhz")?,
             mem_locked_max_mhz: opt_int(&m, "mem_locked_max_mhz")?,
+            gpu_clock_cap_mhz: opt_int(&m, "gpu_clock_cap_mhz")?,
         })
     }
 
@@ -89,6 +94,7 @@ impl ProfileData {
             "name": self.name, "curve_deltas": self.curve_deltas, "gpu_name": self.gpu_name,
             "mem_offset_mhz": self.mem_offset_mhz, "power_limit_w": self.power_limit_w,
             "mem_locked_min_mhz": self.mem_locked_min_mhz, "mem_locked_max_mhz": self.mem_locked_max_mhz,
+            "gpu_clock_cap_mhz": self.gpu_clock_cap_mhz,
         })
     }
 
@@ -155,6 +161,16 @@ pub fn delete_profile(dir: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clock_cap_roundtrip() {
+        let p = ProfileData { name: "flat".into(), gpu_clock_cap_mhz: Some(2047), ..Default::default() };
+        let back = ProfileData::from_value(p.to_value(), "test").unwrap();
+        assert_eq!(back.gpu_clock_cap_mhz, Some(2047));
+        // the obsolete Python-era lock fields are still dropped, not mistaken for the cap
+        let old = serde_json::json!({"name": "x", "gpu_locked_max_mhz": 1900});
+        assert_eq!(ProfileData::from_value(old, "test").unwrap().gpu_clock_cap_mhz, None);
+    }
+
     use super::*;
     #[test]
     fn names() {

@@ -3,6 +3,7 @@
 #include "inteltab.h"
 #include "ryzentab.h"
 #include "scenes.h"
+#include "bootadvisor.h"
 #include "sysinfo.h"
 #include "theme.h"
 
@@ -795,6 +796,7 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
         groups_->addTab(scroll, QStringLiteral("%1  %2").arg(group).arg(available));
     }
     groups_->addTab(buildLaunchPage(), "Game launch");
+    groups_->addTab(new BootAdvisor, "Boot options");
     if (tabIndex >= 0 && tabIndex < groups_->count()) groups_->setCurrentIndex(tabIndex);
     // Dev aids for screenshots (like LPM_TAB): LPM_OPT_SUBTAB=N, LPM_OPT_LOAD=<preset>.
     if (qEnvironmentVariableIsSet("LPM_OPT_SUBTAB")) groups_->setCurrentIndex(qEnvironmentVariableIntValue("LPM_OPT_SUBTAB"));
@@ -844,7 +846,18 @@ void OptimizeTab::updateRow(Row &r, const QJsonObject &o) {
             if (!offered) r.combo->addItem(r.current.isEmpty() ? QStringLiteral("—") : QStringLiteral("— (%1)").arg(r.current), QString());
             for (const Option &x : opts) r.combo->addItem(x.label, x.value);
         }
-        if (!setEditorValue(r, want)) setEditorValue(r, r.current);
+        if (!setEditorValue(r, want)) {
+            if (r.touched && !want.isEmpty()) {
+                // The user's choice is not offered right now (e.g. the CCD it
+                // parks is offline, so sysfs no longer describes it). Keep it
+                // instead of silently falling back to a value-less placeholder,
+                // which Save then dropped without a word.
+                r.combo->addItem(QStringLiteral("%1  (not offered right now)").arg(want), want);
+                setEditorValue(r, want);
+            } else {
+                setEditorValue(r, r.current);
+            }
+        }
     } else if (r.spin) {
         if (midEdit) {
             // Still typing: don't touch range or value, just let the row's
@@ -1060,6 +1073,16 @@ bool OptimizeTab::writeUserPreset(const QString &name, const QJsonObject &p, QSt
 
 void OptimizeTab::saveAs() {
     const QJsonObject values = collectValues();
+    // Checked rows that have no value to save: say so instead of dropping them.
+    QStringList dropped;
+    for (const Row &r : rows_)
+        if (r.include && r.include->isChecked() && r.available && editorValue(r).isEmpty()) dropped << r.name->text();
+    if (!dropped.isEmpty() &&
+        QMessageBox::warning(this, "Save preset",
+            "These checked rows have no value selected and will not be saved:\n\n• " + dropped.join("\n• ") +
+            "\n\nPick a value for them first, or save without them?",
+            QMessageBox::Save | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Save)
+        return;
     if (values.isEmpty()) { QMessageBox::information(this, "Save preset", "Check at least one row first."); return; }
     bool ok = false;
     const QString name = QInputDialog::getText(this, "Save preset",

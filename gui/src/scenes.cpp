@@ -16,6 +16,7 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QCoreApplication>
 #include <QTimer>
 
 namespace scenes {
@@ -171,6 +172,33 @@ int gameSessions() {
     return readObject(QStringLiteral("/run/legion-power-manager/tune/state.json")).value("refcount").toInt();
 }
 
+static QString bootId() {
+    QFile f(QStringLiteral("/proc/sys/kernel/random/boot_id"));
+    return f.open(QIODevice::ReadOnly) ? QString::fromLatin1(f.readAll()).trimmed() : QString();
+}
+
+QString bootGuardReason() {
+    const QJsonObject o = readObject(QStringLiteral("/var/lib/legion-power-manager/boot-guard.json"));
+    if (o.value("tripped").toBool()) return o.value("reason").toString(QStringLiteral("boot presets are paused"));
+    // Same rule as lpm-boot-guard check: the previous boot died armed.
+    if (o.value("state").toString() == QLatin1String("armed") && o.value("boot_id").toString() != bootId())
+        return QStringLiteral("the previous boot did not stay up after the presets were applied");
+    return {};
+}
+
+static QString loginGuardFile() {
+    const QString base = qEnvironmentVariableIsEmpty("XDG_STATE_HOME")
+        ? QDir::homePath() + QStringLiteral("/.local/state") : qEnvironmentVariable("XDG_STATE_HOME");
+    return base + QStringLiteral("/legion-power-manager/login-guard.json");
+}
+
+QString loginGuardReason() {
+    const QJsonObject o = readObject(loginGuardFile());
+    return o.value("tripped").toBool() ? o.value("reason").toString() : QString();
+}
+
+void resumeLoginGuard() { writeObject(loginGuardFile(), {{"state", "ok"}, {"boot_id", bootId()}}, nullptr); }
+
 } // namespace scenes
 
 // ── engine ──────────────────────────────────────────────────────────────────
@@ -187,8 +215,41 @@ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadA
     powerTimer_->start();  // cheap: a handful of sysfs reads every 3 s
     // Session start: bring the machine to the scene for the current source,
     // after the tabs have finished their own startup reads.
-    if (auto_.enabled && ac_)
-        QTimer::singleShot(STARTUP_DELAY_MS, this, [this] { if (auto_.enabled && ac_) applyForSource(*ac_); });
+    if (auto_.enabled && ac_) QTimer::singleShot(STARTUP_DELAY_MS, this, &SceneEngine::startupApply);
+}
+
+// The login scene can carry a CPU/GPU curve: if one is unstable, applying it
+// at every login would crash every login. A small user-level guard (like
+// lpm-boot-guard for the boot presets) marks the apply as in progress and
+// clears it once the session has survived LOGIN_WINDOW_MS; a login that died
+// in between pauses the automatic apply until the user resumes it (Home).
+static constexpr int LOGIN_WINDOW_MS = 120000;
+
+void SceneEngine::startupApply() {
+    if (!auto_.enabled || !ac_) return;
+    const QString file = loginGuardFile();
+    QJsonObject g = readObject(file);
+    const QString cur = bootId();
+    if (!g.value("tripped").toBool() && g.value("state").toString() == QLatin1String("applying")
+        && g.value("boot_id").toString() != cur) {
+        g["tripped"] = true;
+        g["reason"] = QStringLiteral("the last login ended without a clean shutdown within 2 minutes of applying its scene");
+        writeObject(file, g, nullptr);
+    }
+    QString why = g.value("tripped").toBool() ? g.value("reason").toString() : QString();
+    if (why.isEmpty()) why = bootGuardReason();
+    if (!why.isEmpty()) {
+        Q_EMIT finished(QString(), false, {QStringLiteral("automatic scene at login skipped — ") + why});
+        return;
+    }
+    writeObject(file, {{"state", "applying"}, {"boot_id", cur}}, nullptr);
+    // Cleared after the window, and on a clean quit (logout / shutdown / Quit).
+    QTimer::singleShot(LOGIN_WINDOW_MS, this, [file, cur] { writeObject(file, {{"state", "ok"}, {"boot_id", cur}}, nullptr); });
+    connect(qApp, &QCoreApplication::aboutToQuit, this, [file, cur] {
+        const QJsonObject o = readObject(file);
+        if (o.value("state").toString() == QLatin1String("applying")) writeObject(file, {{"state", "ok"}, {"boot_id", cur}}, nullptr);
+    });
+    applyForSource(*ac_);
 }
 
 bool SceneEngine::setAuto(const Auto &a, QString *err) {

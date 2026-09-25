@@ -762,6 +762,45 @@ fn role_options(groups: &[Ccx], park: bool) -> Vec<(String, String)> {
     v
 }
 
+// ── CCD park record ──────────────────────────────────────────────────────
+// Offline CPUs lose their cache/topology directories, so while a CCD is
+// parked it cannot be recognised from sysfs any more: the option list shrank
+// to "none", the current value read "offline 16-31", and a preset saved or
+// loaded in that state silently lost the setting. tune-helper records which
+// role it parked; the record counts only while exactly those CPUs are offline.
+
+pub const CCD_PARK_RECORD: &str = "/run/legion-power-manager/tune/ccd-park.json";
+
+pub fn offline_cpus() -> Vec<usize> {
+    let online = online_cpus();
+    present_cpus().into_iter().filter(|c| !online.contains(c)).collect()
+}
+
+/// (role, option label) of the parked CCD, if the record matches reality.
+fn parked_record() -> Option<(String, String, Vec<usize>)> {
+    let v: serde_json::Value = serde_json::from_str(&crate::read_root_file(CCD_PARK_RECORD, 4096)?).ok()?;
+    match_park_record(&v, &offline_cpus())
+}
+
+/// The record describes the current state only if exactly its CPUs are offline.
+fn match_park_record(v: &serde_json::Value, offline: &[usize]) -> Option<(String, String, Vec<usize>)> {
+    let cpus: Vec<usize> = v["cpus"].as_array()?.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect();
+    if cpus.is_empty() || offline != cpus.as_slice() { return None; }
+    let role = v["role"].as_str()?.to_owned();
+    let label = v["label"].as_str().map(str::to_owned).unwrap_or_else(|| format!("park {role}"));
+    Some((role, label, cpus))
+}
+
+/// Called by tune-helper (root) after a successful park.
+pub fn record_ccd_park(role: &str, label: Option<&str>) -> Result<(), String> {
+    if role == "none" {
+        let _ = std::fs::remove_file(CCD_PARK_RECORD);
+        return Ok(());
+    }
+    let body = serde_json::json!({"role": role, "label": label, "cpus": offline_cpus()});
+    crate::write_root_file(CCD_PARK_RECORD, body.to_string().as_bytes())
+}
+
 fn possible_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("possible")).map(|s| cpu_list(&s)).unwrap_or_default() }
 fn present_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("present")).map(|s| cpu_list(&s)).unwrap_or_default() }
 fn online_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("online")).map(|s| cpu_list(&s)).unwrap_or_default() }
@@ -902,7 +941,7 @@ fn intel_gt_files(i915: &str, xe: &str) -> Vec<PathBuf> {
 
 /// A kernel module is usable: loaded, built in, or present as a loadable
 /// module for the running kernel (writing the sysctl autoloads it).
-fn kmod_available(module: &str, subdir: &str) -> bool {
+pub fn kmod_available(module: &str, subdir: &str) -> bool {
     if Path::new("/sys/module").join(module).exists() { return true; }
     let mut u: libc::utsname = unsafe { std::mem::zeroed() };
     if unsafe { libc::uname(&mut u) } != 0 { return false; }
@@ -1231,6 +1270,10 @@ pub fn options(t: &Tunable) -> Vec<(String, String)> {
         (Options::Special, Target::CcdPark) => {
             let mut v = vec![("none".to_string(), "none (all CPUs online)".to_string())];
             v.extend(role_options(&ccx_groups(), true).into_iter().map(|(k, l)| (k, format!("park {l}"))));
+            // The parked CCD is invisible to ccx_groups(): keep its option.
+            if let Some((role, label, _)) = parked_record() {
+                if !v.iter().any(|(k, _)| *k == role) { v.push((role, label)); }
+            }
             v
         }
         _ => vec![],
@@ -1305,6 +1348,7 @@ pub fn current(t: &Tunable) -> Option<String> {
             return Some(seen.unwrap_or_else(|| "all".into()));
         }
         Target::CcdPark => {
+            if let Some((role, _, _)) = parked_record() { return Some(role); }
             let online = online_cpus();
             let off: Vec<usize> = present_cpus().into_iter().filter(|c| !online.contains(c)).collect();
             if !off.is_empty() && hybrid().map_or(false, |h| h.ecores == off) { return Some("ecore".into()); }
@@ -1399,6 +1443,10 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
         }
         Target::CcdPark => {
             if value == "none" { return Ok(fs.into_iter().map(|f| (f, "1".to_owned())).collect()); }
+            // Already parked with this role (its CPUs are no longer resolvable): same writes, all no-ops.
+            if let Some((_, _, cpus)) = parked_record().filter(|(r, _, _)| r == value) {
+                return Ok(cpus.iter().map(|c| (Path::new(CPU_DIR).join(format!("cpu{c}/online")), "0".to_owned())).collect());
+            }
             let g = role(value)?;
             if g.cpus.contains(&0) { return Err("the CCD holding cpu0 cannot be parked".into()); }
             g.cpus.iter().map(|c| Path::new(CPU_DIR).join(format!("cpu{c}/online")))
@@ -1548,6 +1596,18 @@ mod tests {
             Ccx { index: 0, cpus: (0..8).chain(16..24).collect(), l3_kib: 98304, max_khz: 5_200_000 },
             Ccx { index: 1, cpus: (8..16).chain(24..32).collect(), l3_kib: 32768, max_khz: 5_400_000 },
         ]
+    }
+    #[test]
+    fn park_record_matching() {
+        let rec = serde_json::json!({"role": "frequency", "label": "park frequency CCD (CCD1: 8-15,24-31)",
+                                     "cpus": [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31]});
+        let off: Vec<usize> = (8..16).chain(24..32).collect();
+        let (role, label, _) = match_park_record(&rec, &off).unwrap();
+        assert_eq!(role, "frequency");
+        assert!(label.contains("CCD1"));
+        assert!(match_park_record(&rec, &[]).is_none());                 // everything back online: stale
+        assert!(match_park_record(&rec, &off[..8]).is_none());           // partially online: not this state
+        assert!(match_park_record(&serde_json::json!({"role": "x", "cpus": []}), &[]).is_none());
     }
     #[test]
     fn new_targets() {

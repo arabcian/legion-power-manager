@@ -12,6 +12,7 @@
 //!   {"op":"boost","nice":-5,"autogroup":true}          renice the process that ran pkexec
 //!   {"op":"set_boot","values":{..}|null,"preset":".."} store/clear the boot preset (root-owned file)
 //!   {"op":"boot"}                                      apply the boot preset (OpenRC service)
+//!   {"op":"guard_reset"}                               resume boot presets paused by lpm-boot-guard
 //!
 //! Keys are looked up in lpm_helpers::tune::TUNABLES; paths never come from a
 //! request. The first write to a concrete file records its original value in
@@ -123,6 +124,9 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             Ok(v) => v,
             Err(e) => { results.push(json!({"key": t.key, "ok": false, "error": e})); all_ok = false; continue; }
         };
+        // Label of the CCD being parked, taken while it is still resolvable.
+        let park_label = (t.key == "cpu.ccd_park")
+            .then(|| tune::options(t).into_iter().find(|(k, _)| *k == v).map(|(_, l)| l)).flatten();
         let plan = match tune::plan(t, &v) {
             Ok(p) => p,
             Err(e) => { results.push(json!({"key": t.key, "ok": false, "error": e})); all_ok = false; continue; }
@@ -169,6 +173,9 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
         }
         if !unchanged.is_empty() {
             st.baseline.retain(|(k, q, _)| !(k == t.key && unchanged.contains(q)));
+        }
+        if t.key == "cpu.ccd_park" && errs.is_empty() {
+            if let Err(e) = tune::record_ccd_park(&v, park_label.as_deref()) { errs.push(format!("park record: {e}")); }
         }
         let mut r = json!({"key": t.key, "value": v, "written": written});
         if refused > 0 { r["refused"] = json!(refused); }
@@ -399,6 +406,10 @@ fn run() -> Value {
         "boost" => op_boost(&req),
         "set_boot" => op_set_boot(&req),
         "boot" => op_boot(),
+        "guard_reset" => match lpm_helpers::bootguard::reset() {
+            Ok(v) => json!({"ok": true, "guard": v}),
+            Err(e) => json!({"ok": false, "error": e}),
+        },
         _ => json!({"ok": false, "error": "unknown op"}),
     }
 }

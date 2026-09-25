@@ -69,6 +69,7 @@ fn validate_profile_data(d: &Obj) -> Result<(), String> {
     const BOUNDS: &[(&str, i64, i64)] = &[
         ("mem_offset_mhz", -100_000, 100_000), ("power_limit_w", 1, 2_000),
         ("mem_locked_min_mhz", 1, 100_000), ("mem_locked_max_mhz", 1, 100_000),
+        ("gpu_clock_cap_mhz", 210, 4_000),
     ];
     for (k, v) in d {
         if v.is_null() { continue; }
@@ -157,6 +158,7 @@ fn op_reset_gpu_curve(_: &Obj) -> OpResult {
     let (g, _) = gpu::get_gpu(0).map_err(|e| format!("Reset failed: {e}"))?;
     let (rc, d) = vfcurve::reset_all_offsets(g, false);
     if rc != 0 { return Err(format!("Reset write failed: {d}")); }
+    let _ = limits::reset_gpu_locked_clocks(0);  // stock curve = no cap either
     refresh_result(RESET_RESULT);
     Ok("Reset successful.".into())
 }
@@ -174,6 +176,23 @@ fn op_set_vram_memlock(p: &Obj) -> OpResult {
             "Requested lock: {lo}–{hi} MHz — driver resolved to {actual} MHz (nearest supported stock clock)."),
         _ => format!("Memory clock locked to {lo}–{hi} MHz."),
     })
+}
+
+/// Core clock cap. min defaults to the lowest clock (0 lets the driver pick),
+/// so the GPU still idles down; only the top is held.
+fn op_set_gpu_clocklock(p: &Obj) -> OpResult {
+    let Some(hi) = p.get("max_mhz").and_then(is_int) else { return Err("max_mhz must be an integer".into()) };
+    let lo = p.get("min_mhz").and_then(is_int).unwrap_or(0);
+    if !(210..=4000).contains(&hi) || lo < 0 || lo > hi {
+        return Err("max_mhz must be 210–4000 and min_mhz 0–max_mhz".into());
+    }
+    limits::set_gpu_locked_clocks(lo as u32, hi as u32, 0)?;
+    Ok(format!("GPU core clock capped at {hi} MHz (until unlocked, reboot or driver reload)."))
+}
+
+fn op_reset_gpu_clocklock(_: &Obj) -> OpResult {
+    limits::reset_gpu_locked_clocks(0)?;
+    Ok("GPU core clock unlocked (back to the V/F curve's own maximum).".into())
 }
 
 fn op_reset_vram_memlock(_: &Obj) -> OpResult {
@@ -239,6 +258,8 @@ fn dispatch(op: &str) -> Option<fn(&Obj) -> OpResult> {
         "reset_gpu_curve" => op_reset_gpu_curve,
         "set_vram_memlock" => op_set_vram_memlock,
         "reset_vram_memlock" => op_reset_vram_memlock,
+        "set_gpu_clocklock" => op_set_gpu_clocklock,
+        "reset_gpu_clocklock" => op_reset_gpu_clocklock,
         "write_nvcurve_profile" => op_write_nvcurve_profile,
         "delete_nvcurve_profile" => op_delete_nvcurve_profile,
         "set_default_gpu_profile" => op_set_default_gpu_profile,

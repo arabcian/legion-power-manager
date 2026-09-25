@@ -1,4 +1,7 @@
 #include "fwattrtab.h"
+#include <QFileInfo>
+#include <QStandardPaths>
+#include <QSaveFile>
 #include <QShowEvent>
 #include "platformprofile.h"
 #include "privileged.h"
@@ -36,12 +39,41 @@ static QString gpuHelperPath() { return privileged::helperPath(QStringLiteral("l
 // sysfs write to them (EINVAL). They are written through \_SB.GZFD.WMAE instead.
 // Ranges: Dynamic Boost ceiling/floor 0..25 W (as Legion Space shows them);
 // cTGP deliberately left wide (0..250 sanity cap) for testing.
+// Lower bound 1, never 0: writing 0 makes the firmware treat the feature as off
+// and the kernel drops the attribute from sysfs (only a Windows power-profile
+// reset brought it back). The helpers refuse 0 as well.
 struct WmiKnob { const char *attr, *key; int lo, hi; };
 static const WmiKnob WMI_KNOBS[] = {
-    {"gpu_nv_ctgp", "ctgp", 0, 250},
-    {"gpu_nv_ppab", "boost_up", 0, 25},
-    {"gpu_nv_cpu_boost", "boost_down", 0, 25},
+    {"gpu_nv_ctgp", "ctgp", 1, 250},
+    {"gpu_nv_ppab", "boost_up", 1, 25},
+    {"gpu_nv_cpu_boost", "boost_down", 1, 25},
 };
+// Sysfs-backed limits that legion-gpu-helper can also reach over WMAE; used
+// only when the attribute has vanished from sysfs AND the WMAE read-back was
+// seen to match sysfs on this machine (recorded in the range cache).
+static const std::pair<const char *, const char *> WMAE_FALLBACK[] = {
+    {"ppt_pl1_spl", "spl"}, {"ppt_pl2_sppt", "sppt"}, {"ppt_pl3_fppt", "fppt"}, {"cpu_temp", "cpu_temp"},
+};
+
+/// Last seen firmware ranges, so a row can still be drawn after its attribute
+/// disappeared from sysfs. ~/.cache/legion-power-manager/fwattr-ranges.json
+static QString rangeCacheFile() {
+    return QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation) + QStringLiteral("/legion-power-manager/fwattr-ranges.json");
+}
+static QJsonObject readRangeCache() {
+    QFile f(rangeCacheFile());
+    return f.open(QIODevice::ReadOnly) && f.size() < 256 * 1024 ? QJsonDocument::fromJson(f.readAll()).object() : QJsonObject();
+}
+static void writeRangeCache(const QJsonObject &o) {
+    QDir().mkpath(QFileInfo(rangeCacheFile()).absolutePath());
+    QSaveFile f(rangeCacheFile());
+    if (f.open(QIODevice::WriteOnly)) { f.write(QJsonDocument(o).toJson()); f.commit(); }
+}
+/// The GameZone "other method" WMI interface (WMAE) is present.
+static bool wmaeAvailable() {
+    return !QDir(QStringLiteral("/sys/bus/wmi/devices")).entryList({"DC2A8805-3A8C-41BA-A6F7-092E0089CD3B*"},
+                                                                  QDir::Dirs | QDir::System | QDir::NoDotAndDotDot).isEmpty();
+}
 
 static std::optional<int> readInt(const QString &p) {
     auto s = pp::readText(p);
@@ -71,6 +103,32 @@ QList<FwAttr> FwattrTab::discover() {
                     if (name == QLatin1String(k.attr)) { f.wmiKey = QString::fromLatin1(k.key); f.wmiMin = k.lo; f.wmiMax = k.hi; }
             out.append(f);
         }
+    }
+
+    // Attributes missing from sysfs that are still reachable over WMAE.
+    if (!wmaeAvailable()) return out;
+    auto have = [&](const char *attr) { return std::any_of(out.cbegin(), out.cend(), [&](const FwAttr &a) { return a.name == QLatin1String(attr); }); };
+    const QJsonObject cache = readRangeCache();
+    const QString dev = out.isEmpty() ? cache.value("_device").toString(QStringLiteral("lenovo-wmi-other-0")) : out.first().device;
+    for (const WmiKnob &k : WMI_KNOBS) {
+        if (have(k.attr)) continue;
+        const QJsonObject c = cache.value(QLatin1String(k.attr)).toObject();
+        FwAttr f;
+        f.device = dev; f.name = QString::fromLatin1(k.attr);
+        f.displayName = c.value("display").toString(f.name) + QStringLiteral("  (missing from sysfs — via WMI)");
+        f.ranged = false; f.wmiKey = QString::fromLatin1(k.key); f.wmiMin = k.lo; f.wmiMax = k.hi;
+        out.append(f);
+    }
+    for (const auto &[attr, key] : WMAE_FALLBACK) {
+        const QJsonObject c = cache.value(QLatin1String(attr)).toObject();
+        if (have(attr) || !c.value("wmae_verified").toBool()) continue;
+        FwAttr f;
+        f.device = dev; f.name = QString::fromLatin1(attr);
+        f.displayName = c.value("display").toString(f.name) + QStringLiteral("  (missing from sysfs — via WMI)");
+        f.ranged = false; f.wmiKey = QString::fromLatin1(key);
+        f.wmiMin = std::max(1, c.value("min").toInt(1)); f.wmiMax = std::max(f.wmiMin, c.value("max").toInt(f.wmiMin));
+        f.def = c.value("default").toInt(f.wmiMin);
+        out.append(f);
     }
     return out;
 }
@@ -167,6 +225,18 @@ void FwattrTab::rebuild() {
     rows_.clear();
 
     const QList<FwAttr> attrs = discover();
+    {   // Remember the firmware ranges while the attributes are there.
+        QJsonObject cache = readRangeCache();
+        for (const FwAttr &a : attrs) {
+            if (a.path.isEmpty()) continue;  // synthesized (missing) row
+            QJsonObject c = cache.value(a.name).toObject();
+            c["display"] = a.displayName;
+            if (a.ranged) { c["min"] = a.min; c["max"] = a.max; c["default"] = a.def; }
+            cache[a.name] = c;
+            cache["_device"] = a.device;
+        }
+        writeRangeCache(cache);
+    }
     if (attrs.isEmpty()) { tabs_->addTab(new QLabel("No firmware-attributes device found."), QStringLiteral("—")); return; }
 
     QMap<QString, QList<FwAttr>> byDev;
@@ -201,7 +271,7 @@ void FwattrTab::rebuild() {
                 g->addWidget(label, r, 0);
 
                 QSlider *slider = nullptr;
-                const int lo = a.viaWmi() ? a.wmiMin : a.min, hi = a.viaWmi() ? a.wmiMax : a.max;
+                const int lo = std::max(1, a.viaWmi() ? a.wmiMin : a.min), hi = std::max(lo, a.viaWmi() ? a.wmiMax : a.max);
                 if (a.ranged || a.viaWmi()) {
                     slider = new QSlider(Qt::Horizontal);
                     slider->setRange(lo, hi);
@@ -217,9 +287,9 @@ void FwattrTab::rebuild() {
                 }
                 auto *spin = new QSpinBox;
                 spin->setFixedWidth(70);
-                if (a.viaWmi()) spin->setRange(a.wmiMin, a.wmiMax);
-                else if (a.ranged) { spin->setRange(a.min, a.max); spin->setSingleStep(a.step); }
-                else spin->setRange(0, std::max(a.current, a.def));
+                if (a.viaWmi()) spin->setRange(std::max(1, a.wmiMin), std::max(1, a.wmiMax));
+                else if (a.ranged) { spin->setRange(std::max(1, a.min), std::max(1, a.max)); spin->setSingleStep(a.step); }
+                else spin->setRange(1, std::max({1, a.current, a.def}));
                 spin->setValue(a.current);
                 g->addWidget(spin, r, 2);
                 if (slider) {
@@ -248,7 +318,7 @@ void FwattrTab::rebuild() {
                     "<span style='color:%1'>⚙</span> <b>cTGP</b>, <b>power performance aware boost</b> and <b>GPU to CPU dynamic "
                     "boost</b> are reported by the firmware without a valid range (min = max = 0), so the kernel refuses "
                     "to write them through sysfs. These three are written directly through the Lenovo WMI method "
-                    "(<tt>\\_SB.GZFD.WMAE</tt>) with <tt>acpi_call</tt> and read back from it. Boost limits use 0–25 W; "
+                    "(<tt>\\_SB.GZFD.WMAE</tt>) with <tt>acpi_call</tt> and read back from it. Boost limits use 1–25 W (0 is never written: the firmware would drop the attribute); "
                     "cTGP is left unclamped for testing — the GPU itself caps it (150 W on this model). "
                     "Needs the <tt>acpi_call</tt> module.").arg(theme::PURPLE));
                 note->setTextFormat(Qt::RichText);
@@ -378,6 +448,22 @@ void FwattrTab::readWmi() {
     privileged::run(gpuHelperPath(), QJsonObject{{"op", "status"}}, this, [this](const privileged::Result &r) {
         wmiReady_ = r.reached && r.json.value("acpi").toBool();
         const QJsonObject vals = r.json.value("values").toObject();
+        {   // WMAE id check for the CPU limits: the fallback is only offered
+            // once WMAE has been seen to report exactly what sysfs reports.
+            QJsonObject cache = readRangeCache();
+            bool changed = false;
+            for (auto it = vals.begin(); it != vals.end(); ++it) {
+                const QJsonObject o = it.value().toObject();
+                if (!o.contains("wmae") || !o.value("present").toBool() || !o.contains("value")) continue;
+                const QString attr = o.value("attr").toString();
+                const bool match = o.value("wmae").toInt() == o.value("value").toInt();
+                QJsonObject c = cache.value(attr).toObject();
+                if (c.value("wmae_verified").toBool() != match) { c["wmae_verified"] = match; cache[attr] = c; changed = true; }
+                if (!match) showStatus(QStringLiteral("⚠ %1: WMAE reads %2 but sysfs %3 — its WMI fallback stays off.")
+                                           .arg(attr).arg(o.value("wmae").toInt()).arg(o.value("value").toInt()), 10000);
+            }
+            if (changed) writeRangeCache(cache);
+        }
         for (Row &row : rows_) {
             if (!row.info.viaWmi()) continue;
             const QJsonObject o = vals.value(row.info.wmiKey).toObject();

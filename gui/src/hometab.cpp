@@ -1,4 +1,5 @@
 #include "hometab.h"
+#include "scenes.h"
 #include "privileged.h"
 #include "sysinfo.h"
 #include "theme.h"
@@ -29,6 +30,7 @@
 #include <QPushButton>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QShowEvent>
 #include <QVBoxLayout>
 
 static constexpr int POLL_MS = 2500, LIVE_POLL_MS = 2000, SMI_TIMEOUT_MS = 3000;
@@ -135,6 +137,36 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
     if (handler_) sub << "driver: " + handler_->name;
     root->addWidget(title);
     root->addWidget(muted(sub.join("   ·   ")));
+
+    guardBanner_ = new QFrame;
+    guardBanner_->setStyleSheet(QStringLiteral("QFrame { background: rgba(219,123,110,0.12); border: 1px solid %1; border-radius: 8px; }"
+                                               "QLabel { background: transparent; border: none; }").arg(theme::DANGER_SOFT));
+    auto *gb = new QHBoxLayout(guardBanner_);
+    gb->setContentsMargins(10, 6, 8, 6);
+    guardText_ = new QLabel;
+    guardText_->setWordWrap(true);
+    guardText_->setTextFormat(Qt::RichText);
+    gb->addWidget(guardText_, 1);
+    resumeBoot_ = new QPushButton("Resume boot presets");
+    resumeBoot_->setToolTip("Apply the boot presets again from the next boot on. Fix or lower the offending\n"
+                            "undervolt / curve first, or the machine may crash again.");
+    resumeLogin_ = new QPushButton("Resume login scene");
+    resumeLogin_->setToolTip("Apply the automatic scene at login again. Fix the scene's curves first.");
+    gb->addWidget(resumeBoot_);
+    gb->addWidget(resumeLogin_);
+    root->addWidget(guardBanner_);
+    guardBanner_->hide();
+    connect(resumeLogin_, &QPushButton::clicked, this, [this] { scenes::resumeLoginGuard(); refreshGuard(); });
+    connect(resumeBoot_, &QPushButton::clicked, this, [this] {
+        resumeBoot_->setEnabled(false);
+        privileged::run(privileged::helperPath("tune-helper"), QJsonObject{{"op", "guard_reset"}}, this,
+                        [this](const privileged::Result &r) {
+            resumeBoot_->setEnabled(true);
+            if (!r.ok()) { showStatus("Could not resume: " + r.message(), 8000); return; }
+            showStatus("Boot presets resume from the next boot.", 6000);
+            refreshGuard();
+        });
+    });
 
     auto *profileBox = new QGroupBox("Power Profile");
     profileBox->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
@@ -391,6 +423,8 @@ QGroupBox *HomeTab::buildDeviceBox() {
     g->setHorizontalSpacing(8);
     g->setVerticalSpacing(4);
     int row = 0;
+    // Row labels never wrap: a wrapped "Battery charge" made column 0 jump in width.
+    auto label = [](const QString &t) { QLabel *l = muted(t); l->setWordWrap(false); return l; };
 
     if (!chargeFile_.isEmpty()) {
         charge_ = new QComboBox;
@@ -401,8 +435,32 @@ QGroupBox *HomeTab::buildDeviceBox() {
             charge_->addItem(QString(o).replace('_', ' '), o);
         }
         connect(charge_, &QComboBox::activated, this, [this](int i) { setDevice("charge_type", charge_->itemData(i).toString()); });
-        g->addWidget(muted("Battery charge"), row, 0);
+        g->addWidget(label("Battery charge"), row, 0);
         g->addWidget(charge_, row++, 1, 1, 4);
+    }
+
+    // GPU mode (MUX) — only where the Legion GameZone WMI interface exists.
+    if (!QDir(QStringLiteral("/sys/bus/wmi/devices")).entryList({"887B54E3-DDDC-4B2C-8B88-68A26A8835D0*"},
+                                                               QDir::Dirs | QDir::System | QDir::NoDotAndDotDot).isEmpty()) {
+        gpuMode_ = new QComboBox;
+        gpuMode_->addItem("Hybrid (iGPU + NVIDIA)", "hybrid");
+        gpuMode_->addItem("dGPU only (MUX → NVIDIA)", "dgpu");
+        gpuMode_->setEnabled(false);
+        gpuMode_->setToolTip("Which GPU drives the internal display — switched by the firmware at the next boot.\n"
+                             "Hybrid: the AMD iGPU drives the panel and the NVIDIA GPU can power off (much longer\n"
+                             "battery life); games render on NVIDIA through PRIME offload. Needs the amdgpu driver.\n"
+                             "dGPU only: the panel is wired straight to NVIDIA (lowest latency, G-SYNC on the\n"
+                             "internal panel), the iGPU is hidden and the NVIDIA GPU never sleeps.");
+        const bool amdNow = [] {
+            const QDir d(QStringLiteral("/sys/bus/pci/devices"));
+            for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System))
+                if (rdText(d.filePath(e) + "/vendor") == "0x1002" && rdText(d.filePath(e) + "/class").startsWith("0x03")) return true;
+            return false;
+        }();
+        gpuMode_->setCurrentIndex(amdNow ? 0 : 1);
+        connect(gpuMode_, &QComboBox::activated, this, [this](int i) { setGpuMode(gpuMode_->itemData(i).toString(), false); });
+        g->addWidget(label("GPU mode"), row, 0);
+        g->addWidget(gpuMode_, row++, 1, 1, 4);
     }
 
     if (!ideapadDir_.isEmpty()) {
@@ -418,8 +476,12 @@ QGroupBox *HomeTab::buildDeviceBox() {
             h->addWidget(cb);
         }
         h->addStretch(1);
-        if (!toggles_.isEmpty()) g->addLayout(h, row++, 0, 1, 5);
+        if (!toggles_.isEmpty()) {
+            g->addWidget(label("Switches"), row, 0);
+            g->addLayout(h, row++, 1, 1, 4);
+        }
     }
+
 
     int bannerRow = -1;
     if (!fanHwmon_.isEmpty()) bannerRow = row++;  // banner sits above the fan rows
@@ -476,7 +538,7 @@ QGroupBox *HomeTab::buildDeviceBox() {
                 edit->setFocus();
                 edit->selectAll();
             });
-            g->addWidget(muted("Fan " + n), row, 0);
+            g->addWidget(label("Fan " + n), row, 0);
             g->addWidget(rpm, row, 1);
             auto *modes = new QHBoxLayout;
             modes->setSpacing(8);
@@ -507,7 +569,7 @@ QGroupBox *HomeTab::buildDeviceBox() {
                                "Legion Space). It overrides every fan target and stays on across reboots and OS\n"
                                "changes until it is turned off. Source: " + fullSpeedFile_);
         connect(fullSpeed_, &QCheckBox::clicked, this, [this](bool on) { setDevice("fan_fullspeed", on ? "1" : "0"); });
-        g->addWidget(muted("Fans"), row, 0);
+        g->addWidget(label("Fans"), row, 0);
         g->addWidget(fullSpeed_, row++, 1, 1, 4);
     }
     if (bannerRow >= 0 && !fans_.isEmpty()) {
@@ -851,5 +913,78 @@ void HomeTab::applyProfile(const QString &profile) {
             updateDescription(effective);
         }
         if (previous != effective) Q_EMIT profileChanged(effective);
+    }, 60000);
+}
+
+// ── first show: GPU mode read-back, guard banner ─────────────────────────────
+
+void HomeTab::showEvent(QShowEvent *e) {
+    QWidget::showEvent(e);
+    refreshGuard();
+    if (gpuMode_ && !gpuModeRead_) { gpuModeRead_ = true; readGpuMode(); }
+}
+
+void HomeTab::refreshGuard() {
+    const QString boot = scenes::bootGuardReason(), login = scenes::loginGuardReason();
+    QStringList lines;
+    if (!boot.isEmpty()) lines << QStringLiteral("<b>Boot presets paused</b> — %1.").arg(boot.toHtmlEscaped());
+    if (!login.isEmpty()) lines << QStringLiteral("<b>Automatic login scene paused</b> — %1.").arg(login.toHtmlEscaped());
+    guardText_->setText(lines.join("<br>") + (lines.isEmpty() ? QString()
+        : QStringLiteral("<br><span style='color:%1'>Lower the offending undervolt / curve, then resume.</span>").arg(theme::FG_DIM)));
+    resumeBoot_->setVisible(!boot.isEmpty());
+    resumeLogin_->setVisible(!login.isEmpty());
+    guardBanner_->setVisible(!lines.isEmpty());
+}
+
+static QString modeLabel(const QString &m) { return m == QLatin1String("dgpu") ? QStringLiteral("dGPU only") : QStringLiteral("hybrid"); }
+
+void HomeTab::readGpuMode() {
+    privileged::run(privileged::helperPath("legion-gpu-helper"), QJsonObject{{"op", "gpu_mode"}}, this,
+                    [this](const privileged::Result &r) {
+        const QJsonObject j = r.json;
+        if (!r.ok() || !j.value("supported").toBool()) {
+            gpuMode_->setToolTip((r.ok() ? QStringLiteral("Not supported by this firmware.") : r.message()) + "\n\n" + gpuMode_->toolTip());
+            return;
+        }
+        const QString active = j.value("active").toString(), next = j.value("next_boot").toString(active);
+        const bool pending = j.value("reboot_pending").toBool();
+        {
+            const QSignalBlocker b(gpuMode_);
+            gpuMode_->setItemText(0, QStringLiteral("Hybrid (iGPU + NVIDIA)"));
+            gpuMode_->setItemText(1, QStringLiteral("dGPU only (MUX → NVIDIA)"));
+            const int i = std::max(0, gpuMode_->findData(next));
+            if (pending) gpuMode_->setItemText(i, gpuMode_->itemText(i) + QStringLiteral("  — after reboot (running %1)").arg(modeLabel(active)));
+            gpuMode_->setCurrentIndex(i);
+        }
+        gpuMode_->setStyleSheet(pending ? QStringLiteral("QComboBox { color: %1; }").arg(theme::WARN) : QString());
+        gpuMode_->setEnabled(true);
+    }, 60000);
+}
+
+void HomeTab::setGpuMode(const QString &mode, bool force) {
+    if (!force) {
+        const QString msg = mode == QLatin1String("hybrid")
+            ? "Switch to Hybrid at the next boot?\n\nThe AMD iGPU will drive the internal display; the NVIDIA GPU can "
+              "power off when idle. Games run on NVIDIA via PRIME render offload (prime-run / __NV_PRIME_RENDER_OFFLOAD=1).\n\n"
+              "An X11 config that forces the NVIDIA GPU as primary can leave the desktop black in Hybrid — "
+              "Wayland sessions are unaffected. If anything goes wrong, the BIOS setup (F2) has the same switch."
+            : "Switch to dGPU only at the next boot?\n\nThe internal display is wired straight to the NVIDIA GPU (lowest "
+              "latency, G-SYNC on the panel). The iGPU is hidden and the NVIDIA GPU never powers off — shorter battery life.";
+        if (QMessageBox::question(this, "GPU mode", msg) != QMessageBox::Yes) { readGpuMode(); return; }
+    }
+    gpuMode_->setEnabled(false);
+    privileged::run(privileged::helperPath("legion-gpu-helper"), QJsonObject{{"op", "set_gpu_mode"}, {"mode", mode}, {"force", force}}, this,
+                    [this, mode](const privileged::Result &r) {
+        gpuMode_->setEnabled(true);
+        if (r.reached && r.json.value("needs_force").toBool()) {
+            const auto a = QMessageBox::warning(this, "GPU mode — amdgpu missing", r.message() +
+                "\n\nSwitch anyway? Only do this if you are about to boot a kernel that has amdgpu, "
+                "or you know how to switch back in the BIOS setup (F2).", QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (a == QMessageBox::Yes) setGpuMode(mode, true); else readGpuMode();
+            return;
+        }
+        if (!r.ok()) { showStatus("GPU mode: " + r.message(), 10000); readGpuMode(); return; }
+        showStatus(r.json.value("reboot_pending").toBool() ? "GPU mode set — reboot to switch." : "GPU mode unchanged.", 8000);
+        readGpuMode();
     }, 60000);
 }

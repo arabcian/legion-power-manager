@@ -162,6 +162,15 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
         if (s < 0 || s >= base_.size()) return;
         const int target = int(base_[s].y()) + offsetOf(s);
         for (int i = s + 1; i < base_.size(); ++i) setOffsetClamped(i, target - int(base_[i].y()));
+        if (coreCapSpin_) coreCapSpin_->setValue(target);  // applied with Apply Offsets / saved in the profile
+        // The driver never runs a point more than ~1000 MHz below stock (it
+        // stores deeper offsets but ignores them): say so before applying.
+        int first = -1, last = -1;
+        for (int i = s + 1; i < base_.size(); ++i)
+            if (target - int(base_[i].y()) < -1000) { if (first < 0) first = i; last = i; }
+        if (first >= 0)
+            log(QStringLiteral("ℹ️ Points %1–%2 would need more than -1000 MHz; the driver will not take them that low. "
+                               "Core cap is set to %3 MHz so the top still holds.").arg(first).arg(last).arg(target));
         curveModified_ = true;
         updateCoreOffsetUi();
         recompute();
@@ -279,6 +288,30 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     ch->addWidget(bLock);
     ch->addWidget(bUnlock);
     ch->addStretch();
+    // Core clock cap (NVML locked clocks). The driver will not take per-point
+    // offsets below its floor, so a flatten can stop short of its target; a cap
+    // at the flatten frequency makes the GPU use the lowest-voltage point that
+    // reaches it — the flat top, whatever the points above it say.
+    ch2->addWidget(lbl("Core cap:", theme::MUTED));
+    coreCapSpin_ = spin(0, 4000, " MHz", 96);
+    coreCapSpin_->setSpecialValueText(QStringLiteral("off"));
+    coreCapSpin_->setToolTip("Highest core clock the GPU may use (NVML locked clocks). The driver keeps every curve\n"
+                             "point within ~1000 MHz of stock whatever offset it stores, so a flatten cannot pull the\n"
+                             "top points all the way down — the cap does: the GPU then runs the lowest-voltage point\n"
+                             "that reaches it. Flatten fills it in; it is saved with the profile and applied with\n"
+                             "Apply Offsets. Cap / Uncap change it right away.");
+    ch2->addWidget(coreCapSpin_);
+    auto *bCap = new QPushButton("Cap"), *bUncap = new QPushButton("Uncap");
+    connect(bCap, &QPushButton::clicked, this, [this] {
+        const int mx = coreCapSpin_->value();
+        if (mx < 210) { log("⚠️ Enter a core clock cap in MHz first."); return; }
+        runHelper({{"op", "set_gpu_clocklock"}, {"min_mhz", 0}, {"max_mhz", mx}}, QString(), "Failed to cap the core clock");
+    });
+    connect(bUncap, &QPushButton::clicked, this, [this] {
+        runHelper({{"op", "reset_gpu_clocklock"}}, QString(), "Failed to uncap the core clock");
+    });
+    ch2->addWidget(bCap);
+    ch2->addWidget(bUncap);
     ch2->addStretch();
     readBtn_ = new QPushButton("Read Curve");
     connect(readBtn_, &QPushButton::clicked, this, &NvidiaTab::readCurve);
@@ -292,7 +325,7 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     ch2->addWidget(bApply);
     ch2->addWidget(resetBtn_);
     root->addWidget(ctl);
-    actionButtons_ = {bSave, bDef, bApplyProf, bDel, bLock, bUnlock, readBtn_, bApply, resetBtn_};
+    actionButtons_ = {bSave, bDef, bApplyProf, bDel, bLock, bUnlock, bCap, bUncap, readBtn_, bApply, resetBtn_};
 
     log_ = new QPlainTextEdit;
     log_->setObjectName("terminal");
@@ -535,20 +568,25 @@ void NvidiaTab::applyOffsets() {
         if (const int o = offsetOf(i)) deltas.insert(QString::number(i), qint64(o) * 1000);
     const int mem = memSpin_->value(), lmax = lockMaxSpin_->value();
     const int lmin = lockMinSpin_->value() ? lockMinSpin_->value() : lmax;
-    if (deltas.isEmpty() && mem == 0 && lmax == 0) { log("No offsets to apply."); return; }
+    if (deltas.isEmpty() && mem == 0 && lmax == 0 && coreCapSpin_->value() < 210) { log("No offsets to apply."); return; }
     if (lmax && lmin > lmax) { log("⚠️ VRAM lock: Min cannot be greater than Max."); return; }
 
     const QJsonObject data{{"name", SCRATCH}, {"curve_deltas", deltas},
                            {"mem_offset_mhz", mem ? QJsonValue(mem) : QJsonValue()}, {"power_limit_w", QJsonValue()},
                            {"mem_locked_min_mhz", lmax ? QJsonValue(lmin) : QJsonValue()},
-                           {"mem_locked_max_mhz", lmax ? QJsonValue(lmax) : QJsonValue()}};
+                           {"mem_locked_max_mhz", lmax ? QJsonValue(lmax) : QJsonValue()},
+                           {"gpu_clock_cap_mhz", coreCapSpin_->value() >= 210 ? QJsonValue(coreCapSpin_->value()) : QJsonValue()}};
     const qint64 t0 = QDateTime::currentMSecsSinceEpoch();
+    QHash<int, int> requested;
+    for (int i = 0; i < base_.size(); ++i) requested.insert(i, offsetOf(i));
+    const QVector<QPointF> baseBefore = base_;
     runHelper({{"op", "apply_gpu_offsets"}, {"profile_name", SCRATCH}, {"profile_data", data}},
-              "Offsets applied.", "Apply failed", [this, t0](bool ok, const QJsonObject &) {
+              "Offsets applied.", "Apply failed", [this, t0, requested, baseBefore](bool ok, const QJsonObject &) {
         QJsonArray pts;
         if (!ok || !loadCurveFile("nvcurve_apply_result.json", t0, &pts)) return;
         takeGpuPoints(pts, true);
         log("✅ Curve re-read from the GPU after apply.");
+        reportClamping(baseBefore, requested);
     });
 }
 
@@ -562,6 +600,7 @@ void NvidiaTab::resetCurve() {
         memSpin_->setValue(0);
         lockMinSpin_->setValue(0);
         lockMaxSpin_->setValue(0);
+        coreCapSpin_->setValue(0);
         QJsonArray pts;
         if (loadCurveFile("nvcurve_reset_result.json", t0, &pts)) takeGpuPoints(pts, false);
         else { readOffsets_.clear(); resetGraphToLastRead(); }
@@ -643,6 +682,7 @@ void NvidiaTab::applyProfileToUi(const QJsonObject &data, const QString &name) {
     memSpin_->setValue(mem);
     lockMinSpin_->setValue(data.value("mem_locked_min_mhz").toInt());
     lockMaxSpin_->setValue(data.value("mem_locked_max_mhz").toInt());
+    coreCapSpin_->setValue(data.value("gpu_clock_cap_mhz").toInt());
     flattenSpin_->setValue(-1);
     updateCoreOffsetUi();
     vf_->clearSelection();
@@ -663,7 +703,8 @@ void NvidiaTab::saveProfileAs() {
     const QJsonObject data{{"name", name}, {"curve_deltas", deltas}, {"mem_offset_mhz", memSpin_->value()},
                            {"power_limit_w", QJsonValue()},
                            {"mem_locked_min_mhz", lmax ? QJsonValue(lmin) : QJsonValue()},
-                           {"mem_locked_max_mhz", lmax ? QJsonValue(lmax) : QJsonValue()}};
+                           {"mem_locked_max_mhz", lmax ? QJsonValue(lmax) : QJsonValue()},
+                           {"gpu_clock_cap_mhz", coreCapSpin_->value() >= 210 ? QJsonValue(coreCapSpin_->value()) : QJsonValue()}};
     runHelper({{"op", "write_nvcurve_profile"}, {"name", name},
                {"content", QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented))}},
               "Profile '" + name + "' saved.", "Profile '" + name + "' could not be saved", [this, name](bool ok, const QJsonObject &) {
@@ -699,4 +740,36 @@ void NvidiaTab::applyNamedProfile(const QString &name) {
         QJsonArray pts;
         if (ok && loadCurveFile("nvcurve_apply_result.json", t0, &pts)) takeGpuPoints(pts, true);
     });
+}
+
+/// After an apply: say where the GPU did not end up where it was asked to.
+/// Two different driver behaviours, both seen as "the flatten did not hold":
+///  - the stored freqDelta differs from the request (the driver clamped it);
+///  - the delta was stored but the point's clock did not move by it (its
+///    base shifted) — the driver keeps the effective clock above a floor.
+void NvidiaTab::reportClamping(const QVector<QPointF> &baseBefore, const QHash<int, int> &requested) {
+    if (base_.size() != baseBefore.size()) return;
+    struct Run { int from, to, want, got, kind; };
+    QList<Run> runs;
+    int lowestGot = 0;
+    for (int i = 0; i < base_.size(); ++i) {
+        const int want = requested.value(i), stored = readOffsets_.value(i);
+        const int wantFreq = int(baseBefore[i].y()) + want, gotFreq = int(base_[i].y()) + stored;
+        int kind = 0;
+        if (std::abs(stored - want) > 2) kind = 1;               // delta clamped
+        else if (std::abs(gotFreq - wantFreq) > 15) kind = 2;    // clock did not follow
+        if (!kind) continue;
+        lowestGot = std::min(lowestGot, stored);
+        const int got = kind == 1 ? stored : gotFreq, w = kind == 1 ? want : wantFreq;
+        if (!runs.isEmpty() && runs.back().kind == kind && runs.back().to == i - 1) { runs.back().to = i; runs.back().got = got; }
+        else runs.append({i, i, w, got, kind});
+    }
+    if (runs.isEmpty()) return;
+    for (const Run &r : runs) {
+        const QString pts = r.from == r.to ? QStringLiteral("point %1").arg(r.from) : QStringLiteral("points %1–%2").arg(r.from).arg(r.to);
+        log(r.kind == 1 ? QStringLiteral("⚠️ %1: the driver stored a smaller offset than requested (asked %2 MHz, kept %3 MHz).").arg(pts).arg(r.want).arg(r.got)
+                        : QStringLiteral("⚠️ %1: offset stored, but the clock stayed above the request (asked %2 MHz, runs %3 MHz).").arg(pts).arg(r.want).arg(r.got));
+    }
+    log(QStringLiteral("ℹ️ The driver stores offsets down to %1 MHz but never runs a point more than ~1000 MHz below its stock "
+                       "clock. Core cap holds the flat top instead (flatten fills it in; Apply Offsets and the profile include it).").arg(lowestGot));
 }

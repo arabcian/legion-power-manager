@@ -49,10 +49,19 @@ pub struct Feat {
 
 pub const FEATURES: &[Feat] = &[
     Feat { key: "ctgp",       attr: "gpu_nv_ctgp",      id: 0x0202_0000, label: "cTGP",                  unit: "W",  via_acpi: true,  lo: 5,  hi: CTGP_SANITY_MAX },
-    Feat { key: "boost_up",   attr: "gpu_nv_ppab",      id: 0x0201_0000, label: "Dynamic Boost ceiling", unit: "W",  via_acpi: true,  lo: 0,  hi: 25 },
-    Feat { key: "boost_down", attr: "gpu_nv_cpu_boost", id: 0x020B_0000, label: "Dynamic Boost floor",   unit: "W",  via_acpi: true,  lo: 0,  hi: 25 },
+    Feat { key: "boost_up",   attr: "gpu_nv_ppab",      id: 0x0201_0000, label: "Dynamic Boost ceiling", unit: "W",  via_acpi: true,  lo: 1,  hi: 25 },
+    Feat { key: "boost_down", attr: "gpu_nv_cpu_boost", id: 0x020B_0000, label: "Dynamic Boost floor",   unit: "W",  via_acpi: true,  lo: 1,  hi: 25 },
     Feat { key: "ac_offset",  attr: "gpu_nv_ac_offset", id: 0,           label: "CPU+GPU total offset",  unit: "W",  via_acpi: false, lo: 10, hi: 130 },
     Feat { key: "gpu_temp",   attr: "gpu_temp",         id: 0,           label: "GPU temp target",       unit: "°C", via_acpi: false, lo: 75, hi: 87 },
+    // CPU limits: written through sysfs; the WMAE id (same numbering as the
+    // kernel's lenovo-wmi-other: SPPT 1, SPL 2, FPPT 3, TEMP 4 — matched
+    // against this BIOS's DSDT) is only a fallback for when the attribute has
+    // vanished from sysfs. The GUI enables that fallback only after it has seen
+    // the WMAE read-back equal the sysfs value on this machine.
+    Feat { key: "spl",        attr: "ppt_pl1_spl",      id: 0x0102_0000, label: "CPU sustained power (PL1)", unit: "W",  via_acpi: false, lo: 5,  hi: 200 },
+    Feat { key: "sppt",       attr: "ppt_pl2_sppt",     id: 0x0101_0000, label: "CPU short-term power (PL2)", unit: "W", via_acpi: false, lo: 5,  hi: 250 },
+    Feat { key: "fppt",       attr: "ppt_pl3_fppt",     id: 0x0103_0000, label: "CPU peak power (PL3)",      unit: "W",  via_acpi: false, lo: 5,  hi: 250 },
+    Feat { key: "cpu_temp",   attr: "cpu_temp",         id: 0x0104_0000, label: "CPU temperature limit",     unit: "°C", via_acpi: false, lo: 60, hi: 105 },
 ];
 
 pub fn feat(key: &str) -> Option<&'static Feat> { FEATURES.iter().find(|f| f.key == key) }
@@ -88,6 +97,7 @@ fn sysfs_read(attr: &str) -> Option<SysRange> {
 fn sysfs_write(attr: &str, value: i64) -> Result<(), String> {
     let d = attr_dir(attr).ok_or_else(|| format!("{attr}: attribute not present"))?;
     let r = sysfs_read(attr).ok_or_else(|| format!("{attr}: metadata unreadable"))?;
+    if value < 1 { return Err(ZERO_REFUSED.into()); }
     if r.ranged {
         if value < r.min || value > r.max {
             return Err(format!("{value} outside firmware range [{}, {}]", r.min, r.max));
@@ -159,6 +169,80 @@ fn wmae_set(id: u32, value: i64) -> Result<(), String> {
     acpi_raw(&expr).map(|_| ())
 }
 
+// ── GPU mode (MUX) ──────────────────────────────────────────────────────────
+//
+// From the DSDT of BIOS N20 (WinSMCN20WW), \_SB.GZFD.WMAA = the GameZone WMI
+// interface 887B54E3-DDDC-4B2C-8B88-68A26A8835D0 (what Legion Space calls):
+//   0x28 IsSupportGSync  → 2 on this machine
+//   0x29 GetGSyncStatus  → EC MSMF bit: 1 = dGPU direct (MUX to NVIDIA), 0 = hybrid
+//   0x2A SetGSyncStatus  → SMI 0xCA via port 0xB0, sub-command 0x26 (1) / 0x25 (0)
+// The firmware switches the MUX at the next boot. What runs *now* is visible
+// on the PCI bus: in dGPU mode the AMD iGPU is hidden.
+// WMAE feature 0x00210000 (EC GMDM, 3 states) is reported read-only: its
+// meaning lives in EC firmware and is not verified yet.
+
+const GZ_GSYNC_SUPPORTED: u8 = 0x28;
+const GZ_GSYNC_GET: u8 = 0x29;
+const GZ_GSYNC_SET: u8 = 0x2A;
+const FEAT_GMDM: u32 = 0x0021_0000;
+
+fn wmaa(method: u8, arg: u64) -> Result<u64, String> {
+    let out = acpi_raw(&format!("\\_SB.GZFD.WMAA 0x0 0x{method:x} 0x{arg:x}"))?;
+    parse_u64(&out).ok_or_else(|| format!("WMAA 0x{method:x}: unparseable reply '{out}'"))
+}
+
+/// AMD display controller visible on the PCI bus (hybrid mode running).
+fn amd_igpu_present() -> bool {
+    std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten().any(|e| {
+        let rd = |f: &str| std::fs::read_to_string(e.path().join(f)).ok().map(|s| s.trim().to_owned());
+        rd("vendor").as_deref() == Some("0x1002") && rd("class").map_or(false, |c| c.starts_with("0x03"))
+    })
+}
+
+fn mode_name(dgpu: bool) -> &'static str { if dgpu { "dgpu" } else { "hybrid" } }
+
+pub fn gpu_mode_status() -> Value {
+    if !acpi_available() { modprobe_acpi_call(); }
+    if !acpi_available() {
+        return json!({"ok": false, "error": "acpi_call is not loaded (modprobe acpi_call)", "active": mode_name(!amd_igpu_present())});
+    }
+    let supported = wmaa(GZ_GSYNC_SUPPORTED, 0).map(|v| v != 0).unwrap_or(false);
+    let active_dgpu = !amd_igpu_present();
+    let next = wmaa(GZ_GSYNC_GET, 0).ok().map(|v| v == 1);
+    json!({
+        "ok": true,
+        "supported": supported,
+        "active": mode_name(active_dgpu),
+        "next_boot": next.map(mode_name),
+        "reboot_pending": next.map_or(false, |n| n != active_dgpu),
+        "amdgpu_driver": crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu"),
+        "gmdm_raw": wmae_get(FEAT_GMDM).ok(),
+    })
+}
+
+/// `mode`: "hybrid" | "dgpu". Hybrid puts the internal panel on the iGPU, so
+/// it is refused when the running kernel has no amdgpu driver (black screen
+/// at the next boot) unless `force` is set.
+pub fn set_gpu_mode(mode: &str, force: bool) -> Value {
+    let dgpu = match mode { "dgpu" => true, "hybrid" => false, _ => return json!({"ok": false, "error": "mode must be 'hybrid' or 'dgpu'"}) };
+    if !acpi_available() { modprobe_acpi_call(); }
+    if !acpi_available() { return json!({"ok": false, "error": "acpi_call is not loaded (modprobe acpi_call)"}); }
+    if !wmaa(GZ_GSYNC_SUPPORTED, 0).map_or(false, |v| v != 0) {
+        return json!({"ok": false, "error": "the firmware does not report GPU mode switching support"});
+    }
+    if !dgpu && !force && !crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu") {
+        return json!({"ok": false, "needs_force": true,
+            "error": "this kernel has no amdgpu driver: in hybrid mode the internal display is driven by the AMD iGPU and would stay black. Build amdgpu (CONFIG_DRM_AMDGPU) first."});
+    }
+    if let Err(e) = wmaa(GZ_GSYNC_SET, dgpu as u64) { return json!({"ok": false, "error": e}); }
+    let next = wmaa(GZ_GSYNC_GET, 0).ok().map(|v| v == 1);
+    if next != Some(dgpu) {
+        return json!({"ok": false, "error": "the firmware did not take the new mode (read-back differs)", "next_boot": next.map(mode_name)});
+    }
+    let active_dgpu = !amd_igpu_present();
+    json!({"ok": true, "active": mode_name(active_dgpu), "next_boot": mode_name(dgpu), "reboot_pending": dgpu != active_dgpu})
+}
+
 // ── platform profile ────────────────────────────────────────────────────────
 
 pub fn platform_profile() -> Option<String> {
@@ -213,11 +297,20 @@ fn nvidia_power_limits() -> Option<(i64, i64)> {
 
 // ── read one knob (through its owning channel) ──────────────────────────────
 
+/// The value goes through WMAE: always for the unranged GPU knobs, and as a
+/// fallback for an attribute that has disappeared from sysfs.
+fn use_wmae(f: &Feat) -> bool { f.via_acpi || (f.id != 0 && sysfs_read(f.attr).is_none()) }
+
 fn read_value(f: &Feat) -> Result<i64, String> {
-    if f.via_acpi { wmae_get(f.id) } else {
+    if use_wmae(f) { wmae_get(f.id) } else {
         sysfs_read(f.attr).map(|r| r.cur).ok_or_else(|| format!("{}: not present", f.attr))
     }
 }
+
+/// 0 is never written: the firmware takes it as "feature off", the kernel then
+/// stops exposing the attribute, and only a power-profile reset from Windows
+/// brought it back.
+const ZERO_REFUSED: &str = "0 is refused: the firmware treats it as \"feature off\" and the attribute disappears from sysfs";
 
 // ── operations ──────────────────────────────────────────────────────────────
 
@@ -232,7 +325,12 @@ pub fn status(want_envelope: bool) -> Value {
     let mut vals = serde_json::Map::new();
     for f in FEATURES {
         let sys = sysfs_read(f.attr);
-        let mut o = json!({"label": f.label, "unit": f.unit, "via_acpi": f.via_acpi, "attr": f.attr});
+        let mut o = json!({"label": f.label, "unit": f.unit, "via_acpi": f.via_acpi, "attr": f.attr,
+                           "present": sys.is_some(), "wmae_fallback": f.id != 0 && sys.is_none()});
+        // Cross-check for the GUI: WMAE read-back of a sysfs-backed limit.
+        if !f.via_acpi && f.id != 0 && sys.is_some() && acpi_available() {
+            if let Ok(w) = wmae_get(f.id) { o["wmae"] = json!(w); }
+        }
         match read_value(f) {
             Ok(v) => { o["value"] = json!(v); }
             Err(e) => { o["error"] = json!(e); }
@@ -261,7 +359,7 @@ pub fn status(want_envelope: bool) -> Value {
 pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
     let mut results = Vec::new();
     let mut all = true;
-    let need_acpi = values.keys().any(|k| feat(k).map(|f| f.via_acpi).unwrap_or(false));
+    let need_acpi = values.keys().any(|k| feat(k).map(use_wmae).unwrap_or(false));
     if need_acpi && !acpi_available() { modprobe_acpi_call(); }
 
     // Validate the whole request first: a bad value anywhere means nothing
@@ -271,12 +369,12 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
         let checked = (|| {
             let f = feat(key).ok_or_else(|| format!("unknown knob '{key}'"))?;
             let v = jv.as_i64().ok_or_else(|| format!("{key}: not an integer"))?;
-            if f.via_acpi {
-                // No firmware range for these; only a sanity clamp so a typo
-                // can't send something absurd to the EC. cTGP is left wide on
-                // purpose (user testing); ceiling/floor keep their 0..25.
+            if v < 1 { return Err(format!("{}: {ZERO_REFUSED}", f.label)); }
+            if use_wmae(f) {
+                // No firmware range here; a sanity clamp so a typo can't send
+                // something absurd to the EC. cTGP is left wide on purpose.
                 let cap = if f.key == "ctgp" { CTGP_SANITY_MAX } else { f.hi };
-                if v < 0 || v > cap { return Err(format!("{} must be 0..{cap} {}", f.label, f.unit)); }
+                if v < f.lo || v > cap { return Err(format!("{} must be {}..{cap} {}", f.label, f.lo, f.unit)); }
             }
             Ok((f, v))
         })();
@@ -291,7 +389,7 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
 
     for (key, f, v) in plan {
         let r = (|| {
-            if f.via_acpi {
+            if use_wmae(f) {
                 if !acpi_available() { return Err("acpi_call not available".into()); }
                 wmae_set(f.id, v)?;
                 let back = wmae_get(f.id)?;
@@ -324,6 +422,9 @@ mod tests {
         assert!(!feat("ac_offset").unwrap().via_acpi);
         assert_eq!(feat("ac_offset").unwrap().attr, "gpu_nv_ac_offset");
         assert_eq!(feat("boost_down").unwrap().attr, "gpu_nv_cpu_boost");
+        assert_eq!(feat("spl").unwrap().id, 0x0102_0000);
+        assert_eq!(feat("sppt").unwrap().attr, "ppt_pl2_sppt");
+        assert!(FEATURES.iter().all(|f| f.lo >= 1), "no knob may allow 0");
     }
     #[test]
     fn wmae_id_le() {

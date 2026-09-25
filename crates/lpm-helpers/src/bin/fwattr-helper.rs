@@ -60,6 +60,12 @@ fn write_one(path_v: Option<&Value>, value_v: Option<&Value>) -> Value {
     let Some(value) = parse_value(value_v) else {
         return err("value is not an integer".into());
     };
+    // Even where the firmware reports min_value 0: writing 0 makes it treat the
+    // feature as off, the kernel drops the attribute from sysfs, and it only came
+    // back after resetting the power profiles from Windows.
+    if value < 1 {
+        return err("0 is refused: the firmware treats it as \"feature off\" and the attribute disappears from sysfs".into());
+    }
 
     let p = Path::new(path);
     if !p.exists() {
