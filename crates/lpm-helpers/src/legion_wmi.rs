@@ -432,3 +432,82 @@ mod tests {
         assert_eq!(0x020B_0000u32.to_le_bytes(), [0, 0, 0x0b, 2]);
     }
 }
+
+// ── GameZone extras (DSDT of SMCN19/20WW, \_SB.GZFD.WMAA) ──────────────────────
+//   0x31 IsSupportOD : 1 only if the panel has Over Drive (PANT bit 1) — the firmware
+//                      itself says no on panels without it (e.g. OLED), so we never
+//                      offer the toggle there
+//   0x32 GetODStatus / 0x33 SetODStatus(0|1): panel GPIO 0x4A + EC 0x7F
+//   0x3F IsSupportIGPUMode (3 = supported), 0x40 GetIGPUModeStatus (EC REJF),
+//   0x41 SetIGPUModeStatus (EC WEJF): 0 default, 1 iGPU only (dGPU cut off), 2 auto
+
+pub fn panel_extras() -> Value {
+    if !acpi_available() { modprobe_acpi_call(); }
+    if !acpi_available() { return json!({"ok": false, "error": "acpi_call is not loaded"}); }
+    let od_sup = wmaa(0x31, 0).map(|v| v == 1).unwrap_or(false);
+    let od = if od_sup { wmaa(0x32, 0).ok().map(|v| v == 1) } else { None };
+    let ig_sup = wmaa(0x3F, 0).map(|v| v == 3).unwrap_or(false);
+    let ig = if ig_sup { wmaa(0x40, 0).ok().filter(|&v| v <= 2) } else { None };
+    json!({"ok": true, "od_supported": od_sup, "od": od, "igpu_supported": ig_sup, "igpu_mode": ig})
+}
+
+pub fn set_panel_od(on: bool) -> Value {
+    if !acpi_available() { modprobe_acpi_call(); }
+    match wmaa(0x31, 0) {
+        Ok(1) => {}
+        Ok(_) => return json!({"ok": false, "error": "this panel has no Over Drive (firmware reports unsupported — e.g. OLED)"}),
+        Err(e) => return json!({"ok": false, "error": e}),
+    }
+    if let Err(e) = wmaa(0x33, on as u64) { return json!({"ok": false, "error": e}); }
+    match wmaa(0x32, 0) {
+        Ok(v) if (v == 1) == on => json!({"ok": true, "od": on}),
+        Ok(v) => json!({"ok": false, "error": format!("read-back {v} after setting Over Drive")}),
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+pub fn set_igpu_mode(mode: u64) -> Value {
+    if mode > 2 { return json!({"ok": false, "error": "mode must be 0 (default), 1 (iGPU only) or 2 (auto)"}); }
+    if !acpi_available() { modprobe_acpi_call(); }
+    match wmaa(0x3F, 0) {
+        Ok(3) => {}
+        Ok(_) => return json!({"ok": false, "error": "iGPU mode not supported by this firmware"}),
+        Err(e) => return json!({"ok": false, "error": e}),
+    }
+    if let Err(e) = wmaa(0x41, mode) { return json!({"ok": false, "error": e}); }
+    json!({"ok": true, "igpu_mode": wmaa(0x40, 0).ok()})
+}
+
+// ── EC Full Speed ("turbo fan") via WMAE ────────────────────────────────────
+//
+// WMAE feature 0x04020000 = EC field FNST (byte 0x8B bit 0, right after the
+// F9F0..F9FA fan-table bytes). Get 0x11 returns 0/1; set 0x12 writes the bit
+// under the firmware's own LFCM mutex. Verified on the 16AFR10H (SMCN19WW):
+// 1 → fans 1800/1800/2500 → 5300/5500/7400 RPM within seconds, 0 → back to the
+// EC curve. The bit survives reboots (Windows' Full Speed switch is the same
+// flag), which is why a kernel without pwm1_enable/legion_laptop could see the
+// fans stuck at max and not clear them. Used only when neither sysfs backend
+// exists.
+
+const FEAT_FAN_FULLSPEED: u32 = 0x0402_0000;
+
+/// Some(on) when the firmware answers the FNST getter with 0/1, None otherwise
+/// (no acpi_call, no \_SB.GZFD.WMAE, or an unexpected value → not supported).
+pub fn fan_fullspeed_get() -> Result<bool, String> {
+    if !acpi_available() { modprobe_acpi_call(); }
+    if !acpi_available() { return Err("acpi_call is not loaded (modprobe acpi_call)".into()); }
+    match wmae_get(FEAT_FAN_FULLSPEED)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        v => Err(format!("WMAE full-speed getter returned {v}; not a Legion FNST interface")),
+    }
+}
+
+/// Writes FNST and returns the read-back state.
+pub fn fan_fullspeed_set(on: bool) -> Result<bool, String> {
+    fan_fullspeed_get()?; // capability check before any write
+    wmae_set(FEAT_FAN_FULLSPEED, on as i64)?;
+    let now = fan_fullspeed_get()?;
+    if now != on { return Err(format!("EC kept full speed {} after the write", if now { "on" } else { "off" })); }
+    Ok(now)
+}

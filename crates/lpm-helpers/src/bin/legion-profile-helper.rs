@@ -12,7 +12,10 @@
 //!                                  fanN_target; survives reboots, e.g. set from
 //!                                  Windows). Backends, first found wins:
 //!                                  lenovo_wmi_other pwm1_enable (0 = full, 2 = auto),
-//!                                  legion_laptop PNP0C09:*/fan_fullspeed (1/0)
+//!                                  legion_laptop PNP0C09:*/fan_fullspeed (1/0),
+//!                                  Lenovo WMAE feature 0x04020000 (EC FNST) via acpi_call
+//!   stdin:  {"fan_fullspeed": "get"}
+//!   stdout: {"ok": true, "on": bool, "backend": "pwm1_enable" | "fan_fullspeed" | "wmae"}
 //!   stdout: {"ok": true, "device": .., "effective": ..} | {"ok": false, "error": ..}
 //!
 //! Custom-mode fan table (Legion 16AFR10H, via acpi_call; see lpm_helpers::fan_table):
@@ -192,7 +195,31 @@ fn device_target(key: &str, value: &str) -> Result<PathBuf, String> {
     Err(format!("unknown device control '{key}'"))
 }
 
+/// Full Speed through WMAE, for kernels without a sysfs interface.
+fn fullspeed_wmae(value: &str) -> Value {
+    let on = match value { "1" => true, "0" => false, _ => return json!({"ok": false, "error": "fan_fullspeed takes 0 or 1"}) };
+    match lpm_helpers::legion_wmi::fan_fullspeed_set(on) {
+        Ok(now) => json!({"ok": true, "device": "fan_fullspeed", "effective": if now { "1" } else { "0" }, "backend": "wmae"}),
+        Err(e) => json!({"ok": false, "error": format!("no Full Speed interface in this kernel, and the WMAE fallback failed: {e}")}),
+    }
+}
+
+fn fullspeed_get() -> Value {
+    if let Some((f, v_on, _)) = fullspeed_target() {
+        let backend = f.file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned();
+        return match read_trimmed(&f) {
+            Ok(v) => json!({"ok": true, "on": v == v_on, "backend": backend}),
+            Err(e) => json!({"ok": false, "error": format!("{}: {e}", f.display())}),
+        };
+    }
+    match lpm_helpers::legion_wmi::fan_fullspeed_get() {
+        Ok(on) => json!({"ok": true, "on": on, "backend": "wmae"}),
+        Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
 fn set_device(key: &str, value: &str) -> Value {
+    if key == "fan_fullspeed" && fullspeed_target().is_none() { return fullspeed_wmae(value); }
     let (f, value) = match device_write(key, value) { Ok(x) => x, Err(e) => return json!({"ok": false, "error": e}) };
     let value = value.as_str();
     let Some(real) = canonical_in_sysfs(&f) else {
@@ -235,6 +262,12 @@ fn run() -> Value {
         return match op.as_str() {
             Some(op) => lpm_helpers::fan_table::handle(op, obj.get("levels")),
             None => json!({"ok": false, "error": "'fan_table' must be a string"}),
+        };
+    }
+    if let Some(op) = obj.get("fan_fullspeed") {
+        return match op.as_str() {
+            Some("get") => fullspeed_get(),
+            _ => json!({"ok": false, "error": "'fan_fullspeed' must be \"get\" (set it through 'device')"}),
         };
     }
     if let Some(dev) = obj.get("device") {
