@@ -12,6 +12,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 pub mod bootguard;
+pub mod fan_table;
 pub mod intel_uv;
 pub mod intel_uv_daemon;
 pub mod legion_wmi;

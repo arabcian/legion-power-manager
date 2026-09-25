@@ -15,6 +15,10 @@
 //!                                  legion_laptop PNP0C09:*/fan_fullspeed (1/0)
 //!   stdout: {"ok": true, "device": .., "effective": ..} | {"ok": false, "error": ..}
 //!
+//! Custom-mode fan table (Legion 16AFR10H, via acpi_call; see lpm_helpers::fan_table):
+//!   stdin:  {"fan_table": "get"} | {"fan_table": "set", "levels": [10 x 1..10, non-decreasing]}
+//!   stdout: {"ok": true, "levels": [..], "fans": [{fan, sensor, rpm[10], temp[10]}]}
+//!
 //! Writes the per-handler class interface because the legacy
 //! /sys/firmware/acpi/platform_profile store rejects "custom" (-EINVAL);
 //! lenovo-wmi-gamezone registers it as a hidden choice on the class device.
@@ -215,6 +219,12 @@ fn run() -> Value {
     let Some(obj) = req.as_object() else {
         return json!({"ok": false, "error": "payload must be a JSON object"});
     };
+    if let Some(op) = obj.get("fan_table") {
+        return match op.as_str() {
+            Some(op) => lpm_helpers::fan_table::handle(op, obj.get("levels")),
+            None => json!({"ok": false, "error": "'fan_table' must be a string"}),
+        };
+    }
     if let Some(dev) = obj.get("device") {
         return match (dev.as_str(), obj.get("value").and_then(Value::as_str)) {
             (Some(k), Some(v)) if !k.is_empty() && v.len() <= 32 => set_device(k, v),
