@@ -113,6 +113,13 @@ private:
     // targets to 0 while the fans are still spinning down, which looks the same.
     bool fanTouched_ = false;
     bool fullSpeedAtStart_ = false;      // detected before any write; sticky until the fans actually slow
+    // WMAE fallback (Legion EC FNST via acpi_call): root-only, so the state is
+    // cached and re-read through the helper only when the RPMs disagree with it.
+    bool fullSpeedWmae_ = false;
+    std::optional<bool> wmaeFullSpeed_;
+    bool fsQueryPending_ = false;
+    qint64 nextFsQueryAt_ = 0;
+    void queryFullSpeed();
     std::optional<bool> readFullSpeed() const;
     void clearFullSpeed();
     // The Legion EC only returns fans to its own curve when every fan target is

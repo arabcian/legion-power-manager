@@ -8,6 +8,7 @@
 
 #include <QButtonGroup>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QPointer>
@@ -479,6 +480,45 @@ QGroupBox *HomeTab::buildDeviceBox() {
         connect(gpuMode_, &QComboBox::activated, this, [this](int i) { setGpuMode(gpuMode_->itemData(i).toString(), false); });
         g->addWidget(label("GPU mode"), row, 0);
         g->addWidget(gpuMode_, row++, 1, 1, 4);
+
+        // Firmware extras: shown only when WMAA says the machine supports them.
+        // Over Drive is refused by the firmware itself on panels without it (OLED).
+        auto *igLabel = label("iGPU mode");
+        auto *ig = new QComboBox;
+        ig->addItem("Default", 0);
+        ig->addItem("iGPU only (NVIDIA cut off)", 1);
+        ig->addItem("Auto (iGPU only on battery)", 2);
+        ig->setToolTip("Hybrid-mode behaviour of the NVIDIA GPU (firmware setting, Lenovo \"iGPU mode\").\n"
+                       "iGPU only disconnects the dGPU entirely: best battery life, but no NVIDIA until you switch back.\n"
+                       "Has no effect in dGPU-only (MUX) mode.");
+        auto *od = new QCheckBox("Panel Over Drive");
+        od->setToolTip("Faster pixel response on LCD panels (less ghosting, possible overshoot).\n"
+                       "Only offered when the firmware reports the panel supports it — never on OLED.");
+        for (QWidget *w : {static_cast<QWidget *>(igLabel), static_cast<QWidget *>(ig), static_cast<QWidget *>(od)}) w->hide();
+        g->addWidget(igLabel, row, 0);
+        g->addWidget(ig, row++, 1, 1, 4);
+        g->addWidget(od, row++, 1, 1, 4);
+        const QString gh = privileged::helperPath("legion-gpu-helper");
+        privileged::run(gh, QJsonObject{{"op", "panel_extras"}}, this, [igLabel, ig, od](const privileged::Result &r) {
+            if (!r.ok()) return;
+            if (r.json.value("igpu_supported").toBool() && r.json.value("igpu_mode").isDouble()) {
+                ig->setCurrentIndex(ig->findData(r.json.value("igpu_mode").toInt()));
+                igLabel->show(); ig->show();
+            }
+            if (r.json.value("od_supported").toBool()) {
+                od->setChecked(r.json.value("od").toBool());
+                od->show();
+            }
+        });
+        connect(ig, &QComboBox::activated, this, [this, ig, gh](int i) {
+            privileged::run(gh, QJsonObject{{"op", "set_igpu_mode"}, {"mode", ig->itemData(i).toInt()}}, this,
+                            [this](const privileged::Result &r) {
+                if (!r.ok()) QMessageBox::warning(this, "iGPU mode", r.message()); });
+        });
+        connect(od, &QCheckBox::clicked, this, [this, od, gh](bool on) {
+            privileged::run(gh, QJsonObject{{"op", "set_panel_od"}, {"on", on}}, this, [this, od, on](const privileged::Result &r) {
+                if (!r.ok()) { od->setChecked(!on); QMessageBox::warning(this, "Panel Over Drive", r.message()); } });
+        });
     }
 
     if (!ideapadDir_.isEmpty()) {
@@ -581,14 +621,35 @@ QGroupBox *HomeTab::buildDeviceBox() {
             return QFileInfo(p + "/fan_fullspeed").isFile(); });
         if (!d.isEmpty()) fullSpeedFile_ = d + "/fan_fullspeed";
     }
-    if (!fullSpeedFile_.isEmpty()) {
-        fullSpeed_ = new QCheckBox("Full speed (EC)");
+    // No sysfs interface: the Legion WMAE fallback (EC FNST) is probed through the
+    // helper; the checkbox appears once the firmware answers.
+    if (!fullSpeedFile_.isEmpty() || !fanHwmon_.isEmpty()) {
+        fullSpeed_ = new QCheckBox("Turbo fan (EC full speed)");
         fullSpeed_->setToolTip("The embedded controller's own Full Speed mode (the switch in Lenovo Vantage /\n"
                                "Legion Space). It overrides every fan target and stays on across reboots and OS\n"
-                               "changes until it is turned off. Source: " + fullSpeedFile_);
+                               "changes until it is turned off. Source: "
+                               + (fullSpeedFile_.isEmpty() ? QStringLiteral("Lenovo WMAE 0x04020000 (EC FNST) via acpi_call")
+                                                           : fullSpeedFile_));
         connect(fullSpeed_, &QCheckBox::clicked, this, [this](bool on) { setDevice("fan_fullspeed", on ? "1" : "0"); });
-        g->addWidget(label("Fans"), row, 0);
+        auto *fsLabel = label("Fans");
+        g->addWidget(fsLabel, row, 0);
         g->addWidget(fullSpeed_, row++, 1, 1, 4);
+        if (fullSpeedFile_.isEmpty()) {
+            fullSpeed_->hide();
+            fsLabel->hide();
+            privileged::run(helperPath(), QJsonObject{{"fan_fullspeed", "get"}}, this, [this, fsLabel](const privileged::Result &r) {
+                if (!r.ok() || r.json.value("backend").toString() != QLatin1String("wmae")) {
+                    fullSpeed_->deleteLater(); fullSpeed_ = nullptr; fsLabel->deleteLater();
+                    return;
+                }
+                fullSpeedWmae_ = true;
+                wmaeFullSpeed_ = r.json.value("on").toBool();
+                fullSpeed_->show();
+                fsLabel->show();
+                if (fanWarn_) fanWarn_->hide();
+                refreshDevice();
+            });
+        }
     }
     if (bannerRow >= 0 && !fans_.isEmpty()) {
         maxBanner_ = new QFrame;
@@ -666,6 +727,17 @@ void HomeTab::refreshDevice() {
     if (fs) {
         fullSpeedOn_ = *fs;
         fullSpeedGuess_ = 0;
+        if (fullSpeedWmae_ && !fans_.isEmpty()) {
+            // Cached WMAE state: re-read it when the fans disagree (Fn hotkey,
+            // Windows, another tool). "Looks full" = every target 0, every fan ≥ 92 %.
+            bool looks = true;
+            for (const FanRow &f : std::as_const(fans_)) {
+                const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
+                const int in = rdText(fanHwmon_ + "/fan" + n + "_input").toInt(), tgt = rdText(fanHwmon_ + '/' + f.key).toInt();
+                looks &= tgt == 0 && f.max > 0 && f.max < 9999 && in >= f.max * 92 / 100;
+            }
+            if (looks != *fs) queryFullSpeed();
+        }
     } else if (!fans_.isEmpty()) {
         bool looks = true;
         for (const FanRow &f : fans_) {
@@ -829,7 +901,22 @@ void HomeTab::setFanAuto(const QString &key) {
         showStatus("Fan set to Auto, but it keeps its last speed until every fan is on Auto (EC behaviour).", 8000);
 }
 
+void HomeTab::queryFullSpeed() {
+    if (!fullSpeedWmae_ || fsQueryPending_ || devicePending_ > 0) return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now < nextFsQueryAt_) return;
+    nextFsQueryAt_ = now + 6000;  // fans take a few seconds to ramp either way
+    fsQueryPending_ = true;
+    privileged::run(helperPath(), QJsonObject{{"fan_fullspeed", "get"}}, this, [this](const privileged::Result &r) {
+        fsQueryPending_ = false;
+        if (!r.ok()) return;
+        const bool on = r.json.value("on").toBool();
+        if (wmaeFullSpeed_ != on) { wmaeFullSpeed_ = on; refreshDevice(); }
+    });
+}
+
 std::optional<bool> HomeTab::readFullSpeed() const {
+    if (fullSpeedWmae_) return wmaeFullSpeed_;
     if (fullSpeedFile_.isEmpty()) return std::nullopt;
     const QString v = rdText(fullSpeedFile_);
     if (v.isEmpty()) return std::nullopt;  // read error: fall back to the RPM heuristic
@@ -838,7 +925,7 @@ std::optional<bool> HomeTab::readFullSpeed() const {
 
 void HomeTab::clearFullSpeed() {
     if (!fullSpeedOn_) return;
-    if (fullSpeed_) { setDevice("fan_fullspeed", "0"); return; }
+    if (fullSpeed_ && (fullSpeedWmae_ || !fullSpeedFile_.isEmpty())) { setDevice("fan_fullspeed", "0"); return; }
     showStatus("The EC's Full Speed mode is on and this kernel cannot turn it off — see the note under the fans.", 10000);
 }
 
@@ -855,6 +942,8 @@ void HomeTab::setDevice(const QString &key, const QString &value) {
     const QJsonObject req{{"device", key}, {"value", value}};
     privileged::run(helperPath(), req, this, [this, key](const privileged::Result &r) {
         --devicePending_;
+        if (key == QLatin1String("fan_fullspeed") && fullSpeedWmae_ && r.ok())
+            wmaeFullSpeed_ = r.json.value("effective").toString() == QLatin1String("1");
         if (r.ok()) showStatus(QStringLiteral("%1 → %2").arg(key, r.json.value("effective").toString()));
         else showStatus(QStringLiteral("%1 failed: %2").arg(key, r.message()), 8000);
         if (!deviceQueue_.isEmpty()) {
