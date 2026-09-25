@@ -13,6 +13,7 @@ use std::path::Path;
 
 pub mod bootguard;
 pub mod fan_table;
+pub mod memory_spd;
 pub mod intel_uv;
 pub mod intel_uv_daemon;
 pub mod legion_wmi;

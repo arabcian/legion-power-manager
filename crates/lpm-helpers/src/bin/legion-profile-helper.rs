@@ -19,6 +19,10 @@
 //!   stdin:  {"fan_table": "get"} | {"fan_table": "set", "levels": [10 x 1..10, non-decreasing]}
 //!   stdout: {"ok": true, "levels": [..], "fans": [{fan, sensor, rpm[10], temp[10]}]}
 //!
+//! Memory SPD (read-only, any DDR5 machine; see lpm_helpers::memory_spd):
+//!   stdin:  {"memory": "spd"} | {"memory": "all"} (SPD + live UMC timings via ryzen_smu)
+//!   stdout: {"ok": true, "modules": [{slot, part, speed_mts, tAA{ns,clk}, ...}]}
+//!
 //! Writes the per-handler class interface because the legacy
 //! /sys/firmware/acpi/platform_profile store rejects "custom" (-EINVAL);
 //! lenovo-wmi-gamezone registers it as a hidden choice on the class device.
@@ -219,6 +223,14 @@ fn run() -> Value {
     let Some(obj) = req.as_object() else {
         return json!({"ok": false, "error": "payload must be a JSON object"});
     };
+    match obj.get("memory").and_then(Value::as_str) {
+        Some("spd") => return lpm_helpers::memory_spd::read_all(),
+        Some("all") => return lpm_helpers::memory_spd::read_everything(),
+        Some("aod_get") => return lpm_helpers::memory_spd::aod_get(),
+        Some("aod_set") => return lpm_helpers::memory_spd::aod_set(obj.get("values")),
+        Some(_) => return json!({"ok": false, "error": "'memory' must be \"spd\" or \"all\""}),
+        None => {}
+    }
     if let Some(op) = obj.get("fan_table") {
         return match op.as_str() {
             Some(op) => lpm_helpers::fan_table::handle(op, obj.get("levels")),
