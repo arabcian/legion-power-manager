@@ -29,6 +29,9 @@ use std::path::Path;
 
 pub const MSR_PLATFORM_INFO: u64 = 0xCE;
 pub const MSR_OC_MAILBOX: u64 = 0x150;
+/// MSR_FLEX_RATIO: bit 20 = "OC Lock" (BIOS "Overclocking Lock"; what ThrottleStop's FIVR window reports).
+/// Once set it stays until reset and the OC mailbox (0x150) refuses voltage writes.
+pub const MSR_FLEX_RATIO: u64 = 0x194;
 pub const MSR_TEMPERATURE_TARGET: u64 = 0x1A2;
 pub const MSR_RAPL_POWER_UNIT: u64 = 0x606;
 pub const MSR_PKG_POWER_LIMIT: u64 = 0x610;
@@ -567,6 +570,11 @@ pub fn read_status() -> Value {
         Err(e) => { out["ok"] = json!(false); out["error"] = json!(format!("/dev/cpu/0/msr: {}", err_str(&e))); return out; }
     };
 
+    out["oc_lock"] = match msr.read(MSR_FLEX_RATIO) {
+        Ok(v) => json!({"locked": (v >> 20) & 1 == 1, "raw": format!("{v:#018x}")}),
+        Err(e) => json!({"error": err_str(&e)}),
+    };
+
     let mut planes = Map::new();
     for &(k, idx, label) in PLANES {
         planes.insert(k.into(), match msr.mailbox(uv_read_cmd(idx)) {
@@ -951,4 +959,54 @@ mod tests {
         assert_eq!(p.tjoffset, Some(10));
         assert!(!p.mchbar && p.pl1.is_some() && p.pl2.is_none());
     }
+}
+
+/// Undervolt-protection probe (CVE-2019-11157 / UVP): the OC Lock bit does not
+/// cover every BIOS voltage lock, so the only reliable test is a write. Moves the
+/// CPU Core offset ONE tick (~0.98 mV) towards 0 — never deeper — checks the
+/// readback, then restores the original value. Reads alone cannot tell, because an
+/// ignored write reads back the old value, which is why the value must change.
+pub fn probe_uv_lock() -> Value {
+    if cpu_id().map(|c| c.vendor) != Some("GenuineIntel".into()) {
+        return json!({"ok": false, "error": "not an Intel CPU"});
+    }
+    ensure_allow_writes();
+    let msr = match Msr::open(true) {
+        Ok(m) => m,
+        Err(e) => return json!({"ok": false, "error": format!("/dev/cpu/0/msr: {}", err_str(&e))}),
+    };
+    let oc_lock = msr.read(MSR_FLEX_RATIO).ok().map(|v| (v >> 20) & 1 == 1);
+    let plane = 0u64;  // CPU Core
+    let cur = match msr.mailbox(uv_read_cmd(plane)) {
+        Ok(r) if (r >> 32) & 0xFF != 0 => return json!({"ok": true, "uv_locked": true, "oc_lock": oc_lock,
+            "message": format!("OC mailbox read refused (status {:#04x}) — no voltage control on this CPU/BIOS", (r >> 32) & 0xFF)}),
+        Ok(r) => r,
+        Err(e) => return json!({"ok": false, "error": format!("mailbox read: {}", err_str(&e)), "oc_lock": oc_lock}),
+    };
+    let raw = (((cur & 0xFFFF_FFFF) >> 21) & 0x7FF) as i64;
+    let ticks = if raw >= 0x400 { raw - 0x800 } else { raw };
+    let test = if ticks < 0 { ticks + 1 } else if ticks > 0 { ticks - 1 } else { -1 };
+    let cmd = uv_write_cmd(plane, test);
+    let back = msr.mailbox_set_verify(cmd, uv_read_cmd(plane));
+    // Always restore, whatever happened.
+    let restore = msr.mailbox_set_verify(uv_write_cmd(plane, ticks), uv_read_cmd(plane));
+    let restored = matches!(restore, Ok(r) if r & 0xFFFF_FFFF == uv_write_cmd(plane, ticks) & 0xFFFF_FFFF);
+    let back = match back {
+        Ok(b) => b,
+        Err(e) => return json!({"ok": false, "error": format!("mailbox write: {}", err_str(&e)), "oc_lock": oc_lock}),
+    };
+    let status = (back >> 32) & 0xFF;
+    let accepted = status == 0 && back & 0xFFFF_FFFF == cmd & 0xFFFF_FFFF;
+    json!({
+        "ok": true,
+        "uv_locked": !accepted,
+        "oc_lock": oc_lock,
+        "restored": restored,
+        "original_mv": (decode_mv(cur) * 100.0).round() / 100.0,
+        "test_mv": (decode_mv(cmd) * 100.0).round() / 100.0,
+        "readback_mv": (decode_mv(back) * 100.0).round() / 100.0,
+        "status": status,
+        "message": if accepted { "voltage offsets are writable (undervolt unlocked)".to_string() }
+                   else { format!("write ignored (readback {:.2} mV, status {status:#04x}) — undervolting is locked by the BIOS", decode_mv(back)) },
+    })
 }

@@ -1,6 +1,7 @@
 //! Root helper for the Intel Undervolt tab (pkexec target, same contract as
 //! the other helpers: one JSON request on stdin, one JSON line on stdout).
 //!   {"op": "status"}
+//!   {"op": "probe_uv_lock"}   1-tick write test of the Core offset, restored
 //!   {"op": "apply",     "profile": {...}}   validated whole before any write
 //!   {"op": "reset"}                          all five voltage planes → 0 mV
 //!   {"op": "set_boot",  "profile": {...}}   store the boot/resume profile
@@ -39,6 +40,7 @@ fn run() -> Value {
     };
     let mut out = match obj.get("op").and_then(Value::as_str) {
         Some("status") => intel_uv::read_status(),
+        Some("probe_uv_lock") => intel_uv::probe_uv_lock(),
         Some("apply") => match profile() { Ok((_, p)) => intel_uv::apply(&p), Err(e) => e },
         Some("reset") => intel_uv::apply(&intel_uv::reset_profile()),
         Some("set_boot") => {

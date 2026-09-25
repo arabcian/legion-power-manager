@@ -107,7 +107,21 @@ IntelTab::IntelTab(QWidget *parent) : QWidget(parent) {
                                   QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes)
             applyReset();
     });
+    auto *bProbe = new QPushButton("Test UV lock");
+    bProbe->setToolTip("Detect the BIOS undervolt lock the way it really behaves: move the CPU Core offset one\n"
+                       "step (~1 mV, towards 0) through the OC mailbox, check the readback, restore it.\n"
+                       "OC Lock (MSR 0x194 bit 20) is shown by Read current without writing anything.");
+    connect(bProbe, &QPushButton::clicked, this, [this] {
+        if (busy_) return;
+        runOp({{"op", "probe_uv_lock"}}, [this](const QJsonObject &j) {
+            uvLock_ = j.value("uv_locked").isBool() ? std::optional<bool>(j.value("uv_locked").toBool()) : std::nullopt;
+            log(j.value("message").toString() + (j.value("restored").toBool(true) ? QString() : QStringLiteral(" — WARNING: original offset not restored")),
+                uvLock_.value_or(false) ? "err" : "ok");
+            readStatus();
+        });
+    });
     gl->addWidget(bRead);
+    gl->addWidget(bProbe);
     gl->addWidget(bReset);
     top->addWidget(gBox);
     root->addLayout(top);
@@ -832,9 +846,21 @@ void IntelTab::showStatus(const QJsonObject &s) {
         if (auto *m = qobject_cast<QStandardItemModel *>(ctdp_->model())) m->item(lvl + 1)->setEnabled(lvl <= ct.value("levels").toInt());
     if (ct.value("current").isDouble()) ctdp_->setItemText(0, QStringLiteral("untouched (now %1)").arg(ct.value("current").toInt()));
 
-    // Plundervolt detection is only possible by writing; say so instead of guessing.
-    bits << QStringLiteral("Voltage lock can only be detected by writing: if Apply reports a readback mismatch, "
-                           "undervolting is locked by the BIOS (CVE-2019-11157) or this CPU has no OC mailbox.");
+    // BIOS toggles: OC Lock is a plain MSR bit; undervolt protection needs the write probe.
+    const QJsonObject oc = s.value("oc_lock").toObject();
+    if (oc.contains("locked"))
+        bits << (oc.value("locked").toBool()
+            ? QStringLiteral("<span style='color:%1'><b>OC Lock: ON</b> (BIOS \"Overclocking Lock\", MSR 0x194 bit 20) — "
+                             "voltage offsets cannot be changed until it is disabled in the BIOS.</span>").arg(theme::DANGER)
+            : QStringLiteral("<span style='color:%1'><b>OC Lock: off</b></span> (MSR 0x194 %2)").arg(theme::OK, oc.value("raw").toString()));
+    else if (oc.contains("error"))
+        bits << "OC Lock: unreadable (" + oc.value("error").toString().toHtmlEscaped() + ")";
+    if (uvLock_)
+        bits << (*uvLock_ ? QStringLiteral("<span style='color:%1'><b>Undervolt: LOCKED</b> by the BIOS (write test rejected — "
+                                           "Undervolt Protection / CVE-2019-11157).</span>").arg(theme::DANGER)
+                          : QStringLiteral("<span style='color:%1'><b>Undervolt: unlocked</b></span> (write test accepted).").arg(theme::OK));
+    else
+        bits << QStringLiteral("Undervolt protection: not tested — press <b>Test UV lock</b> (a 1 mV write, restored).");
     info_->setText(bits.join("<br>"));
     log("Values read from the CPU.", "ok");
 }

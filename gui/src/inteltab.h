@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 // Intel Undervolt tab — OC mailbox voltage offsets (5 planes), IccMax,
 // TCC offset and package power limits, via intel-uv-helper (pkexec).
 // Created only when the CPU vendor is GenuineIntel (see MainWindow).
@@ -44,6 +45,7 @@ private:
     bool validate(const QJsonObject &p);
     void readStatus();
     void showStatus(const QJsonObject &s);
+    std::optional<bool> uvLock_;  // result of the last probe_uv_lock (session only)
     void runOp(const QJsonObject &req, std::function<void(const QJsonObject &)> then = {});
     void setBusy(bool b);
     void setPositive(bool on);
