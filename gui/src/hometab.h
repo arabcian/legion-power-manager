@@ -32,6 +32,15 @@ public:
     QStringList offeredProfiles() const { return pp::offeredProfiles(handler_); }
     std::optional<QString> currentProfile() const { return pp::currentProfile(handler_); }
 
+    // Fan control for the tray menu (same sysfs writes / EC rules as the Home tab rows).
+    struct FanInfo { QString key; QString name; int min; int max; int target; };  // target 0 = Auto
+    QList<FanInfo> fanInfo() const;
+    bool fansMaxMode() const { return maxMode_; }
+    bool fanBusy() const { return devicePending_ > 0; }
+    void setAllFansMax();
+    void setAllFansAuto() { exitMaxMode(); }
+    void setFanTarget(const QString &key, int rpm);  // rpm 0 = Auto (EC all-or-nothing rule applies)
+
 Q_SIGNALS:
     /// Emitted after a successful switch (Firmware Attributes tab unlocks on "custom").
     void profileChanged(const QString &profile);

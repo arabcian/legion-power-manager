@@ -8,6 +8,7 @@
 #include "scenes.h"
 #include "theme.h"
 #include <QApplication>
+#include <algorithm>
 #include <QMenu>
 #include <QPainter>
 #include <QTimer>
@@ -201,6 +202,49 @@ void Tray::rebuild() {
         notify("Optimizations", "Restoring original values…");
     });
     om->setEnabled(!opt->busy());
+
+    // Fans: all to max / Auto, or one fan at a fixed RPM (multiples of 100).
+    const QList<HomeTab::FanInfo> fans = home->fanInfo();
+    if (!fans.isEmpty()) {
+        QMenu *fm = menu_->addMenu("Fans");
+        const bool maxMode = home->fansMaxMode();
+        QAction *mx = fm->addAction("Max all fans");
+        mx->setCheckable(true);
+        mx->setChecked(maxMode);
+        connect(mx, &QAction::triggered, this, [this, home, maxMode] {
+            if (!claimCooldown()) return;
+            if (maxMode) { home->setAllFansAuto(); notify("Fans", "All fans back to Auto…"); }
+            else { home->setAllFansMax(); notify("Fans", "All fans to maximum…"); }
+        });
+        connect(fm->addAction("All fans to Auto"), &QAction::triggered, this, [this, home] {
+            if (!claimCooldown()) return;
+            home->setAllFansAuto();
+            notify("Fans", "All fans back to Auto…");
+        });
+        fm->addSeparator();
+        for (const HomeTab::FanInfo &f : fans) {
+            const QString cur = f.target > 0 ? QStringLiteral("%1 RPM").arg(f.target) : QStringLiteral("Auto");
+            QMenu *sub = fm->addMenu(f.name + "  (" + cur + ")");
+            auto add = [this, home, sub, f](const QString &text, int rpm) {
+                QAction *a = sub->addAction(text);
+                a->setCheckable(true);
+                a->setChecked(f.target == rpm);
+                const QString key = f.key, name = f.name;
+                connect(a, &QAction::triggered, this, [this, home, key, name, rpm] {
+                    if (!claimCooldown()) return;
+                    home->setFanTarget(key, rpm);
+                    notify("Fans", rpm > 0 ? QStringLiteral("%1 → %2 RPM").arg(name).arg(rpm) : name + " → Auto");
+                });
+            };
+            add("Auto", 0);
+            sub->addSeparator();
+            const int top = f.max > 0 && f.max < 9999 ? f.max : 6000;
+            const int start = std::max(100, (f.min + 99) / 100 * 100);
+            for (int r = start; r <= top; r += 100) add(QStringLiteral("%1 RPM").arg(r), r);
+            if (top % 100) add(QStringLiteral("%1 RPM (max)").arg(top), top);
+        }
+        fm->setEnabled(!home->fanBusy());
+    }
 
     menu_->addSeparator();
     connect(menu_->addAction(win_->isVisible() ? "Hide window" : "Show window"), &QAction::triggered, this, &Tray::toggleWindow);

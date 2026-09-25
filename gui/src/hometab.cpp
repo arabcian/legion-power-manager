@@ -594,10 +594,7 @@ QGroupBox *HomeTab::buildDeviceBox() {
         // Entry point: one click puts every fan at max (and so into the mode above).
         maxAllBtn_ = new QPushButton("Max all fans");
         maxAllBtn_->setToolTip("Set every fan to its maximum RPM. Controls lock until you press Disable max fans.");
-        connect(maxAllBtn_, &QPushButton::clicked, this, [this] {
-            for (const FanRow &f : std::as_const(fans_)) setDevice(f.key, QString::number(f.max));
-            setMaxMode(true, false);
-        });
+        connect(maxAllBtn_, &QPushButton::clicked, this, &HomeTab::setAllFansMax);
         auto *mh = new QHBoxLayout;
         mh->addStretch(1);
         mh->addWidget(maxAllBtn_);
@@ -741,6 +738,28 @@ void HomeTab::exitMaxMode() {
     }
     setMaxMode(false, false);
     showStatus("All fans back to Auto — the EC curve takes over as they spin down.", 6000);
+}
+
+QList<HomeTab::FanInfo> HomeTab::fanInfo() const {
+    QList<FanInfo> out;
+    for (const FanRow &f : fans_) {
+        const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
+        out.append({f.key, "Fan " + n, rdText(fanHwmon_ + "/fan" + n + "_min").toInt(), f.max,
+                    rdText(fanHwmon_ + '/' + f.key).toInt()});
+    }
+    return out;
+}
+
+void HomeTab::setAllFansMax() {
+    for (const FanRow &f : std::as_const(fans_)) setDevice(f.key, QString::number(f.max));
+    setMaxMode(true, false);
+}
+
+void HomeTab::setFanTarget(const QString &key, int rpm) {
+    if (rpm <= 0) { setFanAuto(key); return; }
+    clearFullSpeed();  // EC Full Speed would ignore the target
+    for (const FanRow &f : std::as_const(fans_))
+        if (f.key == key) { setDevice(key, QString::number(std::min(rpm, f.max))); return; }
 }
 
 void HomeTab::setFanAuto(const QString &key) {
