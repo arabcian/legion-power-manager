@@ -19,6 +19,7 @@ add_executable(legion-power-manager
     src/sysinfo.cpp      src/sysinfo.h
     src/hometab.cpp      src/hometab.h
     src/fancurvedialog.cpp src/fancurvedialog.h
+    src/memorydialog.cpp src/memorydialog.h
     src/fwattrtab.cpp    src/fwattrtab.h
     src/ryzentab.cpp     src/ryzentab.h
     src/inteltab.cpp     src/inteltab.h

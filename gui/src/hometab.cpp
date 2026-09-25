@@ -1,5 +1,6 @@
 #include "hometab.h"
 #include "fancurvedialog.h"
+#include "memorydialog.h"
 #include "scenes.h"
 #include "privileged.h"
 #include "sysinfo.h"
@@ -271,7 +272,23 @@ QGroupBox *HomeTab::buildHardwareBox() {
     add("Kernel", sysinfo::kernel());
     add("CPU", sysinfo::cpuModel());
     add("GPU", QStringLiteral("…"), &gpuHwKey_, &gpuHwValue_);
-    add("Memory", sysinfo::ramTotal());
+    {
+        QLabel *memVal = nullptr;
+        add("Memory", sysinfo::ramTotal(), nullptr, &memVal);
+        if (memVal) {
+            // Replace the plain value with value + a "Timings…" link to the SPD view.
+            auto *w = new QWidget;
+            auto *h = new QHBoxLayout(w);
+            h->setContentsMargins(0, 0, 0, 0);
+            g->removeWidget(memVal);
+            h->addWidget(memVal, 1);
+            auto *btn = new QPushButton("Timings…");
+            btn->setToolTip("Show each module's JEDEC timings from its SPD chip (read-only).");
+            connect(btn, &QPushButton::clicked, this, [this] { (new MemoryDialog(helperPath(), this))->show(); });
+            h->addWidget(btn);
+            g->addWidget(w, row - 1, 1);
+        }
+    }
     add("GPU mode", sysinfo::gpuMode());
     add("BIOS", sysinfo::biosInfo());
     add("EC Firmware", sysinfo::dmiClean("ec_firmware_release"));

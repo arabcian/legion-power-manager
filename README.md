@@ -1,5 +1,8 @@
 # Legion Power Manager 2 — Rust + C++/Qt6
 
+> ⚠️ **This tool writes low-level hardware and firmware settings. Read [DISCLAIMER.md](DISCLAIMER.md) before using it.**
+
+
 Port of the PySide6 Legion Power Manager: privileged work in Rust, GUI in Qt6.
 Five tabs: Home (power profile), Firmware Attributes, NVIDIA Curve Optimizer,
 Ryzen Curve Optimizer *or* Intel Undervolt (picked by CPU vendor), Optimizations
