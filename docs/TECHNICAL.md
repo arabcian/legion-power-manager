@@ -424,6 +424,13 @@ custom-painted views (V/F curve, fan curve, keyboard, tray icon) too.
   6 px spacing (Fusion's fallback of 0 drew button pairs touching).
 - Glyphs in `gui/data/theme/` (chevrons, check) are drawn for this palette at
   1× and 2×.
+- Themes: 8 premade dark palettes in `PALETTES` (theme.cpp) — Graphite
+  (default), Gruvbox, Dracula, Tokyo Night, Nord, Catppuccin Mocha, Crimson,
+  Glacier. Picked on Home (top right), stored as `theme=` in
+  `~/.config/legion-power-manager/gui.ini`, loaded before the first widget.
+  A change restarts the app in place (`execv /proc/self/exe --window` after
+  the event loop ends and the instance lock is released). Adding a theme is
+  one row of 19 colours.
 
 ## Firmware Attributes tab
 
