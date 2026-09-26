@@ -403,6 +403,28 @@ Differences from the PySide6 Home tab:
 - hwmon sensors are ordered numerically (temp2 before temp10).
 - `LPM_SCREENSHOT=/tmp/x.png` renders the window once and exits (dev aid).
 
+### Look and theme contract
+
+All colour, spacing and control styling lives in `gui/src/theme.{h,cpp}`; tabs
+only use the tokens and selectors below, so a palette change reaches the
+custom-painted views (V/F curve, fan curve, keyboard, tray icon) too.
+
+- Surfaces: `BG0` window → `BG1` card → `BG2` inner panel → `BG3` control →
+  `BG4` hover. Text inputs sit in a recessed `WELL` (darker than the card);
+  buttons are one step above it. Amber `ACCENT` marks only what is active.
+- Selectors: `btnAccent`, `btnDanger`, `btnMini`, `terminal`, `miniSlider`,
+  `box_<colour>` (group title colour), `role=muted|title`, `mainTabs`
+  (the header band). A `QGroupBox` inside another renders as a divided
+  sub-section, not a second card.
+- `theme::banner(color, selector)` is the one callout style (profile lock,
+  tuning state, crash guard, max fans, lighting access, AMD trial).
+- `theme::profileAccent()` follows the Legion power-button LED: Power Saver
+  blue, Balanced white, Performance red, Custom purple (Extreme magenta).
+- The app style is Fusion behind a small proxy that gives nested layouts a
+  6 px spacing (Fusion's fallback of 0 drew button pairs touching).
+- Glyphs in `gui/data/theme/` (chevrons, check) are drawn for this palette at
+  1× and 2×.
+
 ## Firmware Attributes tab
 
 Port of `fwattr_tab.py`, same fwattr-helper protocol (single + batch).

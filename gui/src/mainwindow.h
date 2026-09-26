@@ -10,6 +10,7 @@ class LightingTab;
 class NvidiaTab;
 class OptimizeTab;
 class RyzenTab;
+class QLabel;
 class QTabWidget;
 
 class MainWindow : public QMainWindow {
@@ -31,10 +32,12 @@ public:
 
 protected:
     void closeEvent(QCloseEvent *e) override;
+    void showEvent(QShowEvent *e) override;
     void hideEvent(QHideEvent *e) override;
 
 private:
     QTabWidget *tabs_;
+    QLabel *mark_;
     HomeTab *home_;
     RyzenTab *ryzen_ = nullptr;
     IntelTab *intel_ = nullptr;
