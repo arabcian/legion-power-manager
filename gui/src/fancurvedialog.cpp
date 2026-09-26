@@ -52,6 +52,7 @@ int FanCurveWidget::levelAt(double y) const {
 // Keeps the curve non-decreasing: raising a point lifts the ones to its right,
 // lowering it drops the ones to its left (the EC rejects nothing, so we must).
 void FanCurveWidget::setPoint(int step, int level) {
+    if (step == 9) level = std::max(level, 7);  // helper's thermal floor for the hottest step
     if (levels_[step] == level) return;
     levels_[step] = level;
     for (int j = step + 1; j < 10; ++j) levels_[j] = std::max(levels_[j], level);

@@ -355,9 +355,9 @@ void HomeTab::refreshLive() {
     // Not visible (hidden to tray / other tab) → no reads. nvidia-smi in
     // particular wakes the dGPU out of D3cold.
     if (!isVisible()) return;
-    refreshDevice();
     refreshGpuLive();
-    if (liveBusy_ || liveRows_.isEmpty()) return;  // never stack sweeps
+    const bool device = hasDeviceRows() && devicePending_ == 0;
+    if (liveBusy_ || (liveRows_.isEmpty() && !device)) return;  // never stack sweeps
 
     // The sysfs sweep runs off the GUI thread: battery/charger attributes are
     // ACPI method calls (_BST/_PSR) answered by the EC, and an EC that is busy
@@ -368,13 +368,19 @@ void HomeTab::refreshLive() {
     getters.reserve(liveRows_.size());
     for (const LiveRow &r : std::as_const(liveRows_)) getters.append(r.getter);
     QPointer<HomeTab> self(this);
-    QThreadPool::globalInstance()->start([self, getters] {
+    // The device rows ride along: their EC-backed reads block the same way.
+    std::optional<DevicePaths> paths;
+    if (device) paths = devicePaths();
+    QThreadPool::globalInstance()->start([self, getters, paths] {
         QList<std::optional<QString>> vals;
         vals.reserve(getters.size());
         for (const auto &g : getters) vals.append(g());
-        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, vals] {
+        std::optional<DeviceSnap> snap;
+        if (paths) snap = readDevice(*paths);
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, vals, snap] {
             if (!self) return;
             self->liveBusy_ = false;
+            if (snap) self->applyDevice(*snap);
             for (int i = 0; i < vals.size() && i < self->liveRows_.size(); ++i) {
                 const QString t = vals[i].value_or(QStringLiteral("—"));
                 if (self->liveRows_[i].value->text() != t) self->liveRows_[i].value->setText(t);
@@ -468,8 +474,8 @@ QGroupBox *HomeTab::buildDeviceBox() {
         gpuMode_->addItem("dGPU only (MUX → NVIDIA)", "dgpu");
         gpuMode_->setEnabled(false);
         gpuMode_->setToolTip("Which GPU drives the internal display — switched by the firmware at the next boot.\n"
-                             "Hybrid: the AMD iGPU drives the panel and the NVIDIA GPU can power off (much longer\n"
-                             "battery life); games render on NVIDIA through PRIME offload. Needs the amdgpu driver.\n"
+                             "Hybrid: the iGPU drives the panel and the NVIDIA GPU can power off (much longer\n"
+                             "battery life); games render on NVIDIA through PRIME offload. Needs the iGPU driver (amdgpu, or i915/xe on Intel).\n"
                              "dGPU only: the panel is wired straight to NVIDIA (lowest latency, G-SYNC on the\n"
                              "internal panel), the iGPU is hidden and the NVIDIA GPU never sleeps.");
         const bool amdNow = [] {
@@ -764,45 +770,78 @@ QGroupBox *HomeTab::buildDeviceBox() {
     return box;
 }
 
+HomeTab::DevicePaths HomeTab::devicePaths() const {
+    DevicePaths p{chargeFile_, ideapadDir_, fanHwmon_, fullSpeedWmae_ ? QString() : fullSpeedFile_, toggles_.keys(), {}};
+    for (const FanRow &f : fans_) p.fanKeys << f.key;
+    return p;
+}
+
+// Pure reads of plain strings: safe on a worker thread.
+HomeTab::DeviceSnap HomeTab::readDevice(const DevicePaths &p) {
+    DeviceSnap s;
+    if (!p.chargeFile.isEmpty()) s.charge = rdText(p.chargeFile);
+    for (const QString &k : p.toggleKeys) s.toggles.append({k, rdText(p.ideapadDir + '/' + k) == QLatin1String("1")});
+    for (const QString &key : p.fanKeys) {
+        // Each attribute exactly once per poll: the old code read every fan's
+        // input up to twice and its target three times (heuristic, max check,
+        // row update) — each one a WMI call into the EC.
+        const QString n = key.mid(3, key.indexOf('_') - 3);
+        bool okIn = false, okT = false;
+        const int in = rdText(p.fanHwmon + QStringLiteral("/fan") + n + QStringLiteral("_input")).toInt(&okIn);
+        const int tgt = rdText(p.fanHwmon + '/' + key).toInt(&okT);
+        s.fans.append({okIn ? in : -1, okT ? tgt : 0});
+    }
+    if (!p.fullSpeedFile.isEmpty()) s.fullSpeedRaw = rdText(p.fullSpeedFile);
+    return s;
+}
+
 void HomeTab::refreshDevice() {
-    if (devicePending_ > 0) return;  // a write is in flight; its callback refreshes
+    if (devicePending_ > 0 || !hasDeviceRows()) return;  // a write is in flight; its callback refreshes
+    applyDevice(readDevice(devicePaths()));
+}
+
+void HomeTab::applyDevice(const DeviceSnap &snap) {
+    if (devicePending_ > 0) return;  // a write started while the snapshot was taken: its callback refreshes
+    if (snap.fans.size() != fans_.size() || snap.toggles.size() != toggles_.size()) return;  // rows rebuilt meanwhile
     if (charge_ && !charge_->view()->isVisible()) {
-        const QString raw = rdText(chargeFile_);
+        const QString &raw = snap.charge;
         const int a = raw.indexOf('['), b = raw.indexOf(']');
         if (a >= 0 && b > a) {
             QSignalBlocker blk(charge_);
             charge_->setCurrentIndex(charge_->findData(raw.mid(a + 1, b - a - 1)));
         }
     }
-    for (auto it = toggles_.cbegin(); it != toggles_.cend(); ++it) {
-        QSignalBlocker blk(it.value());
-        it.value()->setChecked(rdText(ideapadDir_ + '/' + it.key()) == "1");
+    for (const auto &[key, on] : snap.toggles) {
+        if (QCheckBox *c = toggles_.value(key)) {
+            QSignalBlocker blk(c);
+            c->setChecked(on);
+        }
     }
+    auto rpmOf = [&](int i) { return std::max(0, snap.fans[i].first); };
+    auto targetOf = [&](int i) { return snap.fans[i].second; };
+    // "Looks full" = every target 0 (= "auto"), every fan ≥ 92 % of its max.
+    auto looksFull = [&] {
+        bool looks = true;
+        for (int i = 0; i < fans_.size(); ++i) {
+            const FanRow &f = fans_[i];
+            looks &= targetOf(i) == 0 && f.max > 0 && f.max < 9999 && rpmOf(i) >= f.max * 92 / 100;
+        }
+        return looks;
+    };
     // Full Speed: read it where the kernel exposes it; otherwise infer it —
     // every target 0 (= "auto") yet every fan at ≥ 92 % of its max for two polls in a row.
-    const std::optional<bool> fs = readFullSpeed();
+    std::optional<bool> fs;
+    if (fullSpeedWmae_) fs = wmaeFullSpeed_;
+    else if (snap.fullSpeedRaw && !snap.fullSpeedRaw->isEmpty())  // empty = read error: RPM heuristic
+        fs = fullSpeedPwm_ ? *snap.fullSpeedRaw == QLatin1String("0") : *snap.fullSpeedRaw == QLatin1String("1");
     bool suspect = false;
     if (fs) {
         fullSpeedOn_ = *fs;
         fullSpeedGuess_ = 0;
-        if (fullSpeedWmae_ && !fans_.isEmpty()) {
-            // Cached WMAE state: re-read it when the fans disagree (Fn hotkey,
-            // Windows, another tool). "Looks full" = every target 0, every fan ≥ 92 %.
-            bool looks = true;
-            for (const FanRow &f : std::as_const(fans_)) {
-                const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
-                const int in = rdText(fanHwmon_ + "/fan" + n + "_input").toInt(), tgt = rdText(fanHwmon_ + '/' + f.key).toInt();
-                looks &= tgt == 0 && f.max > 0 && f.max < 9999 && in >= f.max * 92 / 100;
-            }
-            if (looks != *fs) queryFullSpeed();
-        }
+        // Cached WMAE state: re-read it when the fans disagree (Fn hotkey, Windows, another tool).
+        if (fullSpeedWmae_ && !fans_.isEmpty() && looksFull() != *fs) queryFullSpeed();
     } else if (!fans_.isEmpty()) {
-        bool looks = true;
-        for (const FanRow &f : fans_) {
-            const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
-            const int in = rdText(fanHwmon_ + "/fan" + n + "_input").toInt(), tgt = rdText(fanHwmon_ + '/' + f.key).toInt();
-            looks &= tgt == 0 && f.max > 0 && f.max < 9999 && in >= f.max * 92 / 100;
-        }
+        const bool looks = looksFull();
         fullSpeedGuess_ = looks ? fullSpeedGuess_ + 1 : 0;
         if (!fanTouched_ && fullSpeedGuess_ >= 2) fullSpeedAtStart_ = true;
         if (!looks) fullSpeedAtStart_ = false;  // fans slowed down: whatever held them is gone
@@ -825,17 +864,15 @@ void HomeTab::refreshDevice() {
     }
 
     bool allMax = !fans_.isEmpty();
-    for (const FanRow &f : std::as_const(fans_)) {
-        const int t = rdText(fanHwmon_ + '/' + f.key).toInt();
-        allMax &= f.max > 0 && t >= f.max;
-    }
+    for (int i = 0; i < fans_.size(); ++i) allMax &= fans_[i].max > 0 && targetOf(i) >= fans_[i].max;
     const bool ecFs = fs && *fs;
     setMaxMode(allMax || ecFs, ecFs && !allMax);
 
-    for (const FanRow &f : fans_) {
-        const QString n = f.key.mid(3, f.key.indexOf('_') - 3);
-        f.rpm->setText(rdText(fanHwmon_ + "/fan" + n + "_input") + " RPM");
-        const int target = rdText(fanHwmon_ + '/' + f.key).toInt();
+    for (int i = 0; i < fans_.size(); ++i) {
+        const FanRow &f = fans_[i];
+        const QString rpmText = (snap.fans[i].first >= 0 ? QString::number(snap.fans[i].first) : QString()) + QStringLiteral(" RPM");
+        if (f.rpm->text() != rpmText) f.rpm->setText(rpmText);
+        const int target = targetOf(i);
         if (maxMode_) { f.maxBox->setChecked(true); f.autoBox->setChecked(false); continue; }
         // Force the Max display only for a real (read) Full Speed, or an inferred one
         // the user has not overridden yet; after a click the user's choice is shown.
@@ -971,14 +1008,6 @@ void HomeTab::queryFullSpeed() {
         const bool on = r.json.value("on").toBool();
         if (wmaeFullSpeed_ != on) { wmaeFullSpeed_ = on; refreshDevice(); }
     });
-}
-
-std::optional<bool> HomeTab::readFullSpeed() const {
-    if (fullSpeedWmae_) return wmaeFullSpeed_;
-    if (fullSpeedFile_.isEmpty()) return std::nullopt;
-    const QString v = rdText(fullSpeedFile_);
-    if (v.isEmpty()) return std::nullopt;  // read error: fall back to the RPM heuristic
-    return fullSpeedPwm_ ? v == QLatin1String("0") : v == QLatin1String("1");
 }
 
 void HomeTab::clearFullSpeed() {
@@ -1160,7 +1189,7 @@ void HomeTab::readGpuMode() {
             if (pending) gpuMode_->setItemText(i, gpuMode_->itemText(i) + QStringLiteral("  — after reboot (running %1)").arg(modeLabel(active)));
             gpuMode_->setCurrentIndex(i);
         }
-        gpuMode_->setStyleSheet(pending ? QStringLiteral("QComboBox { color: %1; }").arg(theme::WARN) : QString());
+        theme::setSheet(gpuMode_, pending ? QStringLiteral("QComboBox { color: %1; }").arg(theme::WARN) : QString());
         gpuMode_->setEnabled(true);
     }, 60000);
 }
@@ -1182,8 +1211,8 @@ void HomeTab::setGpuMode(const QString &mode, bool force) {
                     [this, mode](const privileged::Result &r) {
         gpuMode_->setEnabled(true);
         if (r.reached && r.json.value("needs_force").toBool()) {
-            const auto a = QMessageBox::warning(this, "GPU mode — amdgpu missing", r.message() +
-                "\n\nSwitch anyway? Only do this if you are about to boot a kernel that has amdgpu, "
+            const auto a = QMessageBox::warning(this, "GPU mode — iGPU driver missing", r.message() +
+                "\n\nSwitch anyway? Only do this if you are about to boot a kernel that has the iGPU driver, "
                 "or you know how to switch back in the BIOS setup (F2).", QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
             if (a == QMessageBox::Yes) setGpuMode(mode, true); else readGpuMode();
             return;

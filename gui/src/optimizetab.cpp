@@ -11,6 +11,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
+#include <QAbstractItemView>
 #include <QComboBox>
 #include <QDir>
 #include <QFile>
@@ -599,7 +600,12 @@ void OptimizeTab::refresh() {
 
 void OptimizeTab::onDescribe(const QJsonObject &d) {
     helperMissing_ = false;
-    topology_ = d.value("topology").toObject();
+    // describe runs every 4 s while the tab is shown; the topology only
+    // changes on hot-plug (SMT, CCD parking), so what is built from it is
+    // rebuilt only then — not a combo clear/refill and a rich-text relayout per poll.
+    const QJsonObject topo = d.value("topology").toObject();
+    bool topoChanged = topo != topology_;
+    topology_ = topo;
     state_ = d.value("state").toObject();
     boot_ = d.value("boot").toObject();
     const QJsonArray rows = d.value("tunables").toArray();
@@ -610,12 +616,13 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
     for (const Row &r : rows_) have << r.key;
     if (keys != have) {
         buildRows(rows);
+        topoChanged = true;  // new affinity combo / topology label
     } else {
         for (int i = 0; i < rows.size(); ++i) updateRow(rows_[i], rows[i].toObject());
     }
 
     // Affinity choices follow the live topology.
-    if (affinity_) {
+    if (affinity_ && (topoChanged || affinity_->count() == 0) && !affinity_->view()->isVisible()) {
         const QString keep = affinity_->currentData().toString();
         const QSignalBlocker b(affinity_);
         affinity_->clear();
@@ -639,7 +646,7 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
         const int k = affinity_->findData(keep);
         affinity_->setCurrentIndex(k < 0 ? 0 : k);
     }
-    if (topoLabel_) {
+    if (topoLabel_ && topoChanged) {
         QStringList lines;
         const int cache = topology_.value("cache_ccd").toInt(-1), freq = topology_.value("frequency_ccd").toInt(-1);
         for (const auto &cv : topology_.value("ccds").toArray()) {
@@ -674,7 +681,7 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
     }
     updateLaunchPreview();
     updateStateBanner();
-    reloadPresets(presetCombo_->currentData().toString());
+    reloadPresets(presetCombo_->currentData().toString(), true);
 }
 
 void OptimizeTab::buildRows(const QJsonArray &rows) {
@@ -826,7 +833,7 @@ void OptimizeTab::updateRow(Row &r, const QJsonObject &o) {
     r.cur->setText(!r.available ? QStringLiteral("n/a") : rootOnly ? QStringLiteral("root only")
                                 : r.kind == "bool" ? (r.current == "1" ? "enabled" : r.current == "0" ? "disabled" : r.current)
                                 : r.current);
-    r.cur->setStyleSheet(QStringLiteral("color:%1; background:transparent;").arg(r.available && !rootOnly ? theme::FG_DIM : theme::MUTED));
+    theme::setSheet(r.cur, QStringLiteral("color:%1; background:transparent;").arg(r.available && !rootOnly ? theme::FG_DIM : theme::MUTED));
     r.cur->setToolTip(r.available ? QStringLiteral("%1 file(s)").arg(o.value("files").toInt()) : "Not present on this kernel/hardware");
 
     // Keep a user edit; otherwise follow the live value. A spin box mid-edit
@@ -924,7 +931,7 @@ void OptimizeTab::markRow(Row &r) {
     if (!r.name) return;
     const bool pending = r.include->isChecked() && differs(r);
     const char *color = !r.available ? theme::MUTED : pending ? theme::ACCENT : r.caution ? theme::WARN : theme::FG;
-    r.name->setStyleSheet(QStringLiteral("color:%1; background:transparent;%2").arg(color, pending ? " font-weight:600;" : ""));
+    theme::setSheet(r.name, QStringLiteral("color:%1; background:transparent;%2").arg(color, pending ? " font-weight:600;" : ""));
 }
 
 OptimizeTab::Row *OptimizeTab::row(const QString &key) {
@@ -954,9 +961,9 @@ void OptimizeTab::updateStateBanner() {
         bannerDetail_->setText("Nothing changed by Legion Power Manager is in effect. Every change you apply is recorded and reversible.");
     }
     active_ = state_.value("active").toBool();
-    frame->setStyleSheet(QStringLiteral("#tuneBanner { background:%1; border:1px solid %2; border-left:3px solid %3; border-radius:%4px; }")
+    theme::setSheet(frame, QStringLiteral("#tuneBanner { background:%1; border:1px solid %2; border-left:3px solid %3; border-radius:%4px; }")
                              .arg(theme::BG1, theme::BORDER_SOFT, accent).arg(theme::RADIUS));
-    banner_->setStyleSheet(QStringLiteral("font-weight:700; background:transparent; color:%1;").arg(accent));
+    theme::setSheet(banner_, QStringLiteral("font-weight:700; background:transparent; color:%1;").arg(accent));
     restoreBtn_->setEnabled(active_ && !busy_);
 
     const QString bootName = boot_.value("preset").toString();
@@ -986,20 +993,34 @@ QJsonObject OptimizeTab::presetObject(const QString &name) const {
     return {};
 }
 
-void OptimizeTab::reloadPresets(const QString &select) {
+void OptimizeTab::reloadPresets(const QString &select, bool poll) {
+    // The periodic describe refresh leaves an open drop-down alone (clearing
+    // the model closed it under the cursor).
+    if (poll && presetCombo_->view()->isVisible()) return;
     const QString keep = select.isEmpty() ? presetCombo_->currentData().toString() : select;
     const QString game = gamePreset(), bootName = boot_.value("preset").toString();
+    QList<QPair<QString, QString>> items;  // (label, name)
+    for (const QString &n : presetNames()) {
+        const bool user = QFile::exists(presetsDir() + '/' + n + ".json");
+        QString label = (builtin(n) && !user ? QStringLiteral("◆ ") : QString()) + n;
+        if (builtin(n) && user) label += "  (edited)";
+        if (n == game) label += "  ★";
+        if (!bootName.isEmpty() && n == bootName) label += "  ⏻";
+        items.append({label, n});
+    }
+    if (poll) {
+        // Every 4 s: nothing to do unless the list itself changed (preset saved or
+        // deleted elsewhere, game/boot marker moved) — the refill and the summary
+        // re-read (a JSON parse per poll) used to run unconditionally.
+        bool same = presetCombo_->count() == items.size();
+        for (int i = 0; same && i < items.size(); ++i)
+            same = presetCombo_->itemText(i) == items[i].first && presetCombo_->itemData(i).toString() == items[i].second;
+        if (same) return;
+    }
     {
         const QSignalBlocker b(presetCombo_);
         presetCombo_->clear();
-        for (const QString &n : presetNames()) {
-            const bool user = QFile::exists(presetsDir() + '/' + n + ".json");
-            QString label = (builtin(n) && !user ? QStringLiteral("◆ ") : QString()) + n;
-            if (builtin(n) && user) label += "  (edited)";
-            if (n == game) label += "  ★";
-            if (!bootName.isEmpty() && n == bootName) label += "  ⏻";
-            presetCombo_->addItem(label, n);
-        }
+        for (const auto &[label, n] : items) presetCombo_->addItem(label, n);
         const int i = presetCombo_->findData(keep);
         presetCombo_->setCurrentIndex(i < 0 ? 0 : i);
     }

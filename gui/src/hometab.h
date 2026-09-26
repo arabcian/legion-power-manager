@@ -69,7 +69,26 @@ private:
     QGroupBox *buildHardwareBox();
     QGroupBox *buildLiveBox();
     QGroupBox *buildDeviceBox();  // nullptr when the machine exposes none of it
-    void refreshDevice();
+    // The device rows' values come from EC-backed attributes (lenovo_wmi_other
+    // fan*_input/fan*_target and ideapad toggles are ACPI/WMI method calls,
+    // tens of ms each on a busy EC). They are read once per poll into a
+    // snapshot — on the Live sweep's worker thread for the 2 s poll — and the
+    // widgets are updated from it on the GUI thread.
+    struct DeviceSnap {
+        QString charge;                       // raw charge_types line ("[Standard] Fast …")
+        QList<QPair<QString, bool>> toggles;  // ideapad attribute → "1"
+        QList<QPair<int, int>> fans;          // per fans_ row: (fanN_input, target); -1 = unreadable
+        std::optional<QString> fullSpeedRaw;  // fullSpeedFile_ content (sysfs flag), unset when not read
+    };
+    struct DevicePaths {
+        QString chargeFile, ideapadDir, fanHwmon, fullSpeedFile;
+        QStringList toggleKeys, fanKeys;
+    };
+    DevicePaths devicePaths() const;
+    static DeviceSnap readDevice(const DevicePaths &p);
+    bool hasDeviceRows() const { return charge_ || !toggles_.isEmpty() || !fans_.isEmpty() || fullSpeed_; }
+    void refreshDevice();                          // synchronous read + apply (after a user action)
+    void applyDevice(const DeviceSnap &snap);
     void setDevice(const QString &key, const QString &value);
     void runNvidiaSmi(const QStringList &args, std::function<void(const QByteArray &)> onOk);
 
@@ -122,7 +141,6 @@ private:
     bool fsQueryPending_ = false;
     qint64 nextFsQueryAt_ = 0;
     void queryFullSpeed();
-    std::optional<bool> readFullSpeed() const;
     void clearFullSpeed();
     // The Legion EC only returns fans to its own curve when every fan target is
     // 0: with any fan still manual, a fan set to 0 just keeps its last speed.

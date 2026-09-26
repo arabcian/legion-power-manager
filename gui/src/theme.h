@@ -2,6 +2,7 @@
 // Single source of truth for the look — port of theme.py.
 #include <QColor>
 #include <QString>
+#include <QWidget>
 
 class QApplication;
 
@@ -19,4 +20,8 @@ inline constexpr int FONT_PT = 10, RADIUS = 8;
 
 QString profileAccent(const QString &profile);
 void apply(QApplication &app);
+/// setStyleSheet() re-polishes the widget (and re-resolves every style rule
+/// for it) even when the sheet is identical; the tabs that restyle a label on
+/// every poll go through this so an unchanged state costs a string compare.
+inline void setSheet(QWidget *w, const QString &css) { if (w->styleSheet() != css) w->setStyleSheet(css); }
 }

@@ -84,7 +84,7 @@ private:
     int loadPresetObject(const QJsonObject &p, QStringList *skipped);
     bool writeUserPreset(const QString &name, const QJsonObject &p, QString *err = nullptr);
 
-    void reloadPresets(const QString &select = {});
+    void reloadPresets(const QString &select = {}, bool poll = false);
     void loadSelected();
     void saveAs();
     void deleteSelected();

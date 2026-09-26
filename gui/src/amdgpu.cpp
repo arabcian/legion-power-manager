@@ -1,15 +1,15 @@
 #include "amdgpu.h"
+#include "platformprofile.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QRegularExpression>
 
 namespace amdgpu {
 
 QByteArray readFile(const QString &path) {
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return {};
-    QByteArray b = f.read(64 * 1024);
+    QByteArray b = pp::readRaw(path).value_or(QByteArray());
     b.replace('\0', "");  // several SMUs pad their tables with NULs
     return b;
 }
@@ -172,10 +172,20 @@ Live readLive(const Card &c) {
     auto i = [](const QString &p) -> std::optional<int> { if (auto v = integer(p)) return int(*v); return std::nullopt; };
     l.busy = i(c.dev + "/gpu_busy_percent");
     if (c.hwmon.isEmpty()) return l;
-    // hwmon inputs are matched by label: the numbering differs between dGPUs and APUs.
-    const QDir h(c.hwmon);
-    for (const QString &f : h.entryList({QStringLiteral("*_label")}, QDir::Files | QDir::System)) {
-        const QString label = text(h.filePath(f)), input = h.filePath(f.chopped(6) + QStringLiteral("_input"));
+    // hwmon inputs are matched by label: the numbering differs between dGPUs and
+    // APUs. Labels are fixed for the hwmon device's lifetime, so the listing and
+    // the label reads happen once per hwmon path (GUI thread only), not per 1.5 s poll.
+    static QHash<QString, QList<QPair<QString, QString>>> labelCache;  // hwmon → (label, input)
+    auto it = labelCache.constFind(c.hwmon);
+    if (it == labelCache.constEnd()) {
+        QList<QPair<QString, QString>> found;
+        const QDir h(c.hwmon);
+        for (const QString &f : h.entryList({QStringLiteral("*_label")}, QDir::Files | QDir::System))
+            found.append({text(h.filePath(f)), h.filePath(f.chopped(6) + QStringLiteral("_input"))});
+        if (!found.isEmpty()) it = labelCache.insert(c.hwmon, found);  // empty: retried next poll (driver still probing)
+    }
+    const QList<QPair<QString, QString>> none;
+    for (const auto &[label, input] : (it == labelCache.constEnd() ? none : *it)) {
         if (label == QLatin1String("sclk")) { if (auto v = integer(input)) l.sclk = int(*v / 1000000); }
         else if (label == QLatin1String("mclk")) { if (auto v = integer(input)) l.mclk = int(*v / 1000000); }
         else if (label == QLatin1String("edge")) { if (auto v = integer(input)) l.edgeC = *v / 1000.0; }

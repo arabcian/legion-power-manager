@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 
 namespace pp {
 
@@ -14,10 +16,40 @@ static const QString CLASS_DIR = QStringLiteral("/sys/class/platform-profile");
 static const QString LEGACY_PROFILE = QStringLiteral("/sys/firmware/acpi/platform_profile");
 static const QString LEGACY_CHOICES = QStringLiteral("/sys/firmware/acpi/platform_profile_choices");
 
+// The Live box, the device rows, Scenes and the GPU tabs read a few hundred
+// sysfs attributes per poll. QFile::read(64 KiB) allocated (and QFile's own
+// read buffer added another) 64 KiB per attribute for what is almost always
+// under 32 bytes; this is one open() and read() into the stack, and only a
+// file that actually fills the first page grows a heap buffer.
+std::optional<QByteArray> readRaw(const QString &path) {
+    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    if (fd < 0) return std::nullopt;
+    constexpr qsizetype CAP = 64 * 1024;
+    char stack[4096];
+    QByteArray big;
+    qsizetype got = 0;
+    for (;;) {
+        char *dst = big.isNull() ? stack + got : big.data() + got;
+        const qsizetype room = (big.isNull() ? qsizetype(sizeof stack) : big.size()) - got;
+        const ssize_t n = ::read(fd, dst, size_t(room));
+        if (n < 0) { if (errno == EINTR) continue; got = 0; big.clear(); break; }  // read error: empty, as before
+        if (n == 0) break;
+        got += n;
+        if (got < (big.isNull() ? qsizetype(sizeof stack) : big.size())) continue;  // short read: sysfs may still have more
+        if (got >= CAP) break;
+        if (big.isNull()) { big.resize(std::min<qsizetype>(CAP, 16 * 1024)); std::memcpy(big.data(), stack, size_t(got)); }
+        else big.resize(std::min<qsizetype>(CAP, big.size() * 2));
+    }
+    ::close(fd);
+    if (big.isNull()) return QByteArray(stack, got);
+    big.truncate(got);
+    return big;
+}
+
 std::optional<QString> readText(const QString &path) {
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) return std::nullopt;
-    return QString::fromUtf8(f.read(64 * 1024)).trimmed();
+    const auto raw = readRaw(path);
+    if (!raw) return std::nullopt;
+    return QString::fromUtf8(*raw).trimmed();
 }
 
 QString Handler::path() const { return CLASS_DIR + '/' + node + QStringLiteral("/profile"); }

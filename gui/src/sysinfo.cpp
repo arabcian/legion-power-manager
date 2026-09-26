@@ -15,10 +15,11 @@ namespace sysinfo {
 
 static const QString SEP = QStringLiteral("  ·  ");
 static Opt rd(const QString &p) { return pp::readText(p); }
+// Numbers parse straight from the bytes: no UTF-16 round trip per attribute.
 static std::optional<long long> rdInt(const QString &p) {
-    auto s = rd(p);
+    const auto s = pp::readRaw(p);
     bool ok = false;
-    long long v = s ? s->toLongLong(&ok) : 0;
+    const long long v = s ? s->trimmed().toLongLong(&ok) : 0;
     return ok ? std::optional(v) : std::nullopt;
 }
 static Opt joined(const QStringList &l) { return l.isEmpty() ? Opt() : Opt(l.join(SEP)); }
@@ -117,13 +118,38 @@ Opt systemInfo() {
     return t.isEmpty() ? Opt() : Opt(t);
 }
 
+/// Directory entries that only change on hot-plug (power supplies, powercap
+/// zones, DRM cards), filtered once by `keep` and re-listed at most every 30 s.
+/// Thread-safe: the Live getters run on a worker thread.
+static QStringList cachedDirs(const QString &dir, bool (*keep)(const QString &path, const QString &entry)) {
+    struct Entry { QStringList paths; QElapsedTimer age; };
+    static QMutex mu;
+    static QHash<QString, Entry> cache;
+    const QMutexLocker lock(&mu);
+    const QString key = dir + QChar(0) + QString::number(quintptr(keep));
+    Entry &e = cache[key];
+    if (!e.age.isValid() || e.age.elapsed() > 30000) {
+        e.paths.clear();
+        const QDir d(dir);
+        for (const QString &n : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name))
+            if (const QString p = d.filePath(n); keep(p, n)) e.paths << p;
+        e.age.restart();
+    }
+    return e.paths;
+}
+
 // ── hwmon ───────────────────────────────────────────────────────────────────
 
-struct Chip { QString name, path; };
+/// One `<kind>N_input` file with its N and lower-cased label (both fixed for the
+/// chip's lifetime, so they are read once per scan, not once per poll).
+struct Input { QString path; int index; QString label; };
+struct Chip { QString name, path; QList<Input> temp, fan, power; };
 
-// hwmon chips only appear/disappear on module load or hot-plug; rescanning the
-// directory (plus every name file) for each of the 2 s Live getters is waste.
 static QList<Chip> scanChips();
+// hwmon chips only appear/disappear on module load or hot-plug, and a chip's
+// sensor files and labels never change while it exists: the directory walk,
+// the three globs per chip and every *_label read used to run for each 2 s
+// Live poll; now they run once per 30 s rescan and a poll only reads values.
 // The Live getters run on a worker thread (HomeTab::refreshLive), so the
 // shared cache is guarded.
 static QList<Chip> chips() {
@@ -132,17 +158,7 @@ static QList<Chip> chips() {
     static QElapsedTimer age;
     const QMutexLocker lock(&mu);
     if (!age.isValid() || age.elapsed() > 30000 || cache.isEmpty()) { cache = scanChips(); age.restart(); }
-    return cache;
-}
-
-static QList<Chip> scanChips() {
-    QList<Chip> out;
-    const QDir d(QStringLiteral("/sys/class/hwmon"));
-    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
-        const QString p = d.filePath(e);
-        if (auto n = rd(p + "/name"); n && !n->isEmpty()) out.append({*n, p});
-    }
-    return out;
+    return cache;  // implicitly shared: a copy is a refcount bump
 }
 
 /// N of ".../<kind>N_input" (0 if absent). Plain scan instead of a shared
@@ -156,27 +172,41 @@ static int trailingIndex(const QString &file) {
     return b < end ? QStringView(file).mid(b, end - b).toInt() : 0;
 }
 
-/// Sensor files `<kind>N_input` sorted by N (not lexically: temp10 > temp2).
-static QStringList inputs(const QString &chip, const QString &kind) {
-    QStringList l = QDir(chip).entryList({kind + "*_input"}, QDir::Files | QDir::System);
-    std::sort(l.begin(), l.end(), [](const QString &a, const QString &b) { return trailingIndex(a) < trailingIndex(b); });
-    for (QString &s : l) s = chip + '/' + s;
-    return l;
-}
-
-static QString label(const QString &input) {
-    return rd(input.chopped(6) + "_label").value_or(QString()).trimmed().toLower();
-}
-
-static std::optional<double> chipTemp(const QString &chip) {
-    const QStringList c = inputs(chip, "temp");
-    if (c.isEmpty()) return std::nullopt;
-    QString chosen = c.first();
-    for (const QString &f : c) {
-        const QString l = label(f);
-        if (l.contains("tctl") || l.contains("tdie") || l.contains("package")) { chosen = f; break; }
+/// Sensor files `<kind>N_input` sorted by N (not lexically: temp10 > temp2), one
+/// directory listing per chip for all three kinds.
+static void scanInputs(Chip &c) {
+    const QStringList all = QDir(c.path).entryList({QStringLiteral("temp*_input"), QStringLiteral("fan*_input"),
+                                                    QStringLiteral("power*_input")}, QDir::Files | QDir::System);
+    for (const QString &f : all) {
+        Input in{c.path + '/' + f, trailingIndex(f), QString()};
+        in.label = rd(in.path.chopped(6) + QStringLiteral("_label")).value_or(QString()).trimmed().toLower();
+        (f.startsWith(QLatin1String("temp")) ? c.temp : f.startsWith(QLatin1String("fan")) ? c.fan : c.power).append(in);
     }
-    auto v = rdInt(chosen);
+    for (QList<Input> *l : {&c.temp, &c.fan, &c.power})
+        std::sort(l->begin(), l->end(), [](const Input &a, const Input &b) { return a.index < b.index; });
+}
+
+static QList<Chip> scanChips() {
+    QList<Chip> out;
+    const QDir d(QStringLiteral("/sys/class/hwmon"));
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
+        const QString p = d.filePath(e);
+        if (auto n = rd(p + "/name"); n && !n->isEmpty()) {
+            Chip c{*n, p, {}, {}, {}};
+            scanInputs(c);
+            out.append(std::move(c));
+        }
+    }
+    return out;
+}
+
+static std::optional<double> chipTemp(const Chip &chip) {
+    if (chip.temp.isEmpty()) return std::nullopt;
+    const Input *chosen = &chip.temp.first();
+    for (const Input &f : chip.temp)
+        if (f.label.contains(QLatin1String("tctl")) || f.label.contains(QLatin1String("tdie"))
+            || f.label.contains(QLatin1String("package"))) { chosen = &f; break; }
+    auto v = rdInt(chosen->path);
     return v ? std::optional(*v / 1000.0) : std::nullopt;
 }
 
@@ -185,16 +215,16 @@ Opt cpuTemp() {
     for (const char *want : {"k10temp", "zenpower", "coretemp"}) {
         for (const Chip &c : cs) {
             if (c.name != QLatin1String(want)) continue;
-            auto main = chipTemp(c.path);
+            auto main = chipTemp(c);
             if (!main) continue;
             QString t = QStringLiteral("%1 °C").arg(*main, 0, 'f', 0);
             long long hottest = -1;
-            for (const QString &f : inputs(c.path, "temp")) {
-                QString l = label(f);
+            for (const Input &f : c.temp) {
                 // coretemp: "Core N" per physical core; show the hottest next to the package.
-                if (l.startsWith("core ")) { if (auto v = rdInt(f)) hottest = std::max(hottest, *v); continue; }
-                if (!l.startsWith("tccd")) continue;
-                if (auto v = rdInt(f)) t += SEP + l.replace("tccd", "CCD") + QStringLiteral(" %1°C").arg(*v / 1000.0, 0, 'f', 0);
+                if (f.label.startsWith(QLatin1String("core "))) { if (auto v = rdInt(f.path)) hottest = std::max(hottest, *v); continue; }
+                if (!f.label.startsWith(QLatin1String("tccd"))) continue;
+                if (auto v = rdInt(f.path))
+                    t += SEP + QString(f.label).replace(QLatin1String("tccd"), QLatin1String("CCD")) + QStringLiteral(" %1°C").arg(*v / 1000.0, 0, 'f', 0);
             }
             if (hottest >= 0) t += SEP + QStringLiteral("hottest core %1°C").arg(hottest / 1000.0, 0, 'f', 0);
             return t;
@@ -206,9 +236,10 @@ Opt cpuTemp() {
 Opt fans() {
     QStringList l;
     for (const Chip &c : chips())
-        for (const QString &f : inputs(c.path, "fan"))
-            if (auto rpm = rdInt(f); rpm && *rpm > 0 && l.size() < 4)
-                l << QStringLiteral("Fan %1 %2 RPM").arg(trailingIndex(f)).arg(*rpm);
+        for (const Input &f : c.fan) {
+            if (l.size() >= 4) return joined(l);
+            if (auto rpm = rdInt(f.path); rpm && *rpm > 0) l << QStringLiteral("Fan %1 %2 RPM").arg(f.index).arg(*rpm);
+        }
     return joined(l);
 }
 
@@ -216,9 +247,9 @@ Opt storage() {
     QStringList l;
     int n = 0;
     for (const Chip &c : chips()) {
-        if (c.name != "nvme") continue;
+        if (c.name != QLatin1String("nvme")) continue;
         ++n;
-        if (auto t = chipTemp(c.path)) l << QStringLiteral("NVMe %1 %2°C").arg(n).arg(*t, 0, 'f', 0);
+        if (auto t = chipTemp(c)) l << QStringLiteral("NVMe %1 %2°C").arg(n).arg(*t, 0, 'f', 0);
     }
     return joined(l);
 }
@@ -226,9 +257,10 @@ Opt storage() {
 Opt power() {
     QStringList l;
     for (const Chip &c : chips())
-        for (const QString &f : inputs(c.path, "power"))
-            if (auto uw = rdInt(f); uw && *uw > 0 && l.size() < 4)
-                l << QStringLiteral("%1 %2 W").arg(c.name).arg(*uw / 1e6, 0, 'f', 1);
+        for (const Input &f : c.power) {
+            if (l.size() >= 4) return joined(l);
+            if (auto uw = rdInt(f.path); uw && *uw > 0) l << QStringLiteral("%1 %2 W").arg(c.name).arg(*uw / 1e6, 0, 'f', 1);
+        }
     return joined(l);
 }
 
@@ -236,18 +268,17 @@ Opt igpu() {
     for (const Chip &c : chips()) {
         if (c.name != "amdgpu") continue;
         QStringList b;
-        if (auto t = chipTemp(c.path)) b << QStringLiteral("%1°C").arg(*t, 0, 'f', 0);
-        if (auto pw = inputs(c.path, "power"); !pw.isEmpty())
-            if (auto uw = rdInt(pw.first())) b << QStringLiteral("%1W").arg(*uw / 1e6, 0, 'f', 1);
+        if (auto t = chipTemp(c)) b << QStringLiteral("%1°C").arg(*t, 0, 'f', 0);
+        if (!c.power.isEmpty())
+            if (auto uw = rdInt(c.power.first().path)) b << QStringLiteral("%1W").arg(*uw / 1e6, 0, 'f', 1);
         if (auto hz = rdInt(c.path + "/freq1_input")) b << QStringLiteral("%1MHz").arg(*hz / 1000000);
         return joined(b);
     }
     // Intel iGPU (i915 / xe): no hwmon temp on most parts, the actual GT clock is enough.
-    const QDir drm(QStringLiteral("/sys/class/drm"));
-    for (const QString &e : drm.entryList({"card*"}, QDir::Dirs | QDir::System, QDir::Name)) {
-        if (e.contains('-')) continue;
-        const QString card = drm.filePath(e);
-        if (rd(card + "/device/vendor") != QStringLiteral("0x8086")) continue;
+    const QStringList cards = cachedDirs(QStringLiteral("/sys/class/drm"), [](const QString &p, const QString &e) {
+        return e.startsWith(QLatin1String("card")) && !e.contains('-') && rd(p + QStringLiteral("/device/vendor")) == QStringLiteral("0x8086");
+    });
+    for (const QString &card : cards) {
         auto mhz = rdInt(card + "/gt/gt0/rps_act_freq_mhz");                    // i915
         if (!mhz) mhz = rdInt(card + "/device/tile0/gt0/freq0/act_freq");        // xe
         if (!mhz) continue;
@@ -259,10 +290,10 @@ Opt igpu() {
 }
 
 Opt battery() {
-    const QDir d(QStringLiteral("/sys/class/power_supply"));
-    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
-        const QString p = d.filePath(e);
-        if (rd(p + "/type") != QStringLiteral("Battery")) continue;
+    const QStringList bats = cachedDirs(QStringLiteral("/sys/class/power_supply"), [](const QString &p, const QString &) {
+        return rd(p + QStringLiteral("/type")) == QStringLiteral("Battery");
+    });
+    for (const QString &p : bats) {
         QStringList b;
         if (auto cap = rd(p + "/capacity")) b << *cap + '%';
         if (auto st = rd(p + "/status"); st && !st->isEmpty()) b << *st;
@@ -283,15 +314,15 @@ Opt cpuPackagePower() {
     static QHash<QString, Sample> last;
     static QElapsedTimer clock;
     if (!clock.isValid()) clock.start();
-    const QDir d(QStringLiteral("/sys/class/powercap"));
-    QStringList l;
-    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
-        if (e.count(':') < 1 || e.count(':') > 2) continue;  // intel-rapl:0 (package), intel-rapl:0:0 (core)
+    const QStringList zones = cachedDirs(QStringLiteral("/sys/class/powercap"), [](const QString &, const QString &e) {
+        if (e.count(':') < 1 || e.count(':') > 2) return false;  // intel-rapl:0 (package), intel-rapl:0:0 (core)
         // intel-rapl-mmio mirrors the MSR package counter; showing both reads as two packages.
-        if (e.startsWith("intel-rapl-mmio") && d.exists(QStringLiteral("intel-rapl:0"))) continue;
-        const QString p = d.filePath(e);
+        return !(e.startsWith(QLatin1String("intel-rapl-mmio")) && QDir(QStringLiteral("/sys/class/powercap")).exists(QStringLiteral("intel-rapl:0")));
+    });
+    QStringList l;
+    for (const QString &p : zones) {
         const auto uj = rdInt(p + "/energy_uj");
-        const auto name = rd(p + "/name");
+        const auto name = rd(p + "/name");  // zone names are short; kept per poll so a renamed zone shows up
         if (!uj || !name) continue;
         Sample &s = last[p];
         const qint64 now = clock.elapsed();
@@ -307,13 +338,14 @@ Opt cpuPackagePower() {
 }
 
 Opt usbcInputs() {
-    const QDir d(QStringLiteral("/sys/class/power_supply"));
+    const QStringList ports = cachedDirs(QStringLiteral("/sys/class/power_supply"), [](const QString &, const QString &e) {
+        return e.startsWith(QLatin1String("ucsi-source-psy"));
+    });
     QStringList l;
     bool any = false;
-    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System, QDir::Name)) {
-        if (!e.startsWith(QStringLiteral("ucsi-source-psy"))) continue;
+    for (const QString &p : ports) {
+        const QString e = p.section('/', -1);
         any = true;
-        const QString p = d.filePath(e);
         if (rdInt(p + "/online").value_or(0) != 1) continue;
         const auto uv = rdInt(p + "/voltage_now"), ua = rdInt(p + "/current_now");
         const QString port = QStringLiteral("Port %1").arg(e.section(':', -1).toInt());
@@ -329,15 +361,16 @@ Opt usbcInputs() {
 Opt gpuMode() {
     // Display-class PCI functions: an AMD one next to the NVIDIA one = hybrid.
     const QDir d(QStringLiteral("/sys/bus/pci/devices"));
-    bool amd = false, nv = false;
+    // iGPU = an AMD *or* Intel display function (Legion/LOQ ship both CPU vendors).
+    bool igpu = false, nv = false;
     for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System)) {
         const QString p = d.filePath(e);
         if (!rd(p + "/class").value_or(QString()).startsWith(QStringLiteral("0x03"))) continue;
         const QString v = rd(p + "/vendor").value_or(QString());
-        amd |= v == QStringLiteral("0x1002");
+        igpu |= v == QStringLiteral("0x1002") || v == QStringLiteral("0x8086");
         nv |= v == QStringLiteral("0x10de");
     }
-    if (amd && nv) return QStringLiteral("Hybrid (iGPU + dGPU)");
+    if (igpu && nv) return QStringLiteral("Hybrid (iGPU + dGPU)");
     if (nv) return QStringLiteral("dGPU only (MUX) — iGPU disabled in firmware");
     return std::nullopt;
 }

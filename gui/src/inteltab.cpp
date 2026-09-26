@@ -20,6 +20,10 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QCoreApplication>
+#include <QFileInfo>
+#include <QPointer>
+#include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -146,7 +150,7 @@ IntelTab::IntelTab(QWidget *parent) : QWidget(parent) {
     connect(monOn_, &QCheckBox::toggled, this, [this](bool on) {
         monPrev_ = {};
         if (limRun_) limRun_->setText(on ? "Stop counting" : "Start counting");
-        if (on && isVisible()) { monTimer_->start(); pollMonitor(); } else { monTimer_->stop(); monLbl_->clear(); }
+        if (on && isVisible()) startMonitor(); else { stopMonitor(); monLbl_->clear(); }
     });
 
     auto *mid = new QHBoxLayout;
@@ -485,12 +489,12 @@ void IntelTab::showEvent(QShowEvent *e) {
     QWidget::showEvent(e);
     // First visit reads the CPU once (one pkexec round trip; silent for wheel via the polkit rule).
     if (!readOnce_ && !qEnvironmentVariableIsSet("LPM_PGO_TRAIN")) { readOnce_ = true; readStatus(); }
-    if (monOn_->isChecked()) monTimer_->start();
+    if (monOn_->isChecked()) startMonitor();
 }
 
 void IntelTab::hideEvent(QHideEvent *e) {
     QWidget::hideEvent(e);
-    monTimer_->stop();  // no pkexec polling while the tab (or window) is hidden
+    stopMonitor();  // no root sampling while the tab (or window) is hidden
     monPrev_ = {};
 }
 
@@ -683,6 +687,94 @@ void IntelTab::saveBoot() {
         runOp({{"op", "set_boot"}, {"config", cfg}});
 }
 
+IntelTab::~IntelTab() { stopMonitorStream(); }
+
+void IntelTab::startMonitor() {
+    // PGO training run: no root helper at all (the per-sample path fails fast).
+    if (!monStreamFailed_ && !qEnvironmentVariableIsSet("LPM_PGO_TRAIN")) { startMonitorStream(); return; }
+    monTimer_->start();
+    pollMonitor();
+}
+
+void IntelTab::stopMonitor() {
+    monTimer_->stop();
+    stopMonitorStream();
+}
+
+void IntelTab::startMonitorStream() {
+    if (monStream_) return;
+    QString pkexec;
+    for (const char *c : {"/usr/bin/pkexec", "/bin/pkexec"})
+        if (QFileInfo(QString::fromLatin1(c)).isFile()) { pkexec = QString::fromLatin1(c); break; }
+    if (pkexec.isEmpty() || !QFileInfo(helperPath()).isFile()) { monStreamFailed_ = true; startMonitor(); return; }
+    // Parented to the app, not the tab: once pkexec has exec'd the root helper
+    // we cannot kill it (EPERM), and a QProcess destructor would block the GUI
+    // waiting for it. Closing stdin makes it exit within one interval.
+    auto *p = new QProcess(QCoreApplication::instance());
+    monStream_ = p;
+    monStreamGotSample_ = false;
+    p->setProgram(pkexec);
+    p->setArguments({helperPath()});
+    p->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(p, &QProcess::readyReadStandardOutput, this, [this, p] {
+        while (p->canReadLine()) {
+            const QByteArray line = p->readLine(1 << 20);
+            const QJsonObject o = QJsonDocument::fromJson(line).object();
+            if (o.isEmpty() || o.value("stream_end").toBool()) continue;
+            if (!o.value("ok").toBool()) {
+                const QString err = o.value("error").toString();
+                if (err.startsWith(QLatin1String("unknown op"))) {  // older helper: per-sample polling instead
+                    monStreamFailed_ = true;
+                    if (monOn_->isChecked() && isVisible()) { monTimer_->start(); pollMonitor(); }
+                } else {
+                    monLbl_->setText(QStringLiteral("<span style='color:%1'>%2</span>").arg(theme::DANGER, err.toHtmlEscaped()));
+                }
+                continue;
+            }
+            monStreamGotSample_ = true;
+            if (clearLogsNext_) {  // requested before the stream was up
+                clearLogsNext_ = false;
+                p->write("clear\n");
+            }
+            showMonitor(o);
+        }
+        if (p->bytesAvailable() > (1 << 20)) p->readAll();  // runaway without newlines: drop
+    });
+    // Context is `p` (it outlives the tab); `self` guards every touch of the tab.
+    QPointer<IntelTab> self(this);
+    connect(p, &QProcess::finished, p, [self, this, p](int code, QProcess::ExitStatus) {
+        p->deleteLater();
+        if (!self || monStream_ != p) return;  // tab gone, or stopped on purpose
+        monStream_ = nullptr;
+        if (!monStreamGotSample_ && (code == 126 || code == 127)) {
+            monLbl_->setText(QStringLiteral("<span style='color:%1'>%2</span>").arg(theme::DANGER,
+                code == 126 ? QStringLiteral("authorization dismissed") : QStringLiteral("polkit did not authorize the monitor")));
+            return;  // no re-prompt loop; untick and tick again to retry
+        }
+        // The helper's 4 h ceiling (or a crash after samples): carry on if still wanted.
+        if (monStreamGotSample_ && monOn_->isChecked() && isVisible())
+            QTimer::singleShot(MONITOR_MS, this, [this] { if (monOn_->isChecked() && isVisible() && !monStream_) startMonitor(); });
+    });
+    connect(p, &QProcess::errorOccurred, p, [self, this, p](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        if (self && monStream_ == p) { monStream_ = nullptr; monStreamFailed_ = true; }
+        p->deleteLater();
+    });
+    p->start();
+    const bool clear = std::exchange(clearLogsNext_, false);
+    p->write(QJsonDocument(QJsonObject{{"op", "monitor_stream"}, {"interval_ms", MONITOR_MS}, {"clear_logs", clear}})
+                 .toJson(QJsonDocument::Compact) + '\n');
+}
+
+void IntelTab::stopMonitorStream() {
+    if (!monStream_) return;
+    QProcess *p = monStream_;
+    monStream_ = nullptr;
+    disconnect(p, &QProcess::readyReadStandardOutput, this, nullptr);
+    p->closeWriteChannel();  // helper sees EOF and exits; finished() deletes it
+    if (p->state() == QProcess::Starting) p->kill();
+}
+
 void IntelTab::pollMonitor() {
     if (busy_ || monInFlight_ || !isVisible()) return;
     monInFlight_ = true;
@@ -744,7 +836,8 @@ void IntelTab::updateLimits(const QJsonObject &limits) {
 void IntelTab::resetLimits() {
     limCounts_.clear();
     limSamples_ = 0;
-    clearLogsNext_ = true;  // the next monitor sample clears the sticky log bits
+    if (monStream_ && monStreamGotSample_) monStream_->write("clear\n");  // next streamed sample clears them
+    else clearLogsNext_ = true;  // the next monitor sample clears the sticky log bits
     for (QLabel *c : std::as_const(limCells_)) { c->setText(QStringLiteral("·")); c->setToolTip({}); }
     limInfo_->setText(monOn_->isChecked() ? QStringLiteral("Counters reset.") : QStringLiteral("Counters reset; press Start counting."));
 }

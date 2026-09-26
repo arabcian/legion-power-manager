@@ -26,6 +26,7 @@ class IntelTab : public QWidget {
     Q_OBJECT
 public:
     explicit IntelTab(QWidget *parent = nullptr);
+    ~IntelTab() override;
 
     QStringList savedProfileNames() const;
     /// Load + apply in one step (tray / game mode).
@@ -51,7 +52,11 @@ private:
     void setPositive(bool on);
     void importThrottleStop();
     void saveBoot();
-    void pollMonitor();
+    void pollMonitor();          // legacy: one pkexec per sample (old helper without monitor_stream)
+    void startMonitor();
+    void stopMonitor();
+    void startMonitorStream();   // one pkexec per session, one JSON line per sample
+    void stopMonitorStream();
     void showMonitor(const QJsonObject &s);
     void updateLimits(const QJsonObject &limits);
     void resetLimits();
@@ -93,4 +98,7 @@ private:
     int limSamples_ = 0;
     bool clearLogsNext_ = false;
     bool busy_ = false, readOnce_ = false, monInFlight_ = false;
+    class QProcess *monStream_ = nullptr;  // parented to qApp (root child: exits on stdin EOF)
+    bool monStreamFailed_ = false;         // helper predates monitor_stream → per-sample polling
+    bool monStreamGotSample_ = false;
 };

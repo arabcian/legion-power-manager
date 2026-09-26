@@ -918,7 +918,7 @@ void LightingTab::refreshBudget() {
     const bool fits = used <= REPORT_LEN && work_.size() <= MAX_EFFECTS;
     budget_->setText(QStringLiteral("%1 / %2 bytes · %3 effect(s)%4").arg(used).arg(REPORT_LEN).arg(work_.size())
                          .arg(dirty() ? QStringLiteral(" · not applied") : QString()));
-    budget_->setStyleSheet(fits ? QString() : QStringLiteral("color: %1;").arg(theme::DANGER));
+    theme::setSheet(budget_, fits ? QString() : QStringLiteral("color: %1;").arg(theme::DANGER));
     apply_->setEnabled(ready_ && !busy_ && dirty() && fits);
     revert_->setEnabled(ready_ && !busy_ && dirty());
 }

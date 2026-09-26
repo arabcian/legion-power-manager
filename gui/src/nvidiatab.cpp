@@ -573,7 +573,7 @@ void NvidiaTab::pollStats() {
     if (auto r = nvml_->eventReasons()) {
         const QString t = throttleText(*r);
         throttle_->setText(QStringLiteral("Limit: ") + (t.isEmpty() ? QStringLiteral("—") : t));
-        throttle_->setStyleSheet(QStringLiteral("color:%1;").arg(t.isEmpty() ? theme::FG_DIM : theme::WARN));
+        theme::setSheet(throttle_, QStringLiteral("color:%1;").arg(t.isEmpty() ? theme::FG_DIM : theme::WARN));
     }
     if (!tempsTried_) {
         tempsTried_ = true;
@@ -767,13 +767,13 @@ void NvidiaTab::updateCoreOffsetUi() {
         coreSpin_->setRange(-501, 500);
         coreSpin_->setSpecialValueText("⚠ curve");
         coreSpin_->setValue(-501);
-        coreSpin_->setStyleSheet(QStringLiteral("QSpinBox { color:%1; font-weight:600; }").arg(theme::DANGER));
+        theme::setSheet(coreSpin_, QStringLiteral("QSpinBox { color:%1; font-weight:600; }").arg(theme::DANGER));
     } else {
         coreSpin_->setEnabled(true);
         coreSpin_->setSpecialValueText(QString());
         coreSpin_->setRange(-500, 500);
         coreSpin_->setValue(coreOffset_);
-        coreSpin_->setStyleSheet(QString());
+        theme::setSheet(coreSpin_, QString());
     }
     coreSpin_->blockSignals(false);
 }

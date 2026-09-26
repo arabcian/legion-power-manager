@@ -16,6 +16,10 @@ namespace pp {
 inline const QStringList VALID_PROFILES{
     "low-power", "cool", "quiet", "balanced", "balanced-performance", "performance", "max-power", "custom"};
 
+/// Whole small file (sysfs/procfs attribute), at most 64 KiB. nullopt when it
+/// cannot be opened; an empty result means it opened but the read failed or
+/// returned nothing (callers treat that as "no value").
+std::optional<QByteArray> readRaw(const QString &path);
 std::optional<QString> readText(const QString &path);
 
 struct Handler {
