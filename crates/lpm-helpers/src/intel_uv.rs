@@ -69,7 +69,24 @@ pub const PLANES: &[(&str, u64, &str)] = &[
     ("cache", 2, "CPU Cache"),
     ("uncore", 3, "System Agent"),
     ("analogio", 4, "Analog I/O"),
+    // Arrow Lake only (see ARL_PLANES). Mapped on a Core Ultra 7 255HX: a
+    // BIOS MemSS offset of +20 mV read back as +19.5 mV on domain 6 (same
+    // encoding as the classic planes); a BIOS NGU offset of -5 mV read back
+    // as -4.9 mV on domain 7. System Agent (3) answers "not supported" there.
+    ("memss", 6, "Memory Subsystem (MemSS)"),
+    ("ngu", 7, "NGU fabric"),
 ];
+
+/// Domains that exist only on Arrow Lake; elsewhere they are never touched.
+pub const ARL_PLANES: &[&str] = &["memss", "ngu"];
+
+pub fn is_arrow_lake() -> bool { cpu_id().map_or(false, |c| codename(c.model) == "Arrow Lake") }
+
+/// Planes this CPU has: Arrow Lake-only ones dropped on other CPUs.
+pub fn cpu_planes() -> impl Iterator<Item = &'static (&'static str, u64, &'static str)> {
+    let arl = is_arrow_lake();
+    PLANES.iter().filter(move |p| arl || !ARL_PLANES.contains(&p.0))
+}
 /// IccMax exists for core/gpu/cache only (throttled CURRENT_PLANES).
 pub const ICC_PLANES: &[&str] = &["core", "gpu", "cache"];
 
@@ -500,7 +517,12 @@ pub fn parse_profile(v: &Value) -> Result<Profile, String> {
         for (i, r) in arr.iter().enumerate() { p.hwphint.push(parse_hwp_rule(r).map_err(|e| format!("hwphint[{i}]: {e}"))?); }
     }
     if let Some(m) = obj(root.get("voltage"), "voltage")? {
-        for k in m.keys() { if plane_index(k).is_none() { return Err(format!("unknown voltage plane '{k}'")); } }
+        for k in m.keys() {
+            if plane_index(k).is_none() { return Err(format!("unknown voltage plane '{k}'")); }
+            if ARL_PLANES.contains(&k.as_str()) && !is_arrow_lake() {
+                return Err(format!("voltage plane '{k}' exists only on Arrow Lake"));
+            }
+        }
         for &(k, idx, _) in PLANES {
             if let Some(mv) = num(m.get(k).unwrap_or(&Value::Null), &format!("voltage.{k}"))? {
                 mv_to_ticks_ex(mv, p.allow_positive).map_err(|e| format!("voltage.{k}: {e}"))?;
@@ -625,7 +647,7 @@ pub fn read_status() -> Value {
     };
 
     let mut planes = Map::new();
-    for &(k, idx, label) in PLANES {
+    for &(k, idx, label) in cpu_planes() {
         planes.insert(k.into(), match msr.mailbox(uv_read_cmd(idx)) {
             Ok(r) => json!({"label": label, "mv": (decode_mv(r) * 100.0).round() / 100.0,
                             "raw": format!("{r:#018x}"), "status": (r >> 32) & 0xFF}),
