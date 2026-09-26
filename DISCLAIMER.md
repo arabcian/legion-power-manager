@@ -52,7 +52,7 @@ After a memory timing change, test stability properly before trusting the system
 
 ## No warranty, no liability
 
-This software is provided **"as is", without warranty of any kind**, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. See the LICENSE file for the full terms.
+This software is provided **"as is", without warranty of any kind**, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. See the LICENSE file (GNU GPL v3 or later) for the full terms.
 
 In no event shall the authors or contributors be liable for any claim, damages, data loss, hardware damage, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or its use.
 

@@ -25,7 +25,15 @@ name = "lpm-helpers"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "lpm-spectrum",
  "serde_json",
+]
+
+[[package]]
+name = "lpm-spectrum"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

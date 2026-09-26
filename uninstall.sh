@@ -29,6 +29,8 @@ rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-
       "$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy" \
       /etc/xdg/autostart/legion-power-manager.desktop \
       /etc/polkit-1/rules.d/49-legion-power-manager.rules /etc/init.d/nvcurve-autoload
+rm -f "${UDEVDIR:-$PREFIX/lib/udev/rules.d}/70-legion-power-manager-lighting.rules"
+command -v udevadm >/dev/null && udevadm control --reload 2>/dev/null || true
 rm -f "$UNITDIR/nvcurve-autoload.service" "$UNITDIR/lpm-tune.service" "$UNITDIR/lpm-intel-uv.service" "$UNITDIR/lpm-intel-uv-daemon.service" "$UNITDIR/lpm-boot-guard.service"
 # Boot-guard state goes; the BIOS memory-timing backups (AodSetupRpl-*) stay:
 # they are the only copy of the variable from before an edit.

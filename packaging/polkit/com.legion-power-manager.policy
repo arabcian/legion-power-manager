@@ -3,7 +3,7 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>legion-power-manager</vendor>
-  <!-- Eight Rust root helpers, each pinned by exec.path; installed root:root 0755
+  <!-- Nine Rust root helpers, each pinned by exec.path; installed root:root 0755
        (nvcurve-root-helper 0700) under /usr/libexec/legion-power-manager.
        The password-less grant (wheel, local active session) comes only from
        /etc/polkit-1/rules.d/49-legion-power-manager.rules; the defaults below
@@ -81,6 +81,15 @@
     <message xml:lang="tr">Bir sonraki açılışta etkin olacak firmware ayarlarını değiştirmek için kimlik doğrulama gerekiyor. Hatalı değerler bilgisayarın açılmasını engelleyebilir.</message>
     <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/legion-firmware-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.legion-power-manager.lighting.write">
+    <description>Change the keyboard lighting via Legion Power Manager</description>
+    <description xml:lang="tr">Legion Power Manager ile klavye aydınlatmasını değiştir</description>
+    <message>Authentication is required to change the keyboard lighting (only needed while the udev rule is not applied)</message>
+    <message xml:lang="tr">Klavye aydınlatmasını değiştirmek için kimlik doğrulama gerekiyor (yalnızca udev kuralı henüz uygulanmamışken)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/lighting-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

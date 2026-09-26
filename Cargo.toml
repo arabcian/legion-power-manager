@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/lpm-helpers", "crates/nvcurve"]
+members = ["crates/lpm-helpers", "crates/lpm-spectrum", "crates/nvcurve"]
 
 [workspace.package]
 edition = "2021"
-license = "GPL-2.0-or-later"
+license = "GPL-3.0-or-later"
 
 [profile.release]
 opt-level = 3

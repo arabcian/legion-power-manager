@@ -18,6 +18,7 @@
 #   /usr/bin/nvcurve                                nvcurve CLI (Rust)
 #   /usr/bin/lpm-gamemode                           Lutris/Steam game-mode hook (runs as the user)
 #   /usr/libexec/legion-power-manager/*-helper      pkexec targets (root:root)
+#   $PREFIX/lib/udev/rules.d/70-legion-power-manager-lighting.rules   keyboard lighting (uaccess)
 #   /usr/share/polkit-1/actions/com.legion-power-manager.policy
 #   /etc/polkit-1/rules.d/49-legion-power-manager.rules
 #   /etc/init.d/nvcurve-autoload                    OpenRC boot-time GPU profile
@@ -95,7 +96,7 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lpm-boot-guard" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/lpm-boot-guard" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$DESTDIR$PREFIX/bin/"
@@ -107,6 +108,14 @@ sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/com.legion-power-manager.policy > 
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"; chmod 0644 "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"
 sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/49-legion-power-manager.rules > "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"; chmod 0644 "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
+# Keyboard lighting: uaccess on the Spectrum controller's hidraw node.
+UDEVDIR=${UDEVDIR:-$PREFIX/lib/udev/rules.d}
+install -d "${own[@]}" -m 0755 "$DESTDIR$UDEVDIR"
+install "${own[@]}" -m 0644 packaging/udev/70-legion-power-manager-lighting.rules "$DESTDIR$UDEVDIR/"
+if [[ -z "$DESTDIR" ]] && command -v udevadm >/dev/null; then
+    udevadm control --reload 2>/dev/null || true
+    udevadm trigger --subsystem-match=hidraw --action=change 2>/dev/null || true
+fi
 # Service files carry @BINDIR@/@LIBEXEC@ so a non-/usr PREFIX points at the right binaries.
 subst() { sed -e "s|@BINDIR@|$PREFIX/bin|g" -e "s|@LIBEXEC@|$LIBEXEC|g" "$1"; }
 for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard; do

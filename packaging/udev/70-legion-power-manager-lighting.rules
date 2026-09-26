@@ -1,0 +1,9 @@
+# Legion Power Manager — keyboard lighting (Lenovo Legion Gen10 Spectrum
+# per-key RGB, ITE 8258 controller, USB 048d:c1xx).
+#
+# Grants the active local session access to the controller's hidraw node
+# (uaccess: systemd-logind or elogind), so the Lighting tab, the tray and
+# scenes change lighting without pkexec. Without this rule lighting-helper
+# still works through pkexec. Sorted before 73-seat-late.rules, which is
+# where the uaccess tag is acted on.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c1??", TAG+="uaccess"

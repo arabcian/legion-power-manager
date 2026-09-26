@@ -3,14 +3,14 @@
 
 EAPI=8
 
-inherit cmake systemd xdg
+inherit cmake systemd udev xdg
 
 DESCRIPTION="Power profile, firmware attribute and CPU/GPU curve tuning for Lenovo Legion laptops"
 HOMEPAGE="https://localhost/legion-power-manager"
 # Self-contained tarball from ./make-dist.sh (crates vendored, offline build).
 SRC_URI="${P}.tar.xz"
 
-LICENSE="GPL-2+"
+LICENSE="GPL-3+"
 # Vendored crates
 LICENSE+=" Apache-2.0 MIT Unicode-3.0"
 SLOT="0"
@@ -51,7 +51,7 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lpm-boot-guard}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lighting-helper,lpm-boot-guard}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
 	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv}
@@ -79,13 +79,18 @@ src_install() {
 	exeinto /$(get_libdir)/elogind/system-sleep
 	exeopts -m0755
 	doexe "${T}"/50-lpm-intel-uv
+	udev_dorules packaging/udev/70-legion-power-manager-lighting.rules
 	keepdir /etc/nvcurve/profiles
 
-	dodoc README.md
+	dodoc README.md NOTICE DISCLAIMER.md
 }
 
 pkg_postinst() {
 	xdg_pkg_postinst
+	udev_reload
+	elog "Keyboard lighting (Legion Gen10 Spectrum RGB): re-login or re-plug once so the"
+	elog "  uaccess udev rule applies to the keyboard's hidraw node; until then the"
+	elog "  Lighting tab goes through pkexec."
 	elog "Boot-time GPU profile (set with ★ Default in the NVIDIA tab):"
 	elog "  OpenRC:  rc-update add nvcurve-autoload default"
 	elog "  systemd: systemctl enable nvcurve-autoload.service"
@@ -102,4 +107,9 @@ pkg_postinst() {
 	elog "Lutris hooks: /usr/bin/lpm-gamemode PRE / POST / RUN (see the Game launch sub-tab)."
 	elog "The Ryzen tab needs a root-owned ryzenadj in /usr/bin, /usr/sbin,"
 	elog "/usr/local/{bin,sbin} or /opt/ryzenadj."
+}
+
+pkg_postrm() {
+	xdg_pkg_postrm
+	udev_reload
 }

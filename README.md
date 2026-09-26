@@ -138,8 +138,8 @@ Unchanged data locations: `/etc/nvcurve/{config.json,profiles/}` (GPU),
 ## Scenes
 
 A scene is one name for the whole machine: power profile, firmware limits,
-CPU curve (Ryzen CO or Intel undervolt), NVIDIA curve, Optimizations preset
-and an optional command. It does not copy those settings — it names the
+CPU curve (Ryzen CO or Intel undervolt), NVIDIA curve, Optimizations preset,
+keyboard lighting (profile and brightness) and an optional command. It does not copy those settings — it names the
 profiles the other tabs already save, so editing a profile updates every
 scene that uses it. Each component can be left *Unchanged*.
 
@@ -178,6 +178,41 @@ Files: `~/.config/legion-power-manager/scenes/<name>.json` and
 active scene is shared with lpm-gamemode in
 `$XDG_RUNTIME_DIR/legion-power-manager/scene.json`. The tray
 has a *Scene* menu with every scene and the auto-switch toggle.
+
+## Keyboard lighting (Lighting tab)
+
+Legion Gen10 laptops with the "Spectrum" per-key RGB keyboard (ITE 8258
+controller, USB `048d:c1xx`, e.g. Legion Pro 7 16AFR10H / 16IAX10H) get a
+Lighting tab; without that controller the tab is not created.
+
+- **Profiles.** The controller stores six lighting profiles itself (shared
+  with Windows / Legion Space, kept across reboots). Choosing a profile
+  activates it and loads its effect list into the editor.
+- **Editor.** The keyboard is drawn from the controller's own key map (keys,
+  18 rear + 10 front/side accent lights, lid logo). Select lights by click /
+  drag (Ctrl/Shift adds), then *Paint selection* (a static colour), *Turn off
+  selection*, or build effects (static, colour change / pulse / wave, smooth,
+  rain, ripple, type lighting, rainbow wave / spiral) with speed, direction and
+  colours. A light belongs to one effect at a time.
+- **Apply** writes the profile into the controller. The whole profile must
+  fit one 960-byte report (shown under the editor): about 36 distinct colours
+  when every light is used. Writes land in the controller's non-volatile
+  store — apply when done, not in a loop.
+- **Brightness (0–9) and the lid logo** apply immediately; the tray has
+  *Keyboard Lighting* (profile, brightness, lights off) and scenes can set a
+  profile and brightness.
+- **Not available:** Audio bounce/ripple and Aurora (screen) sync need host
+  processing that exists only in Windows; profiles containing them are shown
+  and kept, not edited. Host-driven per-frame colour (LLT's Aurora protocol)
+  is ignored by the Gen10 firmware.
+- **Access.** `lighting-helper` runs as the user: the udev rule
+  `70-legion-power-manager-lighting.rules` tags the controller's hidraw node
+  `uaccess` (systemd-logind or elogind). It applies to nodes created after the
+  rule is installed — re-login or replug once; until then the tab offers
+  *Use administrator rights* (pkexec, polkit action
+  `com.legion-power-manager.lighting.write`). Nothing at login ever prompts.
+- Protocol: `crates/lpm-spectrum` (feature reports, report id 7, from
+  LenovoLegionToolkit; key legends after legion-spectrum-control, MIT).
 
 ## Boot guard
 
@@ -226,6 +261,7 @@ Cargo workspace:
 |---|---|---|
 | `crates/lpm-helpers` | pkexec root helpers: `legion-profile-helper`, `fwattr-helper`, `ryzen-co-helper` | step 1 ✔ |
 | `crates/lpm-helpers` `intel_uv` | Intel undervolt core, `intel-uv-helper`, `lpm-intel-uv` CLI | ✔ |
+| `crates/lpm-spectrum` | Spectrum keyboard protocol (hidraw): key map, effects, profiles; `lighting-helper` in lpm-helpers | ✔ |
 | `crates/nvcurve` | nvcurve core library: NvAPI + NVML (dlopen), HAL, safety, snapshots, profiles, autoload | step 2a ✔ |
 | `crates/nvcurve` bins | `nvcurve` CLI, `nvcurve-root-helper` | step 2b ✔ |
 | nvcurve REST/WS server | not ported — nothing in the GUI uses it | — |
@@ -610,3 +646,23 @@ the helpers (`tune::cpu_vendor()`).
   competitive*, *Intel low latency desktop*, *Intel compile throughput*,
   *Intel quiet battery*.
 * Dev aid: `LPM_CPU_VENDOR=amd|intel` forces the GUI's vendor.
+
+## Credits
+
+- **[Lenovo Legion Toolkit](https://github.com/LenovoLegionToolkit-Team/LenovoLegionToolkit)**
+  (GPL-3.0) — the Spectrum keyboard protocol, the keyboard product-ID table
+  per Legion series/generation and the per-effect parameter rules behind the
+  Lighting tab were learned from LLT's source. The code here is an independent
+  Rust / C++ implementation; no LLT source is included. Thank you to Bartosz
+  Cichecki, the LenovoLegionToolkit-Team and every LLT contributor.
+- **[legion-spectrum-control](https://github.com/alstergee/legion-spectrum-control)**
+  (MIT) — key legends used in the Lighting tab; confirmed the Gen10 layout.
+
+Details and the third-party license texts are in [NOTICE](NOTICE).
+
+## License
+
+Copyright (C) 2026 arabcian. Legion Power Manager is free software under the
+**GNU General Public License, version 3 or (at your option) any later version**
+— see [LICENSE](LICENSE). It comes with no warranty; read
+[DISCLAIMER.md](DISCLAIMER.md) before use.
