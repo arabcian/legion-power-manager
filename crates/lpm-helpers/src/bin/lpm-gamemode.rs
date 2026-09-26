@@ -34,7 +34,7 @@ macro_rules! log {
     ($($t:tt)*) => {{ use std::io::Write as _; let _ = writeln!(std::io::stderr(), $($t)*); }};
 }
 
-use lpm_helpers::tune;
+use lpm_helpers::{lighting, tune};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -440,7 +440,22 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
         }
     }
 
-    // 6. user command — as the user, no shell, detached
+    // 6. keyboard lighting — in-process as the user (udev uaccess on the
+    //    hidraw node); lighting-helper through pkexec only if that is denied.
+    if let Some(req) = lighting::scene_request(&s["lighting"]) {
+        let mut v = lighting::handle(&req);
+        if v["denied"] == true {
+            v = pkexec_helper(&format!("{HELPER_DIR}/lighting-helper"), &req)
+                .unwrap_or_else(|e| json!({"ok": false, "error": e}));
+        }
+        line("lighting", if v["ok"] == true {
+            Ok(format!("profile {} · brightness {}", v["profile"], v["brightness"]))
+        } else {
+            Err(v["error"].as_str().unwrap_or("failed").to_owned())
+        });
+    }
+
+    // 7. user command — as the user, no shell, detached
     if let Some(cmd) = s["command"].as_str().map(str::trim).filter(|c| !c.is_empty()) {
         // Same quoting rules as the GUI (QProcess::splitCommand).
         let argv = split_command(cmd);

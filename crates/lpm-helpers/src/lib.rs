@@ -17,6 +17,7 @@ pub mod memory_spd;
 pub mod intel_uv;
 pub mod intel_uv_daemon;
 pub mod legion_wmi;
+pub mod lighting;
 pub mod tune;
 
 /// Process-wide setup every root helper runs first.

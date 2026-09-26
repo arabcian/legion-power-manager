@@ -1,0 +1,10 @@
+[package]
+name = "lpm-spectrum"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Lenovo Legion Spectrum (ITE 8258, 048d:c1xx) per-key RGB keyboard over hidraw"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+libc = "0.2"

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
 description = "NVIDIA V/F curve management core (NvAPI + NVML via dlopen)"
-license = "GPL-2.0-or-later"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "nvcurve"
