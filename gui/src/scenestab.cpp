@@ -151,8 +151,9 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
         addRow(win_->ryzen() ? "CPU curve (Ryzen)" : "CPU undervolt (Intel)", cpu_,
                "A profile saved in the CPU tab. Reset sets every offset back to 0.");
     }
-    gpu_ = new QComboBox;
-    addRow("GPU curve (NVIDIA)", gpu_, "A profile saved in the NVIDIA tab. Reset clears the curve offsets.");
+    gpu_ = new QComboBox(this);
+    gpu_->hide();
+    if (win_->nvidia()) addRow("GPU curve (NVIDIA)", gpu_, "A profile saved in the NVIDIA tab. Reset clears the curve offsets.");
     tuning_ = new QComboBox;
     addRow("Optimizations", tuning_,
            "An Optimizations preset. Switching presets restores every knob the new one does not set, "
@@ -296,7 +297,7 @@ void ScenesTab::setEditor(const Scene &s) {
         const QStringList names = win_->ryzen() ? win_->ryzen()->savedProfileNames() : win_->intel()->savedProfileNames();
         fillChoice(cpu_, names, win_->ryzen() ? "Reset (0 offset)" : "Reset (0 mV)", s.cpu);
     }
-    fillChoice(gpu_, win_->nvidia()->profileNames(), "Reset curve", s.gpu);
+    fillChoice(gpu_, win_->nvidia() ? win_->nvidia()->profileNames() : QStringList(), "Reset curve", s.gpu);
     fillChoice(tuning_, win_->optimize()->presetNames(), "Restore originals", s.tuning);
     if (lightProfile_) {
         lightProfile_->setCurrentIndex(std::max(0, lightProfile_->findData(s.lightProfile)));
@@ -404,7 +405,7 @@ void ScenesTab::captureFirmware() {
         if (a.viaWmi()) { hasWmi = true; continue; }
         if (a.ranged) fw.insert(a.name, a.current);
     }
-    const QMap<QString, int> wmi = win_->fwattr()->wmiValues();
+    const QMap<QString, int> wmi = win_->fwattr() ? win_->fwattr()->wmiValues() : QMap<QString, int>();
     for (auto it = wmi.cbegin(); it != wmi.cend(); ++it) fw.insert(it.key(), it.value());
     if (fw.isEmpty()) { setStatus("This machine exposes no writable firmware attributes.", theme::WARN); return; }
     firmware_ = fw;

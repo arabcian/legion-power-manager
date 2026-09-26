@@ -26,6 +26,8 @@ struct FwAttr {
 class FwattrTab : public QWidget {
     Q_OBJECT
 public:
+    /// A firmware-attributes device with attributes, or the GameZone WMAE interface.
+    static bool present();
     explicit FwattrTab(QWidget *parent = nullptr);
     static QList<FwAttr> discover();
     /// Values of the WMI-only GPU knobs as last read back from the EC, or

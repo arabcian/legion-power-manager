@@ -16,6 +16,8 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QCoreApplication>
+#include <QProcess>
 #include <QPushButton>
 #include <QSlider>
 #include <QSpinBox>
@@ -512,7 +514,16 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     // do that while the app is starting hidden in the tray).
 }
 
-NvidiaTab::~NvidiaTab() { delete temps_; delete nvml_; }
+bool NvidiaTab::present() {
+    const QDir d(QStringLiteral("/sys/bus/pci/devices"));
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System)) {
+        auto rd = [&](const char *f) { QFile x(d.filePath(e) + '/' + QLatin1String(f)); return x.open(QIODevice::ReadOnly) ? x.readAll().trimmed() : QByteArray(); };
+        if (rd("vendor") == "0x10de" && rd("class").startsWith("0x03")) return true;
+    }
+    return false;
+}
+
+NvidiaTab::~NvidiaTab() { stopSensorStream(); delete temps_; delete nvml_; }
 
 void NvidiaTab::showEvent(QShowEvent *e) {
     QWidget::showEvent(e);
@@ -540,6 +551,9 @@ void NvidiaTab::showEvent(QShowEvent *e) {
 void NvidiaTab::hideEvent(QHideEvent *e) {
     QWidget::hideEvent(e);
     statsTimer_->stop();
+    stopSensorStream();
+    streamFailed_ = false;
+    streamAt_ = 0;
     delete temps_;  // NvAPI_Unload, like NVML below
     temps_ = nullptr;
     tempsTried_ = false;
@@ -569,11 +583,70 @@ void NvidiaTab::pollStats() {
             for (QLabel *l : {hotspot_, vram_})
                 l->setToolTip("NvAPI unavailable for this user — `sudo nvcurve sensors` reads it as root");
     }
-    if (temps_) {
+    // Blackwell: hotspot and partition temps are privileged register reads →
+    // the root stream supplies them; the user-mode reads cover the rest.
+    if (blackwell_ && !sensorStream_ && !streamFailed_) startSensorStream();
+    const bool streamFresh = QDateTime::currentMSecsSinceEpoch() - streamAt_ < 5000;
+    if (temps_ && !streamFresh) {
         const auto h = temps_->hotspot(blackwell_), v = temps_->vram(blackwell_);
         hotspot_->setText(h ? QStringLiteral("Hotspot: %1 °C").arg(*h) : QStringLiteral("Hotspot: — °C"));
         vram_->setText(v ? QStringLiteral("VRAM: %1 °C").arg(*v) : QStringLiteral("VRAM: — °C"));
     }
+}
+
+void NvidiaTab::startSensorStream() {
+    QString pkexec;
+    for (const char *c : {"/usr/bin/pkexec", "/bin/pkexec"})
+        if (QFileInfo(QString::fromLatin1(c)).isFile()) { pkexec = QString::fromLatin1(c); break; }
+    const QString helper = privileged::helperPath(QStringLiteral("nvcurve-sensors"));
+    if (pkexec.isEmpty() || !QFileInfo(helper).isExecutable()) {
+        streamFailed_ = true;
+        hotspot_->setToolTip("Blackwell hotspot needs root: nvcurve-sensors is not installed");
+        return;
+    }
+    // Parented to the app, not the tab: once pkexec has exec'd the root helper
+    // we can't kill it (EPERM) — it exits on its own when stdin closes.
+    auto *p = new QProcess(QCoreApplication::instance());
+    sensorStream_ = p;
+    p->setProgram(pkexec);
+    p->setArguments({helper});
+    connect(p, &QProcess::readyReadStandardOutput, this, [this, p] {
+        QByteArray last;
+        while (p->canReadLine()) last = p->readLine();
+        const QJsonObject o = QJsonDocument::fromJson(last).object();
+        if (o.isEmpty() || o.contains("error")) return;
+        streamAt_ = QDateTime::currentMSecsSinceEpoch();
+        const QJsonValue h = o.value("hotspot_c"), v = o.value("vram_c");
+        hotspot_->setText(h.isDouble() ? QStringLiteral("Hotspot: %1 °C").arg(h.toInt()) : QStringLiteral("Hotspot: — °C"));
+        if (v.isDouble()) vram_->setText(QStringLiteral("VRAM: %1 °C").arg(v.toInt()));
+        QStringList parts;
+        for (const QJsonValue &x : o.value("vram_partitions").toArray())
+            parts << QStringLiteral("%1 %2°").arg(x.toArray().at(0).toString()).arg(x.toArray().at(1).toInt());
+        vram_->setToolTip(parts.isEmpty() ? QString() : QStringLiteral("Hottest memory sensor. All: ") + parts.join("  "));
+    });
+    connect(p, &QProcess::finished, p, [this, p](int code) {
+        if (sensorStream_ == p) {
+            sensorStream_ = nullptr;
+            if (code != 0) {  // denied / no agent: don't ask again until the tab is reopened
+                streamFailed_ = true;
+                hotspot_->setToolTip("Blackwell hotspot needs root and the sensor helper was not authorized");
+            }
+        }
+        p->deleteLater();
+    });
+    connect(p, &QProcess::errorOccurred, p, [this, p](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart) { if (sensorStream_ == p) sensorStream_ = nullptr; streamFailed_ = true; p->deleteLater(); }
+    });
+    p->start();
+}
+
+void NvidiaTab::stopSensorStream() {
+    if (!sensorStream_) return;
+    QProcess *p = sensorStream_;
+    sensorStream_ = nullptr;
+    disconnect(p, &QProcess::readyReadStandardOutput, this, nullptr);
+    p->closeWriteChannel();  // helper sees EOF and exits; finished() deletes it
+    if (p->state() == QProcess::Starting) p->kill();
 }
 
 void NvidiaTab::syncPowerMizer() {

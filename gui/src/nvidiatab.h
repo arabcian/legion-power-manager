@@ -23,6 +23,8 @@ class NvidiaTab : public QWidget {
     Q_OBJECT
 public:
     explicit NvidiaTab(QWidget *parent = nullptr);
+    /// An NVIDIA display-class PCI device exists (the tab is only created then).
+    static bool present();
     ~NvidiaTab() override;
 
     QStringList profileNames() const;
@@ -69,6 +71,8 @@ private:
     void deleteProfile();
     void pollStats();
     void syncPowerMizer();
+    void startSensorStream();
+    void stopSensorStream();
 
     VfCurveWidget *vf_;
     QLabel *temp_, *power_, *clock_, *memClock_, *hotspot_, *vram_, *throttle_;
@@ -85,6 +89,9 @@ private:
     Nvml *nvml_ = nullptr;
     NvApiTemps *temps_ = nullptr;   // opened with NVML, closed on hide
     bool tempsTried_ = false, blackwell_ = false;
+    class QProcess *sensorStream_ = nullptr;  // root nvcurve-sensors (Blackwell hotspot/partitions)
+    bool streamFailed_ = false;
+    qint64 streamAt_ = 0;                      // last line received (ms since epoch)
 
     QVector<QPointF> base_;          // (mV, base MHz) of GPU-domain points
     QHash<int, int> pointOffsets_;   // per-point MHz, on top of coreOffset_

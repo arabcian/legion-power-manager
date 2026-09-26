@@ -571,7 +571,7 @@ void SceneEngine::start(const Scene &s) {
     }
 
     // 4. NVIDIA V/F curve.
-    if (s.gpu.kind != Choice::Unchanged) {
+    if (s.gpu.kind != Choice::Unchanged && win_->nvidia()) {
         addStep("GPU curve", [this, c = s.gpu](Done done) {
             // Two NvAPI sessions writing the ClockBoostTable at once is asking for trouble.
             if (win_->nvidia()->busy()) { done(false, "the NVIDIA tab is busy; skipped"); return; }

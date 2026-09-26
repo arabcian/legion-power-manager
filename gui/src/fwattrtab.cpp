@@ -74,6 +74,14 @@ static bool wmaeAvailable() {
                                                                   QDir::Dirs | QDir::System | QDir::NoDotAndDotDot).isEmpty();
 }
 
+bool FwattrTab::present() {
+    const QDir base(BASE);
+    for (const QString &dev : base.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System))
+        if (!QDir(base.filePath(dev) + QStringLiteral("/attributes")).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty())
+            return true;
+    return wmaeAvailable();
+}
+
 static std::optional<int> readInt(const QString &p) {
     auto s = pp::readText(p);
     bool ok = false;

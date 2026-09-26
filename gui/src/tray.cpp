@@ -167,8 +167,8 @@ void Tray::rebuild() {
     }
 
     // NVIDIA
+    if (NvidiaTab *nv = win_->nvidia()) {  // no NVIDIA GPU → no menu
     QMenu *nm = menu_->addMenu("GPU Curve (NVIDIA)");
-    NvidiaTab *nv = win_->nvidia();
     const QStringList nnames = nv->profileNames();
     const QString def = nv->defaultProfileName();
     if (nnames.isEmpty()) disabledEntry(nm, "(no saved profiles)");
@@ -183,6 +183,7 @@ void Tray::rebuild() {
         if (claimCooldown()) nv->resetCurve();
     });
     nm->setEnabled(!nv->busy());  // greyed while an NVIDIA helper call is in flight
+    }
 
     // Optimizations
     QMenu *om = menu_->addMenu("Optimizations");

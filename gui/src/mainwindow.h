@@ -38,10 +38,10 @@ private:
     HomeTab *home_;
     RyzenTab *ryzen_ = nullptr;
     IntelTab *intel_ = nullptr;
-    NvidiaTab *nvidia_;
+    NvidiaTab *nvidia_ = nullptr;
     AmdGpuTab *amdgpu_ = nullptr;
     OptimizeTab *optimize_;
-    FwattrTab *fwattr_;
+    FwattrTab *fwattr_ = nullptr;
     LightingTab *lighting_ = nullptr;
     SceneEngine *scenes_;
     bool forceQuit_ = false, hideOnClose_ = false;

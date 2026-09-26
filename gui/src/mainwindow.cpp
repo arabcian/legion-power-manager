@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include <QFile>
 #include "amdgputab.h"
 #include "fwattrtab.h"
 #include "hometab.h"
@@ -34,13 +35,19 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     home_ = new HomeTab;
     tabs_->addTab(home_, "Home");
-    auto *fw = fwattr_ = new FwattrTab;
     const int scenesAt = tabs_->count();  // Scenes sits right after Home; built last (it reads every tab)
-    tabs_->addTab(fw, "Firmware Attributes");
-    // Switching to Custom on Home unlocks this tab immediately (not after its poll).
-    connect(home_, &HomeTab::profileChanged, fw, &FwattrTab::refreshLockState);
-    nvidia_ = new NvidiaTab;
-    tabs_->addTab(nvidia_, "NVIDIA Curve Optimizer");
+    // Every tab below exists only where its hardware/firmware interface does,
+    // so nobody is offered a control their machine can't honour.
+    if (FwattrTab::present()) {
+        fwattr_ = new FwattrTab;
+        tabs_->addTab(fwattr_, "Firmware Attributes");
+        // Switching to Custom on Home unlocks this tab immediately (not after its poll).
+        connect(home_, &HomeTab::profileChanged, fwattr_, &FwattrTab::refreshLockState);
+    }
+    if (NvidiaTab::present()) {
+        nvidia_ = new NvidiaTab;
+        tabs_->addTab(nvidia_, "NVIDIA Curve Optimizer");
+    }
     // AMD GPU tuning: discrete Radeon or the CPU's integrated graphics (Hybrid mode).
     if (AmdGpuTab::present()) {
         amdgpu_ = new AmdGpuTab;
@@ -49,7 +56,19 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     // One CPU voltage tab per vendor: Curve Optimizer (AMD SMU) or the
     // OC-mailbox undervolt tab (Intel). The other one is never created, so
     // nothing polls ryzen_smu on Intel or touches MSR 0x150 on AMD.
-    if (sysinfo::isAmd()) {
+    // Curve Optimizer exists from Zen 3 mobile on (family 0x19 Zen 3/4, 0x1A Zen 5);
+    // Renoir/Picasso (0x17) have no per-core CO, so no tab there.
+    const int cpuFamily = [] {
+        QFile f(QStringLiteral("/proc/cpuinfo"));
+        if (!f.open(QIODevice::ReadOnly)) return 0;
+        // procfs reports size 0, so QFile::atEnd() is true before the first
+        // read — a readLine() loop never ran and the tab vanished. The field
+        // is in the first processor block, well within 4 KiB.
+        for (const QByteArray &l : f.read(4096).split('\n'))
+            if (l.startsWith("cpu family")) return l.mid(l.indexOf(':') + 1).trimmed().toInt();
+        return 0;
+    }();
+    if (sysinfo::isAmd() && cpuFamily >= 0x19) {
         ryzen_ = new RyzenTab;
         tabs_->addTab(ryzen_, "Ryzen Curve Optimizer");
     } else if (sysinfo::isIntel()) {

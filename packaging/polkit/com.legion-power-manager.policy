@@ -29,6 +29,16 @@
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/nvcurve-root-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
+  <action id="com.legion-power-manager.nvcurve.sensors">
+    <description>Read NVIDIA GPU hotspot and memory temperatures (read-only)</description>
+    <description xml:lang="tr">NVIDIA GPU hotspot ve bellek sıcaklıklarını oku (salt okunur)</description>
+    <message>Authentication is required to read NVIDIA GPU sensors</message>
+    <message xml:lang="tr">NVIDIA GPU sensörlerini okumak için kimlik doğrulama gerekiyor</message>
+    <!-- Read-only, fixed register offsets, no input: the active local session gets it without a prompt. -->
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/nvcurve-sensors</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
   <action id="com.legion-power-manager.amdgpu.tune">
     <description>Change AMD GPU clocks, voltage, power limit and fan settings via Legion Power Manager</description>
     <description xml:lang="tr">Legion Power Manager üzerinden AMD GPU saat, voltaj, güç limiti ve fan ayarlarını değiştir</description>
