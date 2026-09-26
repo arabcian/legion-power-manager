@@ -11,6 +11,16 @@ use std::path::Path;
 /// Marketing-name prefixes accepted (case-insensitive, word-anchored).
 pub const FAMILIES: &[&str] = &["Legion", "LOQ", "IdeaPad Gaming"];
 
+/// China-market Legion / GeekPro names that may not carry "Legion" in DMI
+/// (from LenovoLegionToolkit's allowed-model list): "Y9000P IAX10", "R9000K"…
+pub const CN_MODELS: &[&str] = &["Y9000", "R9000", "Y7000", "R7000", "G5000"];
+
+/// A word of the name starts with one of CN_MODELS ("Y9000P" yes, "XY9000" no).
+fn names_cn_model(name: &str) -> bool {
+    name.to_ascii_uppercase().split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| CN_MODELS.iter().any(|m| w.starts_with(m)))
+}
+
 fn read(base: &Path, f: &str) -> String {
     std::fs::read_to_string(base.join(f)).map(|s| s.trim().to_owned()).unwrap_or_default()
 }
@@ -42,7 +52,7 @@ pub fn check_at(dmi: &Path) -> Result<String, String> {
         return Err(format!("unsupported machine ({what}): Legion Power Manager runs only on \
                             Lenovo Legion, LOQ and IdeaPad Gaming laptops"));
     }
-    if names.iter().any(|n| names_family(n)) {
+    if names.iter().any(|n| names_family(n) || names_cn_model(n)) {
         Ok(shown)
     } else {
         Err(format!("unsupported Lenovo model ({shown}): Legion Power Manager runs only on \
@@ -51,6 +61,50 @@ pub fn check_at(dmi: &Path) -> Result<String, String> {
 }
 
 pub fn check() -> Result<String, String> { check_at(Path::new("/sys/class/dmi/id")) }
+
+/// BIOS identity: "SMCN19WW" → prefix "SMCN" (the board family), version 19.
+/// Lenovo reuses a prefix across every BIOS release of one board, so firmware
+/// quirks are keyed on it (the scheme LenovoLegionToolkit uses).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Bios { pub prefix: String, pub version: Option<u32> }
+
+pub fn parse_bios(raw: &str) -> Bios {
+    let raw = raw.trim();
+    let head: String = raw.chars().take(4).collect();
+    if head.len() < 4 || !head.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        return Bios::default();
+    }
+    let rest = &raw[4..];
+    let version = rest.as_bytes().windows(2).position(|w| w[0].is_ascii_digit() && w[1].is_ascii_digit())
+        .and_then(|i| rest[i..i + 2].parse().ok());
+    Bios { prefix: head, version }
+}
+
+pub fn bios_at(dmi: &Path) -> Bios { parse_bios(&read(dmi, "bios_version")) }
+pub fn bios() -> Bios { bios_at(Path::new("/sys/class/dmi/id")) }
+
+/// Known firmware bugs when switching platform profiles, as worked around by
+/// LenovoLegionToolkit (PowerModeFeature):
+///  - J2CN boards: Quiet → Performance directly misbehaves; go through Balanced.
+///  - K1CN boards: leaving Custom directly misbehaves; step through another
+///    mode first (Quiet via Performance, Balanced via Quiet, Performance via
+///    Balanced, Extreme is simply written twice).
+/// Returns the mode to write first (kernel names), or None.
+pub fn profile_detour(bios: &Bios, from: &str, to: &str) -> Option<&'static str> {
+    if bios.prefix.eq_ignore_ascii_case("J2CN") && from == "low-power" && to == "performance" {
+        return Some("balanced");
+    }
+    if bios.prefix.eq_ignore_ascii_case("K1CN") && from == "custom" && to != "custom" {
+        return match to {
+            "low-power" => Some("performance"),
+            "balanced" => Some("low-power"),
+            "performance" => Some("balanced"),
+            "max-power" => Some("max-power"),
+            _ => None,
+        };
+    }
+    None
+}
 
 #[cfg(test)]
 mod tests {
@@ -86,6 +140,31 @@ mod tests {
             let d = dmi("LENOVO", ver, fam);
             assert!(check_at(&d.0).is_ok(), "{ver} / {fam}");
         }
+    }
+
+    #[test]
+    fn china_models() {
+        for ver in ["Lenovo Y9000P IAX10", "R9000K", "Y7000P 2024", "GeekPro G5000 IAX10"] {
+            assert!(check_at(&dmi("LENOVO", ver, "").0).is_ok(), "{ver}");
+        }
+        for ver in ["XY9000", "Y900", "Yoga 9000"] {
+            assert!(check_at(&dmi("LENOVO", ver, "").0).is_err(), "{ver}");
+        }
+        assert!(check_at(&dmi("HP", "Y9000P", "").0).is_err());
+    }
+
+    #[test]
+    fn bios_and_detours() {
+        assert_eq!(parse_bios("SMCN19WW"), Bios { prefix: "SMCN".into(), version: Some(19) });
+        assert_eq!(parse_bios("J2CN25WW\n"), Bios { prefix: "J2CN".into(), version: Some(25) });
+        assert_eq!(parse_bios("1.19"), Bios::default());
+        let (j2, k1, sm) = (parse_bios("J2CN25WW"), parse_bios("K1CN31WW"), parse_bios("SMCN19WW"));
+        assert_eq!(profile_detour(&j2, "low-power", "performance"), Some("balanced"));
+        assert_eq!(profile_detour(&j2, "balanced", "performance"), None);
+        assert_eq!(profile_detour(&k1, "custom", "balanced"), Some("low-power"));
+        assert_eq!(profile_detour(&k1, "custom", "custom"), None);
+        assert_eq!(profile_detour(&sm, "custom", "balanced"), None);
+        assert_eq!(profile_detour(&sm, "low-power", "performance"), None);
     }
 
     #[test]

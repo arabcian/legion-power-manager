@@ -104,14 +104,29 @@ fn set_profile(node: Option<&str>, profile: &str) -> Value {
         }
     };
 
+    // Firmware switching bugs on some boards (see machine::profile_detour):
+    // pass through an intermediate mode the handler offers, then the target.
+    let mut via = None;
+    if let Ok(current) = read_trimmed(&target) {
+        if let Some(mid) = lpm_helpers::machine::profile_detour(&lpm_helpers::machine::bios(), &current, profile) {
+            let choices = target.parent().map(|d| d.join("choices"))
+                .filter(|p| p.exists()).unwrap_or_else(|| PathBuf::from("/sys/firmware/acpi/platform_profile_choices"));
+            let offered = read_trimmed(&choices).map_or(false, |c| c.split_whitespace().any(|w| w == mid));
+            if offered && sysfs_write(&target, mid.as_bytes()).is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                via = Some(mid);
+            }
+        }
+    }
+
     if let Err(e) = sysfs_write(&target, profile.as_bytes()) {
-        return json!({"ok": false, "error": explain(&e, profile, &target)});
+        return json!({"ok": false, "error": explain(&e, profile, &target), "via": via});
     }
 
     // Firmware may land elsewhere (e.g. mode unavailable on battery):
     // report what is actually in effect.
     let effective = read_trimmed(&target).unwrap_or_else(|_| profile.to_owned());
-    json!({"ok": true, "profile": profile, "effective": effective})
+    json!({"ok": true, "profile": profile, "effective": effective, "via": via})
 }
 
 // ── device controls ─────────────────────────────────────────────────────────

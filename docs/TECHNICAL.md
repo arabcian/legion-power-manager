@@ -105,6 +105,21 @@ Unchanged data locations: `/etc/nvcurve/{config.json,profiles/}` (GPU),
 
 ## Supported machines
 
+Hardware-safety rules taken from LenovoLegionToolkit (behaviour only, no code):
+
+- China-market names without "Legion" in DMI (Y9000*, R9000*, Y7000*, R7000*,
+  GeekPro G5000*) are accepted, in the GUI and in every helper.
+- Firmware quirks are keyed on the BIOS prefix (`SMCN19WW` → `SMCN`):
+  J2CN boards go Quiet → Balanced → Performance instead of straight to
+  Performance; K1CN boards step through another mode when leaving Custom.
+  Done in legion-profile-helper, so Home, tray, scenes and lpm-gamemode all
+  get it; the reply's `via` names the intermediate mode.
+- The Spectrum keyboard is only talked to on a 048D:C1xx hidraw interface
+  whose HID descriptor declares a 960-byte feature report; any other
+  interface of the same device gets no ioctl at all.
+- Everything else stays capability-based: each control appears only where
+  its sysfs node / WMI method answers (see the tabs' `present()` checks).
+
 Checked by the GUI at start (`sysinfo::supportedMachine`) and by every Rust
 helper in `lpm_helpers::init()` (`crates/lpm-helpers/src/machine.rs`), plus
 `lpm-gamemode` and `lpm-intel-uv`: `/sys/class/dmi/id/sys_vendor` must be
@@ -402,6 +417,35 @@ Differences from the PySide6 Home tab:
   Python tab blocked the GUI thread up to 3 s every 2 s poll.
 - hwmon sensors are ordered numerically (temp2 before temp10).
 - `LPM_SCREENSHOT=/tmp/x.png` renders the window once and exits (dev aid).
+
+### Look and theme contract
+
+All colour, spacing and control styling lives in `gui/src/theme.{h,cpp}`; tabs
+only use the tokens and selectors below, so a palette change reaches the
+custom-painted views (V/F curve, fan curve, keyboard, tray icon) too.
+
+- Surfaces: `BG0` window → `BG1` card → `BG2` inner panel → `BG3` control →
+  `BG4` hover. Text inputs sit in a recessed `WELL` (darker than the card);
+  buttons are one step above it. Amber `ACCENT` marks only what is active.
+- Selectors: `btnAccent`, `btnDanger`, `btnMini`, `terminal`, `miniSlider`,
+  `box_<colour>` (group title colour), `role=muted|title`, `mainTabs`
+  (the header band). A `QGroupBox` inside another renders as a divided
+  sub-section, not a second card.
+- `theme::banner(color, selector)` is the one callout style (profile lock,
+  tuning state, crash guard, max fans, lighting access, AMD trial).
+- `theme::profileAccent()` follows the Legion power-button LED: Power Saver
+  blue, Balanced white, Performance red, Custom purple (Extreme magenta).
+- The app style is Fusion behind a small proxy that gives nested layouts a
+  6 px spacing (Fusion's fallback of 0 drew button pairs touching).
+- Glyphs in `gui/data/theme/` (chevrons, check) are drawn for this palette at
+  1× and 2×.
+- Themes: 8 premade dark palettes in `PALETTES` (theme.cpp) — Graphite
+  (default), Gruvbox, Dracula, Tokyo Night, Nord, Catppuccin Mocha, Crimson,
+  Glacier. Picked on Home (top right), stored as `theme=` in
+  `~/.config/legion-power-manager/gui.ini`, loaded before the first widget.
+  A change restarts the app in place (`execv /proc/self/exe --window` after
+  the event loop ends and the instance lock is released). Adding a theme is
+  one row of 19 colours.
 
 ## Firmware Attributes tab
 
