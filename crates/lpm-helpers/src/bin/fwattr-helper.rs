@@ -97,6 +97,12 @@ fn write_one(path_v: Option<&Value>, value_v: Option<&Value>) -> Value {
         if value < minv || value > maxv {
             return err(format!("value {value} outside firmware range [{minv}, {maxv}]"));
         }
+        // The firmware publishes its granularity; an off-grid value was passed
+        // straight to the EC before (it rounds, truncates or rejects it
+        // depending on the BIOS — never what the slider showed).
+        if step > 1 && (value - minv) % step != 0 {
+            return err(format!("value {value} is not on the firmware's {step}-step grid from {minv}"));
+        }
     } else if !(0..=UNRANGED_HARD_CAP).contains(&value) {
         return err(format!("value {value} outside sanity range [0, {UNRANGED_HARD_CAP}]"));
     }

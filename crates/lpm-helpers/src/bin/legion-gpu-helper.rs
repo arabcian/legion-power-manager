@@ -23,7 +23,10 @@ fn run() -> Value {
         Some("gpu_mode") => legion_wmi::gpu_mode_status(),
         Some("fw_oc") => legion_wmi::fw_oc_status(),
         Some("panel_extras") => legion_wmi::panel_extras(),
-        Some("set_panel_od") => legion_wmi::set_panel_od(o.get("on").and_then(Value::as_bool).unwrap_or(false)),
+        Some("set_panel_od") => match o.get("on").and_then(Value::as_bool) {
+            Some(on) => legion_wmi::set_panel_od(on),
+            None => json!({"ok": false, "error": "set_panel_od needs 'on' (bool)"}),
+        },
         // The guarded path only: the forced override (black-screen risk) needs
         // the password and goes through legion-firmware-helper.
         Some("set_igpu_mode") if o.get("force").and_then(Value::as_bool).unwrap_or(false) => moved("set_igpu_mode with force"),

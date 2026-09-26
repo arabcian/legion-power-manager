@@ -37,6 +37,18 @@ const ACPI_CALL: &str = "/proc/acpi/call";
 /// the EC. The recommended envelope is available from status on request.
 pub const CTGP_SANITY_MAX: i64 = 250;
 
+/// Upper bound for a cTGP write: the vBIOS envelope when nvidia-smi can report
+/// it (skipped, not woken, while the dGPU sleeps), else CTGP_SANITY_MAX.
+fn ctgp_cap() -> i64 {
+    match nvidia_power_limits() {
+        Some((_, maxp)) if maxp > 0 => {
+            let boost = wmae_get(0x0201_0000).ok().filter(|b| (0..=50).contains(b)).unwrap_or(0);
+            (maxp - boost).clamp(1, CTGP_SANITY_MAX)
+        }
+        _ => CTGP_SANITY_MAX,
+    }
+}
+
 pub struct Feat {
     pub key: &'static str,
     pub attr: &'static str,   // firmware-attributes name (also read source)
@@ -101,6 +113,9 @@ fn sysfs_write(attr: &str, value: i64) -> Result<(), String> {
     if r.ranged {
         if value < r.min || value > r.max {
             return Err(format!("{value} outside firmware range [{}, {}]", r.min, r.max));
+        }
+        if r.step > 1 && (value - r.min) % r.step != 0 {
+            return Err(format!("{value} is not on the firmware's {}-step grid from {}", r.step, r.min));
         }
     } else if let Some(f) = FEATURES.iter().find(|f| f.attr == attr) {
         // No firmware range published: fall back to the feature's own
@@ -193,19 +208,45 @@ fn wmaa(method: u8, arg: u64) -> Result<u64, String> {
     parse_u64(&out).ok_or_else(|| format!("WMAA 0x{method:x}: unparseable reply '{out}'"))
 }
 
-/// AMD display controller visible on the PCI bus (hybrid mode running).
-fn amd_igpu_present() -> bool {
-    std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten().any(|e| {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Igpu { Amd, Intel }
+
+/// Integrated display controller visible on the PCI bus (hybrid mode running).
+/// Legion/LOQ ship with both AMD and Intel CPUs: checking only for an AMD
+/// display function reported every Intel machine in hybrid mode as "dGPU
+/// (MUX) only" and pointed the iGPU-only guard at the wrong driver.
+fn igpu_present() -> Option<Igpu> {
+    std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten().find_map(|e| {
         let rd = |f: &str| std::fs::read_to_string(e.path().join(f)).ok().map(|s| s.trim().to_owned());
-        rd("vendor").as_deref() == Some("0x1002") && rd("class").map_or(false, |c| c.starts_with("0x03"))
+        if !rd("class").map_or(false, |c| c.starts_with("0x03")) { return None; }
+        match rd("vendor").as_deref() { Some("0x1002") => Some(Igpu::Amd), Some("0x8086") => Some(Igpu::Intel), _ => None }
     })
+}
+
+/// The iGPU this machine uses in hybrid mode. In dGPU (MUX) mode the iGPU is
+/// hidden from the bus, so the CPU vendor decides.
+fn igpu_kind() -> Igpu {
+    igpu_present().unwrap_or(if crate::tune::cpu_vendor() == crate::tune::Vendor::Intel { Igpu::Intel } else { Igpu::Amd })
+}
+
+/// The kernel has (or has loaded) the driver for that iGPU.
+fn igpu_driver_available(k: Igpu) -> bool {
+    match k {
+        Igpu::Amd => crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu"),
+        Igpu::Intel => crate::tune::kmod_available("i915", "drivers/gpu/drm/i915")
+            || crate::tune::kmod_available("xe", "drivers/gpu/drm/xe"),
+    }
+}
+
+fn igpu_driver_name(k: Igpu) -> &'static str {
+    match k { Igpu::Amd => "amdgpu (CONFIG_DRM_AMDGPU)", Igpu::Intel => "i915 or xe (CONFIG_DRM_I915 / CONFIG_DRM_XE)" }
 }
 
 fn mode_name(dgpu: bool) -> &'static str { if dgpu { "dgpu" } else { "hybrid" } }
 
 /// Running mode: the PCI bus is authoritative (the iGPU is hidden in dGPU
 /// mode); MSMF only when the bus cannot tell.
-fn active_is_dgpu() -> bool { !amd_igpu_present() }
+fn active_is_dgpu() -> bool { igpu_present().is_none() }
 
 /// Mode requested for the next boot during *this* boot, if any.
 fn pending_request() -> Option<bool> {
@@ -228,7 +269,7 @@ pub fn gpu_mode_status() -> Value {
         "active": mode_name(active_dgpu),
         "next_boot": mode_name(next),
         "reboot_pending": next != active_dgpu,
-        "amdgpu_driver": crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu"),
+        "amdgpu_driver": igpu_driver_available(igpu_kind()),  // key name kept for the GUI: "iGPU driver present"
         "msmf": wmaa(GZ_GSYNC_GET, 0).ok(),
         "gmdm_raw": wmae_get(FEAT_GMDM).ok(),
     })
@@ -244,9 +285,10 @@ pub fn set_gpu_mode(mode: &str, force: bool) -> Value {
     if !wmaa(GZ_GSYNC_SUPPORTED, 0).map_or(false, |v| v != 0) {
         return json!({"ok": false, "error": "the firmware does not report GPU mode switching support"});
     }
-    if !dgpu && !force && !crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu") {
+    let kind = igpu_kind();
+    if !dgpu && !force && !igpu_driver_available(kind) {
         return json!({"ok": false, "needs_force": true,
-            "error": "this kernel has no amdgpu driver: in hybrid mode the internal display is driven by the AMD iGPU and would stay black. Build amdgpu (CONFIG_DRM_AMDGPU) first."});
+            "error": format!("this kernel has no {} driver: in hybrid mode the internal display is driven by the iGPU and would stay black. Build it first.", igpu_driver_name(kind))});
     }
     match wmaa(GZ_GSYNC_SET, dgpu as u64) {
         Ok(0) => {}
@@ -320,6 +362,32 @@ fn nvidia_power_limits() -> Option<(i64, i64)> {
 
 /// The value goes through WMAE: always for the unranged GPU knobs, and as a
 /// fallback for an attribute that has disappeared from sysfs.
+const VERIFIED_FILE: &str = "/var/lib/legion-power-manager/wmae-verified.json";
+
+/// Key tying a WMAE verification to this exact machine + BIOS.
+fn verify_key() -> String {
+    let d = |n: &str| std::fs::read_to_string(format!("/sys/class/dmi/id/{n}")).map(|s| s.trim().to_owned()).unwrap_or_default();
+    format!("{}|{}", d("product_name"), d("bios_version"))
+}
+
+/// Feature ids whose WMAE read-back matched sysfs on this machine/BIOS.
+/// Recorded by the helper itself (root-owned), never taken from the GUI.
+fn verified_ids() -> Vec<u32> {
+    crate::read_root_file(VERIFIED_FILE, 4096).and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|v| v["key"].as_str() == Some(verify_key().as_str()))
+        .and_then(|v| v["ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()))
+        .unwrap_or_default()
+}
+
+fn record_verified(id: u32) {
+    let mut ids = verified_ids();
+    if ids.contains(&id) { return; }
+    ids.push(id);
+    let rec = json!({"key": verify_key(), "ids": ids});
+    let _ = crate::secure_dir("/var/lib/legion-power-manager")
+        .and_then(|_| crate::write_root_file(VERIFIED_FILE, rec.to_string().as_bytes()));
+}
+
 fn use_wmae(f: &Feat) -> bool { f.via_acpi || (f.id != 0 && sysfs_read(f.attr).is_none()) }
 
 fn read_value(f: &Feat) -> Result<i64, String> {
@@ -350,7 +418,10 @@ pub fn status(want_envelope: bool) -> Value {
                            "present": sys.is_some(), "wmae_fallback": f.id != 0 && sys.is_none()});
         // Cross-check for the GUI: WMAE read-back of a sysfs-backed limit.
         if !f.via_acpi && f.id != 0 && sys.is_some() && acpi_available() {
-            if let Ok(w) = wmae_get(f.id) { o["wmae"] = json!(w); }
+            if let Ok(w) = wmae_get(f.id) {
+                o["wmae"] = json!(w);
+                if sys.as_ref().map(|r| r.cur) == Some(w) { record_verified(f.id); }
+            }
         }
         // Same channel rule as read_value(), reusing the sysfs read above.
         let value = if f.via_acpi || (f.id != 0 && sys.is_none()) { wmae_get(f.id) } else {
@@ -395,10 +466,18 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
             let f = feat(key).ok_or_else(|| format!("unknown knob '{key}'"))?;
             let v = jv.as_i64().ok_or_else(|| format!("{key}: not an integer"))?;
             if v < 1 { return Err(format!("{}: {ZERO_REFUSED}", f.label)); }
+            if !f.via_acpi && use_wmae(f) && !verified_ids().contains(&f.id) {
+                return Err(format!("{}: sysfs attribute missing and the WMAE fallback was never verified \
+                    against it on this machine/BIOS; refusing", f.label));
+            }
             if use_wmae(f) {
                 // No firmware range here; a sanity clamp so a typo can't send
-                // something absurd to the EC. cTGP is left wide on purpose.
-                let cap = if f.key == "ctgp" { CTGP_SANITY_MAX } else { f.hi };
+                // something absurd to the EC. cTGP: the GPU's own vBIOS maximum
+                // (nvidia-smi Max Power Limit, minus the Dynamic Boost headroom it
+                // includes) when the driver can report it — a cTGP above what the
+                // board is designed to deliver is never a valid target — else
+                // the wide sanity ceiling.
+                let cap = if f.key == "ctgp" { ctgp_cap() } else { f.hi };
                 if v < f.lo || v > cap { return Err(format!("{} must be {}..{cap} {}", f.label, f.lo, f.unit)); }
             } else {
                 // Same check sysfs_write() does at write time, done here too so
@@ -407,6 +486,9 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
                 let r = sysfs_read(f.attr).ok_or_else(|| format!("{}: attribute not present", f.attr))?;
                 let (lo, hi) = if r.ranged { (r.min, r.max) } else { (f.lo, f.hi) };
                 if v < lo || v > hi { return Err(format!("{}: {v} outside {lo}..{hi} {}", f.label, f.unit)); }
+                if r.ranged && r.step > 1 && (v - r.min) % r.step != 0 {
+                    return Err(format!("{}: {v} is not on the firmware's {}-step grid from {}", f.label, r.step, r.min));
+                }
             }
             Ok((f, v))
         })();
@@ -504,13 +586,13 @@ pub fn set_igpu_mode(mode: u64, force: bool) -> Value {
     // the dGPU, and without amdgpu nothing can drive it: a black screen either
     // way. Same guard as set_gpu_mode, overridable with force.
     if mode == 1 && !force {
-        if !amd_igpu_present() {
+        let Some(kind) = igpu_present() else {
             return json!({"ok": false, "needs_force": true,
                 "error": "the machine is running in dGPU (MUX direct) mode: the display is on the NVIDIA GPU, and \"iGPU only\" would cut it off. Switch the GPU mode to hybrid and reboot first."});
-        }
-        if !crate::tune::kmod_available("amdgpu", "drivers/gpu/drm/amd/amdgpu") {
+        };
+        if !igpu_driver_available(kind) {
             return json!({"ok": false, "needs_force": true,
-                "error": "this kernel has no amdgpu driver: with the dGPU cut off nothing could drive the display."});
+                "error": format!("this kernel has no {} driver: with the dGPU cut off nothing could drive the display.", igpu_driver_name(kind))});
         }
     }
     if !acpi_available() { modprobe_acpi_call(); }

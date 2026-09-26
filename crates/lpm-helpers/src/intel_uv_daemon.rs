@@ -208,8 +208,43 @@ fn handler(f: extern "C" fn(libc::c_int)) -> libc::sighandler_t { f as *const ()
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
-extern "C" fn on_stop(_: libc::c_int) { STOP.store(true, Ordering::SeqCst); }
-extern "C" fn on_reload(_: libc::c_int) { RELOAD.store(true, Ordering::SeqCst); }
+/// Write end of the self-pipe the handlers poke (-1 until set up).
+static WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+fn poke() {
+    let fd = WAKE_FD.load(Ordering::SeqCst);
+    if fd >= 0 { unsafe { libc::write(fd, b"x".as_ptr().cast(), 1); } }  // async-signal-safe; full pipe = already poked
+}
+extern "C" fn on_stop(_: libc::c_int) { STOP.store(true, Ordering::SeqCst); poke(); }
+extern "C" fn on_reload(_: libc::c_int) { RELOAD.store(true, Ordering::SeqCst); poke(); }
+
+/// Sleeps up to `ms`, returning early on SIGTERM/SIGINT/SIGHUP/SIGUSR1.
+/// One poll() on a self-pipe: the old loop slept in 100 ms slices, i.e. ten
+/// wake-ups a second for the whole life of an always-on root daemon. The
+/// pipe (not a blocked-signal sigtimedwait) keeps modprobe & co. spawned from
+/// here on a normal signal mask, and a signal that lands between the flag
+/// check and poll() is not lost: its byte is already in the pipe.
+fn wait(rd: libc::c_int, ms: u64) {
+    if rd < 0 {  // no pipe (fd exhaustion): the old sliced sleep
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end && !STOP.load(Ordering::SeqCst) && !RELOAD.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100.min(ms)));
+        }
+        return;
+    }
+    let end = Instant::now() + Duration::from_millis(ms);
+    loop {
+        if STOP.load(Ordering::SeqCst) || RELOAD.load(Ordering::SeqCst) { break; }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() { break; }
+        let mut p = libc::pollfd { fd: rd, events: libc::POLLIN, revents: 0 };
+        let r = unsafe { libc::poll(&mut p, 1, left.as_millis().min(i32::MAX as u128) as libc::c_int) };
+        if r > 0 {
+            let mut b = [0u8; 64];
+            while unsafe { libc::read(rd, b.as_mut_ptr().cast(), b.len()) } > 0 {}  // drain (non-blocking)
+        }
+        // r < 0 (EINTR) or a drained poke: loop re-checks the flags and the deadline.
+    }
+}
 
 fn clock(id: libc::clockid_t) -> f64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -259,6 +294,11 @@ fn report(tag: &str, v: &Value, periodic: bool) {
 fn mtime() -> Option<std::time::SystemTime> { std::fs::metadata(BOOT_FILE).and_then(|m| m.modified()).ok() }
 
 pub fn run_daemon() -> i32 {
+    let mut pipe = [-1 as libc::c_int; 2];
+    let rd = if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0 {
+        WAKE_FD.store(pipe[1], Ordering::SeqCst);
+        pipe[0]
+    } else { -1 };
     unsafe {
         libc::signal(libc::SIGTERM, handler(on_stop));
         libc::signal(libc::SIGINT, handler(on_stop));
@@ -320,11 +360,7 @@ pub fn run_daemon() -> i32 {
                 }
             }
         }
-        // Sleep in slices so SIGTERM is honoured quickly.
-        let end = Instant::now() + Duration::from_millis(interval);
-        while Instant::now() < end && !STOP.load(Ordering::SeqCst) && !RELOAD.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(100.min(interval)));
-        }
+        wait(rd, interval);
     }
     eprintln!("lpm-intel-uv: daemon stopped");
     0

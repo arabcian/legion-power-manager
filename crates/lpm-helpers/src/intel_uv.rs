@@ -342,10 +342,19 @@ fn err_str(e: &io::Error) -> String {
 
 // ── CPU identity ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct CpuId { pub vendor: String, pub family: u32, pub model: u32, pub stepping: u32, pub name: String }
 
+/// Parsed once per process (apply, monitor samples and the daemon's
+/// re-apply loop all ask; the answer cannot change while we run).
 pub fn cpu_id() -> Option<CpuId> {
-    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    static ID: std::sync::OnceLock<Option<CpuId>> = std::sync::OnceLock::new();
+    ID.get_or_init(parse_cpu_id).clone()
+}
+
+fn parse_cpu_id() -> Option<CpuId> {
+    let text = crate::cpuinfo_head();
+    if text.is_empty() { return None; }
     let mut c = CpuId { vendor: String::new(), family: 0, model: 0, stepping: 0, name: String::new() };
     for line in text.lines() {
         if line.trim().is_empty() { break; } // first processor block only

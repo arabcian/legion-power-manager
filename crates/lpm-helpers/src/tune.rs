@@ -47,7 +47,7 @@ pub fn vendor_from_cpuinfo(s: &str) -> Vendor {
 /// The running CPU's vendor (read once). `Any` if unknown.
 pub fn cpu_vendor() -> Vendor {
     static V: std::sync::OnceLock<Vendor> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::fs::read_to_string("/proc/cpuinfo").map(|s| vendor_from_cpuinfo(&s)).unwrap_or(Vendor::Any))
+    *V.get_or_init(|| vendor_from_cpuinfo(crate::cpuinfo_head()))
 }
 
 fn vendor_ok(t: &Tunable) -> bool { t.vendor == Vendor::Any || t.vendor == cpu_vendor() }
@@ -452,8 +452,8 @@ pub const TUNABLES: &[Tunable] = &[
       Kind::Choice, BR, Target::IntelGt { i915: "slpc_power_profile", xe: "" })),
     // ── Stability ─────────────────────────────────────────────────────────
     t("mce.check_interval", "Stability", "MCE poll interval (s)",
-      "Polling interval (seconds) for correctable machine-check errors (early-warning signs of a marginal core/memory, short of a full crash). Stock is 300s. 10s (what the CO validation preset uses) catches a marginal Curve Optimizer offset within seconds of it starting to misbehave instead of up to 5 minutes later - pair with `dmesg -w` or rasdaemon open in a terminal while stress-testing a new offset. Set back to something relaxed (or 0 to stop polling) for normal use; frequent polling has a small but real overhead not worth paying permanently.",
-      int(0, 3600), NO, Target::Mce),
+      "Polling interval (seconds) for correctable machine-check errors (early-warning signs of a marginal core/memory, short of a full crash). Stock is 300s. 10s (what the CO validation preset uses) catches a marginal Curve Optimizer offset within seconds of it starting to misbehave instead of up to 5 minutes later - pair with `dmesg -w` or rasdaemon open in a terminal while stress-testing a new offset. Set it back to the stock 300 s for normal use. 0 (no polling) is not offered: correctable errors - the early warning of failing RAM or a marginal core - would then go unnoticed until something crashes.",
+      int(1, 3600), NO, Target::Mce),
     // ── Hot-plug (must stay last, see HOTPLUG_KEYS) ───────────────────────
     warn(t("cpu.smt", "CPU", "SMT",
       "Turns SMT (the second logical thread per physical core) on or off system-wide. Most games are unaffected or slightly faster with SMT on (more threads available); a minority of titles - especially ones sensitive to cache contention between sibling threads, or with poor thread-count scaling - show better 1% lows with it off, since every physical core is then dedicated to one thread with no sibling contention. This is genuinely game-specific: test SMT on vs off on the specific title if chasing 1% lows. Hot-plugs half the CPUs off/online, which is why this row is always applied last and restored first - every other per-CPU setting needs the CPU online first to accept the write.",
@@ -832,6 +832,15 @@ fn is_pci_config(p: &Path) -> bool {
         && p.parent().map_or(false, |d| d.join("vendor").is_file() && d.join("class").is_file())
 }
 
+/// A runtime-suspended function (D3hot/D3cold: the dGPU, its audio function,
+/// an idle NVMe/Wi-Fi) must not be read for the status display: sysfs config
+/// reads go through pci_config_pm_runtime_get(), which resumes a D3cold device
+/// and its parent bridge — the 4 s describe poll kept the RTX dGPU from ever
+/// staying asleep while the Optimizations tab was open.
+fn pci_runtime_suspended(cfg: &Path) -> bool {
+    cfg.parent().and_then(|d| read(&d.join("power/runtime_status"))).as_deref() == Some("suspended")
+}
+
 fn pci_latency_read(cfg: &Path) -> Option<u8> {
     use std::os::unix::fs::FileExt;
     let f = std::fs::File::open(cfg).ok()?;
@@ -986,16 +995,27 @@ fn run_tool(bin: &Path, args: &[&str], timeout: std::time::Duration) -> Option<(
         .env("LC_ALL", "C").current_dir("/").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().ok()?;
     let mut out = child.stdout.take()?;
-    let reader = std::thread::spawn(move || { let mut v = Vec::new(); let _ = (&mut out).take(64 * 1024).read_to_end(&mut v); v });
-    let start = std::time::Instant::now();
+    // The reader hands over the output at stdout EOF (the tool exited or closed
+    // it); the caller waits on that with a timeout instead of polling try_wait()
+    // every 10 ms — `iw … get power_save` answers in ~1 ms, so every describe
+    // used to pay a 10 ms floor per Wi-Fi interface.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = (&mut out).take(64 * 1024).read_to_end(&mut v);
+        let _ = tx.send(v);
+    });
+    let Ok(bytes) = rx.recv_timeout(timeout) else { let _ = child.kill(); let _ = child.wait(); return None; };
+    // stdout closed; the exit follows at once (or it closed stdout early and hangs: bounded).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(1)),
             _ => { let _ = child.kill(); let _ = child.wait(); return None; }
         }
     };
-    Some((status.success(), String::from_utf8_lossy(&reader.join().ok()?).into_owned()))
+    Some((status.success(), String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn iw() -> Option<PathBuf> {
@@ -1326,7 +1346,10 @@ fn current_with(t: &Tunable, fs: Vec<PathBuf>) -> Option<String> {
         }
         Target::PciLatency => {
             // Hardwired-zero (PCIe) functions ignore the write; they don't make it "stock".
-            let tuned = fs.iter().all(|f| pci_latency_read(f).map_or(true, |b| b == pci_latency_target(f) || b == 0));
+            // Suspended functions are skipped (not woken): the byte is restored with
+            // the rest of config space on resume, so the awake ones tell the state.
+            let tuned = fs.iter().filter(|f| !pci_runtime_suspended(f))
+                .all(|f| pci_latency_read(f).map_or(true, |b| b == pci_latency_target(f) || b == 0));
             return Some(if tuned { "tuned".into() } else { "stock".into() });
         }
         Target::WqCpumask => {

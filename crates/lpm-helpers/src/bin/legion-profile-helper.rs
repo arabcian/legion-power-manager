@@ -192,6 +192,11 @@ fn device_target(key: &str, value: &str) -> Result<PathBuf, String> {
             // ceiling and negatives are refused.
             let hi = rd("max").unwrap_or(10_000);
             if rpm < 0 || rpm > hi { return Err(format!("{rpm} RPM is outside 0..{hi} (0 = auto)")); }
+            // 1..min would pin the fan below its lowest stable speed (or stop it)
+            // while the EC's own curve is switched off by the manual target.
+            if let Some(lo) = rd("min").filter(|&m| m > 0) {
+                if rpm > 0 && rpm < lo { return Err(format!("{rpm} RPM is below this fan's minimum {lo} RPM (0 = auto)")); }
+            }
             return Ok(f);
         }
         return Err("lenovo_wmi_other hwmon not found".into());

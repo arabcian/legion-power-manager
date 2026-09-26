@@ -22,6 +22,32 @@ pub mod lighting;
 pub mod machine;
 pub mod tune;
 
+/// The first processor block of /proc/cpuinfo (vendor, family, model, name are
+/// identical across CPUs), read once per process. The whole file is one
+/// seq_file record per CPU and each record samples that CPU's current
+/// frequency — on a 32-thread part a full read is ~40 KiB of kernel work that
+/// can IPI idle cores awake. The Intel daemon used to do that on every
+/// re-apply interval; now it is at most a few KiB, once.
+pub fn cpuinfo_head() -> &'static str {
+    static HEAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HEAD.get_or_init(|| {
+        let Ok(mut f) = std::fs::File::open("/proc/cpuinfo") else { return String::new() };
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 2048];
+        loop {
+            match f.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+            if let Some(end) = buf.windows(2).position(|w| w == b"\n\n") { buf.truncate(end + 1); break; }
+            if buf.len() >= 64 * 1024 { break; }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
 /// Process-wide setup every root helper runs first.
 ///
 /// pkexec passes the caller's umask through untouched: a user who runs

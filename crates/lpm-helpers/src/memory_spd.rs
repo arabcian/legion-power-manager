@@ -155,7 +155,7 @@ fn smn_read(addr: u32) -> Result<u32, String> {
 }
 
 fn amd_family() -> Option<u32> {
-    let info = fs::read_to_string("/proc/cpuinfo").ok()?;
+    let info = crate::cpuinfo_head();
     if !info.lines().any(|l| l.starts_with("vendor_id") && l.contains("AuthenticAMD")) { return None; }
     info.lines().find(|l| l.starts_with("cpu family"))
         .and_then(|l| l.split(':').nth(1)).and_then(|v| v.trim().parse().ok())
