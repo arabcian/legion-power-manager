@@ -14,6 +14,11 @@ pub struct VfPoint {
     pub index: usize,
     /// Frequency reported by GetVFPCurve (already includes the current delta).
     pub freq_khz: u32,
+    /// Offset-free base frequency from the V3 status (None on GPUs/drivers
+    /// without the base tuple). Moves with temperature and load: use it for
+    /// display and range checks only, never store it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_khz: Option<u32>,
     pub volt_uv: u32,
     /// Signed offset from the ClockBoostTable.
     pub delta_khz: i32,
@@ -21,7 +26,14 @@ pub struct VfPoint {
 }
 
 impl VfPoint {
-    pub fn effective_freq_khz(&self) -> i64 { self.freq_khz as i64 + self.delta_khz as i64 }
+    /// The frequency the point runs at. `freq_khz` already includes the delta
+    /// (adding it again double-counted the offset).
+    pub fn effective_freq_khz(&self) -> i64 { self.freq_khz as i64 }
+    /// Offset-free frequency: the V3 base tuple when the driver has one,
+    /// otherwise the reported frequency minus the stored delta.
+    pub fn base_freq_khz(&self) -> i64 {
+        self.base_khz.map_or(self.freq_khz as i64 - self.delta_khz as i64, i64::from)
+    }
     pub fn freq_mhz(&self) -> f64 { self.freq_khz as f64 / 1000.0 }
     pub fn effective_freq_mhz(&self) -> f64 { self.effective_freq_khz() as f64 / 1000.0 }
     pub fn volt_mv(&self) -> f64 { self.volt_uv as f64 / 1000.0 }
@@ -31,6 +43,9 @@ impl VfPoint {
 #[derive(Debug, Clone, Serialize)]
 pub struct CurveState {
     pub points: Vec<VfPoint>,
+    /// How GPU/memory points were told apart: "point-info" (the driver's
+    /// per-point type + voltage-based flag) or "flags" (legacy heuristic).
+    pub domain_source: &'static str,
     pub timestamp: f64,
     pub gpu_name: String,
 }

@@ -81,58 +81,190 @@ pub fn get_clock_offsets(gpu_index: u32) -> ClockOffsets {
     let Ok(h) = n.handle(gpu_index) else { return out };
 
     if n.has("nvmlDeviceGetClockOffsets") {
-        let mut used_new = false;
-        match n.get_clock_offset(h, CLOCK_GRAPHICS) {
-            Ok(v) => { out.gpc_offset_mhz = Some(v); used_new = true; }
+        match n.get_clock_offset(h, CLOCK_GRAPHICS, 0) {
+            Ok(v) => out.gpc_offset_mhz = Some(v.offset_mhz),
             Err(e) => debug!("nvmlDeviceGetClockOffsets(GRAPHICS): {e}"),
         }
-        match n.get_clock_offset(h, CLOCK_MEM) {
-            Ok(v) => { out.mem_offset_mhz = Some(raw_mem_to_effective(v)); used_new = true; }
+        match n.get_clock_offset(h, CLOCK_MEM, 0) {
+            Ok(v) => out.mem_offset_mhz = Some(raw_mem_to_effective(v.offset_mhz)),
             Err(e) => debug!("nvmlDeviceGetClockOffsets(MEM): {e}"),
         }
-        if used_new { return out; }
     }
-    out.gpc_offset_mhz = n.gpc_clk_vf_offset(h).map_err(|e| debug!("GetGpcClkVfOffset: {e}")).ok();
-    out.mem_offset_mhz = n.mem_clk_vf_offset(h).map_err(|e| debug!("GetMemClkVfOffset: {e}")).ok()
-        .map(raw_mem_to_effective);
+    if out.gpc_offset_mhz.is_none() {
+        out.gpc_offset_mhz = n.gpc_clk_vf_offset(h).map_err(|e| debug!("GetGpcClkVfOffset: {e}")).ok();
+    }
+    if out.mem_offset_mhz.is_none() {
+        out.mem_offset_mhz = n.mem_clk_vf_offset(h).map_err(|e| debug!("GetMemClkVfOffset: {e}")).ok()
+            .map(raw_mem_to_effective);
+    }
     out
 }
 
 /// Sets only the domains given. mem_offset_mhz is effective MHz.
+///
+/// Core: the per-P-state API first (its struct is now the right size, so it
+/// actually works), the deprecated per-domain call as fallback.
+/// Memory: deliberately the *other* order — the deprecated call first, which
+/// is what every earlier build used and what the ×2 effective→raw scaling was
+/// calibrated against on real hardware. The new API only takes over where the
+/// old one is missing (see `LPM_NVML_MEM_NEW_API` to try it explicitly).
 pub fn set_clock_offsets(gpc_offset_mhz: Option<i32>, mem_offset_mhz: Option<i32>, gpu_index: u32)
     -> Result<(), String>
 {
     if gpc_offset_mhz.is_none() && mem_offset_mhz.is_none() { return Ok(()); }
     let n = nvml::ready()?;
     let h = n.handle(gpu_index)?;
-    let mem_raw = match mem_offset_mhz {
-        Some(v) => Some(v.checked_mul(2).ok_or("mem_offset_mhz overflows NVML's raw domain")?),
-        None => None,
-    };
-    let domains: Vec<(u32, i32)> = [(CLOCK_GRAPHICS, gpc_offset_mhz), (CLOCK_MEM, mem_raw)]
-        .into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
-
-    if n.has("nvmlDeviceSetClockOffsets") {
-        let mut all_ok = true;
-        for &(k, v) in &domains {
-            if let Err(e) = n.set_clock_offset(h, k, v) {
-                debug!("nvmlDeviceSetClockOffsets(type={k}): {e} — trying fallback");
-                all_ok = false;
-                break;
-            }
-        }
-        if all_ok { return Ok(()); }
-    }
-
-    // Deprecated per-domain API (still what works on Blackwell / 590.x).
+    let has_new = n.has("nvmlDeviceSetClockOffsets");
     let mut errs = Vec::new();
+
     if let Some(v) = gpc_offset_mhz {
-        if let Err(e) = n.set_gpc_clk_vf_offset(h, v) { errs.push(format!("GPC: {e}")); }
+        let new = if has_new { n.set_clock_offset(h, CLOCK_GRAPHICS, 0, v) } else { Err("n/a".into()) };
+        if let Err(e) = new {
+            if has_new { debug!("nvmlDeviceSetClockOffsets(GRAPHICS): {e} — trying the per-domain call"); }
+            if let Err(e2) = n.set_gpc_clk_vf_offset(h, v) { errs.push(format!("GPC: {e2}")); }
+        }
     }
-    if let Some(v) = mem_raw {
-        if let Err(e) = n.set_mem_clk_vf_offset(h, v) { errs.push(format!("MEM: {e}")); }
+    if let Some(v) = mem_offset_mhz {
+        let raw = v.checked_mul(2).ok_or("mem_offset_mhz overflows NVML's raw domain")?;
+        let prefer_new = std::env::var_os("LPM_NVML_MEM_NEW_API").is_some();
+        let old = |n: &nvml::Nvml| n.set_mem_clk_vf_offset(h, raw);
+        let new = |n: &nvml::Nvml| n.set_clock_offset(h, CLOCK_MEM, 0, raw);
+        let (first, second): (&dyn Fn(&nvml::Nvml) -> Result<(), String>, &dyn Fn(&nvml::Nvml) -> Result<(), String>) =
+            if prefer_new { (&new, &old) } else { (&old, &new) };
+        if let Err(e) = first(n) {
+            debug!("memory offset, first API: {e} — trying the other one");
+            if let Err(e2) = second(n) { errs.push(format!("MEM: {e}; {e2}")); }
+        }
     }
     if errs.is_empty() { Ok(()) } else { Err(errs.join("; ")) }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OffsetRanges {
+    /// Core offset range (MHz) the driver allows in P0.
+    pub gpc: Option<(i32, i32)>,
+    /// Memory offset range in effective MHz.
+    pub mem: Option<(i32, i32)>,
+}
+
+/// Ranges straight from nvmlDeviceGetClockOffsets (P0). None where the
+/// driver can't report them.
+pub fn get_offset_ranges(gpu_index: u32) -> OffsetRanges {
+    let mut out = OffsetRanges::default();
+    let Ok(n) = nvml::ready() else { return out };
+    let Ok(h) = n.handle(gpu_index) else { return out };
+    if let Ok(i) = n.get_clock_offset(h, CLOCK_GRAPHICS, 0) { out.gpc = Some((i.min_mhz, i.max_mhz)); }
+    if let Ok(i) = n.get_clock_offset(h, CLOCK_MEM, 0) {
+        out.mem = Some((raw_mem_to_effective(i.min_mhz), raw_mem_to_effective(i.max_mhz)));
+    }
+    out
+}
+
+/// Zeroes the core and memory offset of *every* supported P-state (and the
+/// deprecated per-domain offsets), not only P0: another tool — or an older
+/// build — may have left offsets in P2/P3/P5 that keep applying after a
+/// "reset". Returns what was changed.
+pub fn reset_all_clock_offsets(gpu_index: u32) -> Result<Vec<String>, String> {
+    let n = nvml::ready()?;
+    let h = n.handle(gpu_index)?;
+    let mut done = Vec::new();
+    if n.has("nvmlDeviceGetClockOffsets") {
+        for p in n.supported_pstates(h).unwrap_or_else(|_| vec![0]) {
+            for (kind, name) in [(CLOCK_GRAPHICS, "core"), (CLOCK_MEM, "memory")] {
+                match n.get_clock_offset(h, kind, p) {
+                    Ok(i) if i.offset_mhz != 0 => match n.set_clock_offset(h, kind, p, 0) {
+                        Ok(()) => done.push(format!("P{p} {name} offset {:+} → 0", i.offset_mhz)),
+                        Err(e) => warn!("reset P{p} {name} offset: {e}"),
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+    if n.gpc_clk_vf_offset(h).map_or(false, |v| v != 0) && n.set_gpc_clk_vf_offset(h, 0).is_ok() {
+        done.push("core offset (per-domain) → 0".into());
+    }
+    if n.mem_clk_vf_offset(h).map_or(false, |v| v != 0) && n.set_mem_clk_vf_offset(h, 0).is_ok() {
+        done.push("memory offset (per-domain) → 0".into());
+    }
+    Ok(done)
+}
+
+// ── clock event (throttle) reasons ──────────────────────────────────────────
+
+const REASONS: &[(u64, &str, &str)] = &[
+    (0x0001, "idle", "GPU idle"),
+    (0x0002, "app_clocks", "application clock setting"),
+    (0x0004, "sw_power_cap", "power limit"),
+    (0x0008, "hw_slowdown", "hardware slowdown (power brake / thermal)"),
+    (0x0010, "sync_boost", "sync boost"),
+    (0x0020, "sw_thermal", "thermal limit (driver)"),
+    (0x0040, "hw_thermal", "thermal limit (hardware)"),
+    (0x0080, "hw_power_brake", "external power brake"),
+    (0x0100, "display_clock", "display clock setting"),
+];
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Throttle {
+    pub mask: u64,
+    /// Short keys ("sw_power_cap", …), idle excluded.
+    pub reasons: Vec<&'static str>,
+    pub descriptions: Vec<&'static str>,
+}
+
+pub fn decode_throttle(mask: u64) -> Throttle {
+    let mut t = Throttle { mask, ..Default::default() };
+    for &(bit, key, text) in REASONS {
+        if mask & bit != 0 && bit != 0x0001 { t.reasons.push(key); t.descriptions.push(text); }
+    }
+    t
+}
+
+pub fn get_throttle(gpu_index: u32) -> Option<Throttle> {
+    let n = nvml::ready().ok()?;
+    n.clock_event_reasons(n.handle(gpu_index).ok()?).ok().map(decode_throttle)
+}
+
+// ── PowerMizer ──────────────────────────────────────────────────────────────
+
+pub const POWER_MIZER_MODES: &[(u32, &str, &str)] = &[
+    (0, "adaptive", "Adaptive — clocks drop when load drops"),
+    (1, "max", "Prefer maximum performance — keeps clocks up (no down-clock stutter, more idle power)"),
+    (2, "auto", "Auto — the driver decides (default)"),
+    (3, "consistent", "Prefer consistent performance — steady clocks for benchmarking"),
+];
+
+pub fn power_mizer_mode_id(name: &str) -> Option<u32> {
+    POWER_MIZER_MODES.iter().find(|m| m.1 == name).map(|m| m.0)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PowerMizer {
+    pub current: &'static str,
+    pub supported: Vec<&'static str>,
+}
+
+pub fn get_power_mizer(gpu_index: u32) -> Result<PowerMizer, String> {
+    let n = nvml::ready()?;
+    let m = n.power_mizer(n.handle(gpu_index)?)?;
+    let name = |id: u32| POWER_MIZER_MODES.iter().find(|x| x.0 == id).map_or("unknown", |x| x.1);
+    Ok(PowerMizer {
+        current: name(m.current),
+        supported: POWER_MIZER_MODES.iter().filter(|x| m.supported & (1 << x.0) != 0).map(|x| x.1).collect(),
+    })
+}
+
+pub fn set_power_mizer(gpu_index: u32, name: &str) -> Result<(), String> {
+    let id = power_mizer_mode_id(name).ok_or_else(|| format!("unknown PowerMizer mode {name:?}"))?;
+    let n = nvml::ready()?;
+    let h = n.handle(gpu_index)?;
+    let m = n.power_mizer(h)?;
+    if m.supported & (1 << id) == 0 { return Err(format!("PowerMizer mode {name} is not supported by this GPU")); }
+    if m.current == id { return Ok(()); }
+    n.set_power_mizer(h, id)?;
+    let after = n.power_mizer(h)?;
+    if after.current != id { return Err(format!("driver kept PowerMizer mode {} after the write", after.current)); }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +327,14 @@ pub fn reset_gpu_locked_clocks(gpu_index: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::raw_mem_to_effective as f;
+    use super::decode_throttle;
+    #[test]
+    fn throttle_decoding() {
+        let t = decode_throttle(0x0001 | 0x0004 | 0x0040);
+        assert_eq!(t.reasons, vec!["sw_power_cap", "hw_thermal"]);
+        assert!(decode_throttle(0x0001).reasons.is_empty());
+    }
+
     #[test]
     fn python_round_semantics() {
         assert_eq!(f(2000), 1000);

@@ -195,6 +195,28 @@ fn op_reset_gpu_clocklock(_: &Obj) -> OpResult {
     Ok("GPU core clock unlocked (back to the V/F curve's own maximum).".into())
 }
 
+fn op_reset_all(_: &Obj) -> OpResult {
+    let (done, errs) = ops::reset_everything(0);
+    refresh_result(RESET_RESULT);
+    let mut msg = done.join("\n");
+    if !errs.is_empty() { return Err(format!("{}{}{}", msg, if msg.is_empty() { "" } else { "\n" }, errs.join("; "))); }
+    if msg.is_empty() { msg = "Already at stock.".into(); }
+    Ok(msg)
+}
+
+fn op_set_powermizer(p: &Obj) -> OpResult {
+    let mode = p.get("mode").and_then(Value::as_str).ok_or("mode must be a string")?;
+    if limits::power_mizer_mode_id(mode).is_none() { return Err(format!("unknown PowerMizer mode {mode:?}")); }
+    limits::set_power_mizer(0, mode)?;
+    Ok(format!("PowerMizer set to {mode}."))
+}
+
+/// Sensors that may need root on some drivers (register reads) — the GUI
+/// reads them in-process first and only falls back to this.
+fn op_read_sensors(_: &Obj) -> OpResult {
+    Ok(ops::sensors_json(0).to_string())
+}
+
 fn op_reset_vram_memlock(_: &Obj) -> OpResult {
     limits::reset_mem_locked_clocks(0)?;
     Ok("Memory clock unlocked (returned to driver/P-state control).".into())
@@ -256,6 +278,9 @@ fn dispatch(op: &str) -> Option<fn(&Obj) -> OpResult> {
         "apply_gpu_offsets" => op_apply_gpu_offsets,
         "apply_named_profile" => op_apply_named_profile,
         "reset_gpu_curve" => op_reset_gpu_curve,
+        "reset_all" => op_reset_all,
+        "set_powermizer" => op_set_powermizer,
+        "read_sensors" => op_read_sensors,
         "set_vram_memlock" => op_set_vram_memlock,
         "reset_vram_memlock" => op_reset_vram_memlock,
         "set_gpu_clocklock" => op_set_gpu_clocklock,

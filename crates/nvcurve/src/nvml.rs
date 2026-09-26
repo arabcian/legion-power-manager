@@ -44,10 +44,28 @@ pub fn ready() -> Result<&'static Nvml, String> {
     Ok(n)
 }
 
+/// nvmlClockOffset_v1_t. The struct carries the offset *and* the allowed
+/// range; NVML derives the expected size from `version`, so a struct missing
+/// the two range fields (16 instead of 24 bytes) is rejected with
+/// ARGUMENT_VERSION_MISMATCH — which is what silently pushed every earlier
+/// build onto the deprecated per-domain API.
 #[repr(C)]
-#[derive(Default)]
-struct ClockOffset { version: u32, kind: u32, pstate: u32, offset_mhz: i32 }
+#[derive(Default, Debug, Clone, Copy)]
+struct ClockOffset { version: u32, kind: u32, pstate: u32, offset_mhz: i32, min_mhz: i32, max_mhz: i32 }
 const CLOCK_OFFSET_V1: u32 = (1 << 24) | std::mem::size_of::<ClockOffset>() as u32;
+const _: () = assert!(std::mem::size_of::<ClockOffset>() == 24);
+
+/// Offset of one clock domain in one P-state, with the driver's range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OffsetInfo { pub offset_mhz: i32, pub min_mhz: i32, pub max_mhz: i32 }
+
+/// nvmlDevicePowerMizerModes_v1_t (no version field).
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct PowerMizerModes { pub current: u32, pub mode: u32, pub supported: u32 }
+
+pub const PSTATE_UNKNOWN: u32 = 32;
+const MAX_PSTATES: usize = 16;
 
 #[repr(C)]
 struct PciInfoV3 {
@@ -199,18 +217,46 @@ impl Nvml {
         self.check(unsafe { f(h.0, mw) })
     }
 
-    /// New per-domain API (driver ≥ 555.85). Err(rc-string) on driver error.
-    pub fn get_clock_offset(&self, h: Handle, kind: u32) -> Result<i32, String> {
+    /// New per-domain API (driver ≥ 555.85): offset and allowed range of
+    /// `kind` in `pstate`.
+    pub fn get_clock_offset(&self, h: Handle, kind: u32, pstate: u32) -> Result<OffsetInfo, String> {
         let f: unsafe extern "C" fn(usize, *mut ClockOffset) -> u32 = self.func("nvmlDeviceGetClockOffsets")?;
-        let mut info = ClockOffset { version: CLOCK_OFFSET_V1, kind, ..Default::default() };
+        let mut info = ClockOffset { version: CLOCK_OFFSET_V1, kind, pstate, ..Default::default() };
         self.check(unsafe { f(h.0, &mut info) })?;
-        Ok(info.offset_mhz)
+        Ok(OffsetInfo { offset_mhz: info.offset_mhz, min_mhz: info.min_mhz, max_mhz: info.max_mhz })
     }
 
-    pub fn set_clock_offset(&self, h: Handle, kind: u32, mhz: i32) -> Result<(), String> {
+    pub fn set_clock_offset(&self, h: Handle, kind: u32, pstate: u32, mhz: i32) -> Result<(), String> {
         let f: unsafe extern "C" fn(usize, *mut ClockOffset) -> u32 = self.func("nvmlDeviceSetClockOffsets")?;
-        let mut info = ClockOffset { version: CLOCK_OFFSET_V1, kind, pstate: 0, offset_mhz: mhz };
+        let mut info = ClockOffset { version: CLOCK_OFFSET_V1, kind, pstate, offset_mhz: mhz, ..Default::default() };
         self.check(unsafe { f(h.0, &mut info) })
+    }
+
+    /// P-states the device supports (P0 first), NVML_PSTATE_UNKNOWN entries dropped.
+    pub fn supported_pstates(&self, h: Handle) -> Result<Vec<u32>, String> {
+        let f: unsafe extern "C" fn(usize, *mut u32, u32) -> u32 = self.func("nvmlDeviceGetSupportedPerformanceStates")?;
+        let mut buf = [PSTATE_UNKNOWN; MAX_PSTATES];
+        self.check(unsafe { f(h.0, buf.as_mut_ptr(), MAX_PSTATES as u32) })?;
+        Ok(buf.into_iter().filter(|&p| p < PSTATE_UNKNOWN).collect())
+    }
+
+    /// nvmlDeviceArchitecture_t: 7 Ampere, 8 Ada, 9 Hopper, 10 Blackwell.
+    pub fn architecture(&self, h: Handle) -> Result<u32, String> { self.get1("nvmlDeviceGetArchitecture", h) }
+
+    /// Clock event (throttle) reason bitmask; the old name on drivers before 535.
+    pub fn clock_event_reasons(&self, h: Handle) -> Result<u64, String> {
+        self.get1("nvmlDeviceGetCurrentClocksEventReasons", h)
+            .or_else(|_| self.get1("nvmlDeviceGetCurrentClocksThrottleReasons", h))
+    }
+
+    /// PowerMizer (driver ≥ 580). `mode` is ignored on read.
+    pub fn power_mizer(&self, h: Handle) -> Result<PowerMizerModes, String> {
+        self.get1("nvmlDeviceGetPowerMizerMode_v1", h)
+    }
+    pub fn set_power_mizer(&self, h: Handle, mode: u32) -> Result<(), String> {
+        let f: unsafe extern "C" fn(usize, *mut PowerMizerModes) -> u32 = self.func("nvmlDeviceSetPowerMizerMode_v1")?;
+        let mut m = PowerMizerModes { mode, ..Default::default() };
+        self.check(unsafe { f(h.0, &mut m) })
     }
 
     pub fn gpc_clk_vf_offset(&self, h: Handle) -> Result<i32, String> { self.get1("nvmlDeviceGetGpcClkVfOffset", h) }

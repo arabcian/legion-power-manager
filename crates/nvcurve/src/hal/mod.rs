@@ -2,6 +2,7 @@ pub mod gpu;
 pub mod limits;
 pub mod monitoring;
 pub mod ranges;
+pub mod sensors;
 pub mod snapshot;
 pub mod vfcurve;
 

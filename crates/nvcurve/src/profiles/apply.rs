@@ -126,7 +126,7 @@ pub fn apply_with_retry(gpu_index: usize, name: &str, cfg: &Config, max_retries:
                 Ok(offs) => {
                     let mism: Vec<String> = expected.iter().filter_map(|(&i, &v)| {
                         let got = *offs.get(usize::try_from(i).ok()?)? as i64;
-                        (got != v).then(|| format!("pt{i}: expected {:+.0}MHz got {:+.0}MHz",
+                        (!vfcurve::readback_matches(v, got)).then(|| format!("pt{i}: expected {:+.0}MHz got {:+.0}MHz",
                                                     v as f64 / 1000.0, got as f64 / 1000.0))
                     }).collect();
                     if mism.is_empty() {

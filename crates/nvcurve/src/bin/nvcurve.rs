@@ -10,7 +10,7 @@ use nvcurve::hal::{gpu, limits, monitoring, snapshot, vfcurve};
 use nvcurve::nvapi::*;
 use nvcurve::profiles::apply::{apply_profile, run_autoload};
 use nvcurve::profiles::native::{list_profiles, load_profile, profile_path, save_profile, ProfileData};
-use nvcurve::safety::{check_negative_freq_warnings, validate_write};
+use nvcurve::safety::validate_write;
 use nvcurve::{logging, ops, CurveState, Domain, NvError};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -29,6 +29,10 @@ commands:
   gpus                                           List NVIDIA GPUs
   profile   list | save NAME | apply NAME | default (NAME | --clear)
   memlock   status | set (--max MHz | --to-max) [--min MHz] | reset
+  sensors   [--json] [--raw]                     Hotspot + VRAM temps, throttle reasons, PowerMizer
+  powermizer status | set (auto|adaptive|max|consistent)
+  reset-all                                      Everything to stock: curve, offsets in all P-states,
+                                                 clock locks, power limit, PowerMizer (root)
   autoload                                       Apply configured auto-load profiles (root)
 ";
 
@@ -120,7 +124,7 @@ fn print_curve(s: &CurveState, voltage: Option<u32>, full: bool) {
     let mut parts = vec![format!("{gpu_n} GPU core points")];
     if mem_n > 0 { parts.push(format!("{mem_n} memory points")); }
     parts.push(format!("{} total", gpu_n + mem_n));
-    println!("Curve: {}\n", parts.join(", "));
+    println!("Curve: {}  (domains from {})\n", parts.join(", "), s.domain_source);
 
     let current = voltage.and_then(|v| s.points.iter().position(|p| p.volt_uv > 0 && (p.volt_uv as i64 - v as i64).abs() < 10_000));
     let mut prev = None;
@@ -304,9 +308,6 @@ fn cmd_write(a: &Args, cfg: &Config) {
         for e in errs { eprintln!("Error: {e}"); }
         exit(1);
     }
-    let freqs: Vec<i64> = state.points.iter().map(|p| p.freq_khz as i64).collect();
-    let cur: Vec<i64> = state.points.iter().map(|p| p.delta_khz as i64).collect();
-    let warnings = check_negative_freq_warnings(&deltas, &freqs, Some(&cur));
 
     if cfg.auto_snapshot {
         snapshot::save(g, &name, &cfg.snapshot_dir, cfg.max_snapshots, Some(raw.bytes()));
@@ -314,7 +315,10 @@ fn cmd_write(a: &Args, cfg: &Config) {
     let (rc, d) = vfcurve::write_offsets(g, &deltas, false, false, Some(raw.bytes()));
     if rc != 0 { die(1, format!("Write failed ({rc}): {d}")); }
     println!("Write OK — {} point(s) updated.", deltas.len());
-    for w in warnings { println!("WARNING: {w}"); }
+    // Points that would have dropped to 0 MHz were raised to their floor.
+    if let Some(notes) = d.split_once(" [").map(|x| x.1.trim_end_matches(']')) {
+        for n in notes.split("; ") { println!("NOTE: {n}"); }
+    }
 }
 
 // ── snapshot / gpus ─────────────────────────────────────────────────────────
@@ -469,6 +473,67 @@ fn cmd_memlock(a: &Args) {
     }
 }
 
+fn cmd_sensors(a: &Args) {
+    let v = ops::sensors_json(a.gpu());
+    if a.flag("--json") { println!("{}", serde_json::to_string_pretty(&v).unwrap()); return; }
+    let c = |k: &str| v[k].as_i64().map_or("—".to_string(), |t| format!("{t} °C"));
+    println!("Hotspot:  {}", c("hotspot_c"));
+    println!("VRAM:     {}", c("vram_c"));
+    if let Some(parts) = v["vram_partitions"].as_array().filter(|p| !p.is_empty()) {
+        let s: Vec<String> = parts.iter().filter_map(|p| Some(format!("{} {}°", p[0].as_str()?, p[1].as_i64()?))).collect();
+        println!("          {}", s.join("  "));
+    }
+    if let Some(src) = v["sensor_source"].as_str().filter(|s| !s.is_empty()) { println!("          ({src})"); }
+    match v["throttle"]["descriptions"].as_array() {
+        Some(d) if d.is_empty() => println!("Limited by: nothing (boosting freely)"),
+        Some(d) => println!("Limited by: {}", d.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+        None => println!("Limited by: unknown (NVML unavailable)"),
+    }
+    match v["power_mizer"].as_object() {
+        Some(p) => println!("PowerMizer: {} (supported: {})", p["current"].as_str().unwrap_or("?"),
+                            p["supported"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
+        None => println!("PowerMizer: not available (driver < 580 or unsupported GPU)"),
+    }
+    if let Some(r) = v["offset_ranges"]["gpc_mhz"].as_array() { println!("Core offset range: {} … {} MHz", r[0], r[1]); }
+    if let Some(r) = v["offset_ranges"]["mem_mhz"].as_array() { println!("Memory offset range: {} … {} MHz (effective)", r[0], r[1]); }
+    if a.flag("--raw") {
+        let ch: Vec<String> = v["channels"].as_array().into_iter().flatten()
+            .filter_map(|c| Some(format!("{}:{}°", c[0].as_i64()?, c[1].as_i64()?))).collect();
+        println!("Thermal channels: {}", if ch.is_empty() { "none readable".into() } else { ch.join("  ") });
+        println!("Architecture id: {}", v["architecture"]);
+    }
+}
+
+fn cmd_powermizer(a: &Args) {
+    let idx = a.gpu() as u32;
+    match a.pos.get(1).map(String::as_str) {
+        Some("status") | None => match limits::get_power_mizer(idx) {
+            Ok(p) => {
+                println!("Current: {}", p.current);
+                for (_, name, text) in limits::POWER_MIZER_MODES {
+                    if p.supported.contains(name) { println!("  {:<11} {text}", name); }
+                }
+            }
+            Err(e) => die(1, format!("PowerMizer not available: {e}")),
+        },
+        Some("set") => {
+            require_root();
+            let m = a.pos.get(2).map(String::as_str).unwrap_or_else(|| die(2, "usage: nvcurve powermizer set (auto|adaptive|max|consistent)"));
+            limits::set_power_mizer(idx, m).unwrap_or_else(|e| die(1, format!("Error: {e}")));
+            println!("PowerMizer set to {m}.");
+        }
+        _ => die(2, "usage: nvcurve powermizer status | set (auto|adaptive|max|consistent)"),
+    }
+}
+
+fn cmd_reset_all(a: &Args) {
+    require_root();
+    let (done, errs) = ops::reset_everything(a.gpu());
+    for d in &done { println!("✓ {d}"); }
+    for e in &errs { eprintln!("✗ {e}"); }
+    if !errs.is_empty() { exit(1); }
+}
+
 fn main() {
     let a = parse_args();
     let default_level = if a.pos.first().map(String::as_str) == Some("autoload") { log::Level::Info } else { log::Level::Warn };
@@ -482,6 +547,9 @@ fn main() {
         Some("gpus") => cmd_gpus(),
         Some("profile") => cmd_profile(&a, &cfg),
         Some("memlock") => cmd_memlock(&a),
+        Some("sensors") => cmd_sensors(&a),
+        Some("powermizer") => cmd_powermizer(&a),
+        Some("reset-all") => cmd_reset_all(&a),
         Some("autoload") => exit(run_autoload(&cfg)),
         Some(c @ ("serve" | "daemon" | "verify" | "setup" | "service")) =>
             die(2, format!("nvcurve: '{c}' is not ported yet in the Rust build")),

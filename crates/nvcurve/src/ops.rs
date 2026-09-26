@@ -2,7 +2,8 @@
 
 use crate::atomicio::{ensure_dir, write_json};
 use crate::config::{Config, PERSISTENT_CONFIG_FILE};
-use crate::hal::{gpu, limits, monitoring, vfcurve};
+use crate::hal::{gpu, limits, monitoring, sensors, vfcurve};
+use crate::nvml;
 use crate::profiles::apply::apply_profile;
 use crate::profiles::native::{load_profile, profile_path};
 use crate::types::CurveState;
@@ -17,7 +18,7 @@ pub fn curve_json(gpu_name: &str, state: &CurveState, voltage: Option<u32>) -> V
         "index": p.index, "freq_kHz": p.freq_khz, "volt_uV": p.volt_uv,
         "freq_offset_kHz": p.delta_khz, "domain": p.domain,
     })).collect();
-    json!({"gpu": gpu_name, "current_voltage_uV": voltage, "vf_curve": pts})
+    json!({"gpu": gpu_name, "current_voltage_uV": voltage, "vf_curve": pts, "domain_source": state.domain_source})
 }
 
 /// Read the curve, retrying briefly if the driver is still settling after a write.
@@ -67,7 +68,7 @@ pub fn apply_profile_verified(gpu_index: usize, name: &str, cfg: &Config, max_re
                 Ok(offs) => {
                     let mism: Vec<String> = expected.iter().filter_map(|(&i, &v)| {
                         let got = *offs.get(usize::try_from(i).ok()?)? as i64;
-                        (got != v).then(|| format!("pt{i}: expected {:+.0}MHz got {:+.0}MHz",
+                        (!vfcurve::readback_matches(v, got)).then(|| format!("pt{i}: expected {:+.0}MHz got {:+.0}MHz",
                                                     v as f64 / 1000.0, got as f64 / 1000.0))
                     }).collect();
                     if !mism.is_empty() { errs = vec![format!("Read-back mismatch: {}", mism.join("; "))]; }
@@ -84,6 +85,72 @@ pub fn apply_profile_verified(gpu_index: usize, name: &str, cfg: &Config, max_re
     let mut msg = format!("Profile '{name}' applied successfully.");
     for w in warns { msg.push('\n'); msg.push_str(&w); }
     Ok(msg)
+}
+
+/// Hotspot/VRAM temperatures, throttle reasons, PowerMizer and the driver's
+/// offset ranges in one object (`nvcurve sensors --json`, helper op).
+pub fn sensors_json(gpu_index: usize) -> Value {
+    let arch = nvml::ready().ok().and_then(|n| n.architecture(n.handle(gpu_index as u32).ok()?).ok());
+    let s = gpu::get_gpu(gpu_index).ok().map(|(g, _)| sensors::read(g, arch)).unwrap_or_default();
+    let t = limits::get_throttle(gpu_index as u32);
+    let pm = limits::get_power_mizer(gpu_index as u32).ok();
+    let r = limits::get_offset_ranges(gpu_index as u32);
+    json!({
+        "architecture": arch,
+        "hotspot_c": s.hotspot_c, "vram_c": s.vram_c,
+        "vram_partitions": s.vram_partitions, "channels": s.channels, "sensor_source": s.source,
+        "throttle": t.map(|t| json!({"mask": t.mask, "reasons": t.reasons, "descriptions": t.descriptions})),
+        "power_mizer": pm,
+        "offset_ranges": {"gpc_mhz": r.gpc, "mem_mhz": r.mem},
+    })
+}
+
+/// Everything back to stock, in the order LACT's reset uses too: curve
+/// offsets (every point, both domains), NVML offsets in every P-state, core
+/// and memory clock locks, power limit, PowerMizer → Auto. Each step is
+/// attempted even if an earlier one fails; returns (done, errors).
+pub fn reset_everything(gpu_index: usize) -> (Vec<String>, Vec<String>) {
+    let (mut done, mut errs) = (Vec::new(), Vec::new());
+    let idx = gpu_index as u32;
+    match gpu::get_gpu(gpu_index) {
+        Ok((g, _)) => match vfcurve::reset_all_offsets(g, false) {
+            (0, _) => done.push("V/F curve offsets → 0 (all points)".to_string()),
+            (rc, d) => errs.push(format!("curve reset ({rc}): {d}")),
+        },
+        Err(e) => errs.push(format!("curve reset: {e}")),
+    }
+    match limits::reset_all_clock_offsets(idx) {
+        Ok(v) if v.is_empty() => done.push("NVML clock offsets already 0 in every P-state".into()),
+        Ok(v) => done.extend(v),
+        Err(e) => errs.push(format!("clock offsets: {e}")),
+    }
+    for (what, r) in [("core clock lock", limits::reset_gpu_locked_clocks(idx)),
+                      ("memory clock lock", limits::reset_mem_locked_clocks(idx))] {
+        match r {
+            Ok(()) => done.push(format!("{what} released")),
+            // "not supported" on a GPU without locks is not a failed reset
+            Err(e) if e.contains("Not Supported") || e.contains("not found") => {}
+            Err(e) => errs.push(format!("{what}: {e}")),
+        }
+    }
+    let pl = limits::get_power_limit(idx);
+    if let (Some(cur), Some(def)) = (pl.power_limit_w, pl.default_power_limit_w) {
+        if cur != def {
+            match limits::set_power_limit(def, idx) {
+                Ok(()) => done.push(format!("power limit {cur} W → {def} W (default)")),
+                Err(e) => errs.push(format!("power limit: {e}")),
+            }
+        }
+    }
+    if let Ok(pm) = limits::get_power_mizer(idx) {
+        if pm.current != "auto" && pm.supported.contains(&"auto") {
+            match limits::set_power_mizer(idx, "auto") {
+                Ok(()) => done.push(format!("PowerMizer {} → auto", pm.current)),
+                Err(e) => errs.push(format!("PowerMizer: {e}")),
+            }
+        }
+    }
+    (done, errs)
 }
 
 // ── Persistent config (/etc/nvcurve/config.json) as a raw JSON object ──────

@@ -72,7 +72,8 @@ preset from the GUI — enabling the service early is harmless.
     /usr/libexec/legion-power-manager/
         legion-profile-helper  fwattr-helper  ryzen-co-helper
         tune-helper  intel-uv-helper  legion-gpu-helper
-        legion-firmware-helper  lighting-helper  lpm-boot-guard (root:root 0755)
+        legion-firmware-helper  lighting-helper  amdgpu-helper
+        lpm-boot-guard                                          (root:root 0755)
         nvcurve-root-helper                                     (root:root 0700)
     /usr/share/polkit-1/actions/com.legion-power-manager.policy
     /etc/polkit-1/rules.d/49-legion-power-manager.rules
@@ -169,6 +170,70 @@ Files: `~/.config/legion-power-manager/scenes/<name>.json` and
 active scene is shared with lpm-gamemode in
 `$XDG_RUNTIME_DIR/legion-power-manager/scene.json`. The tray
 has a *Scene* menu with every scene and the auto-switch toggle.
+
+## AMD GPU tuning (AMD GPU tab)
+
+Shown when an `amdgpu` card exists (a discrete Radeon, or the CPU's integrated
+graphics in Hybrid mode). The form is generated from what the driver reports
+for the selected card, so each generation only gets the controls it has:
+
+| `pp_od_clk_voltage` shape | Generations | Controls |
+|---|---|---|
+| per-state `OD_SCLK`/`OD_MCLK` with mV, range `VDDC` | Polaris, Vega 10 | clock + voltage of every state |
+| `OD_VDDC_CURVE` | Vega 20, RDNA1 | min/max GPU clock, max memory clock, 3-point V/F curve |
+| `OD_SCLK` 0/1, optional `OD_VDDGFX_OFFSET` | RDNA2, RDNA3, APUs | GPU/memory clock window, voltage offset |
+| `OD_SCLK_OFFSET` | RDNA4 | GPU clock offset, memory clock, voltage offset |
+
+Plus performance level, power profile (`pp_power_profile_mode`, CUSTOM not
+offered), power limit (hwmon `power1_cap`) and the PMFW fan settings of RDNA3+
+(`gpu_od/fan_ctrl/*`: zero-RPM, minimum speed, target temperature, acoustic
+limits, 5-point curve).
+
+- **Overdrive** needs bit `0x4000` in `amdgpu.ppfeaturemask`. Without it the tab
+  shows the exact parameter (current mask | 0x4000) and Optimizations → Boot
+  options lists it; nothing edits the bootloader.
+- **amdgpu-helper** takes the complete wanted state of one card, re-reads every
+  range from sysfs, rejects the whole request if anything is out of range, and
+  only then writes: level `manual` → OD `r`, edits, `c` → power cap → fan
+  (value + `c`) → profile → wanted level. A failed OD write restores the stock
+  table before reporting. Extra limits on top of the driver's: clocks ≤ 4000
+  MHz, voltages ≤ 1300 mV, voltage offset ≤ 0 (undervolt only). A value equal
+  to what the driver currently reports is always accepted (some firmware ships
+  stock points outside its own OD_RANGE).
+- **Trial apply.** Every Apply runs as a trial: unless *Keep* is pressed within
+  20 s, the previous settings are written back. *Undervolt step* lowers the
+  voltage offset by 10 mV per trial — step until the game or stress test
+  crashes, keep the last step that held. Nothing is applied at boot, so a hang
+  is undone by a reboot.
+- **Stock reference** (for the presets) and the last kept summary live in
+  `~/.config/legion-power-manager/amdgpu-state.ini`; profiles in
+  `~/.config/legion-power-manager/amdgpu/*.json` (with the card's PCI id).
+- `LPM_AMDGPU_DRM=<dir>` points the tab at a fake `/sys/class/drm` tree (dev aid).
+
+## nvcurve: sensors, PowerMizer, full reset
+
+- **Temperatures NVML doesn't give on GeForce** (`nvcurve sensors`, NVIDIA tab):
+  hotspot = NvAPI thermal channel 9 up to Ada, the aggregated hotspot register
+  `0x00AD0AA0` on Blackwell; VRAM = channel 15 (GDDR6/6X) or, on Blackwell
+  (GDDR7), the hottest per-partition register sensor with channel 10 as
+  fallback. `--raw` lists every readable channel.
+- **Throttle reasons** (NVML clock event reasons) in `sensors` and the tab's
+  *Limit* field.
+- **PowerMizer** (driver ≥ 580): `nvcurve powermizer status|set`, tab combo.
+- **`nvcurve reset-all`** / *Reset All*: curve offsets on every point, NVML core
+  and memory offsets in **every** P-state, core/VRAM clock locks, power limit,
+  PowerMizer → Auto.
+- **NVML ClockOffset fix**: `nvmlClockOffset_v1_t` is 24 bytes (offset + min +
+  max); the old 16-byte struct was always rejected on version mismatch, so the
+  per-P-state API never ran. Core offsets now use it; memory offsets still go
+  through the per-domain call first (the ×2 raw scaling was measured on that
+  path) — `LPM_NVML_MEM_NEW_API=1` tries the new API first.
+- **V/F point classification** from the driver's per-point records in the
+  GetClockBoostMask buffer (`type`, `bVoltageBased`); the old flags heuristic
+  is the fallback. `nvcurve read` prints which one was used.
+- **0 MHz floor**: negative offsets that would take a point to ≤ 0 MHz are raised
+  to the point's floor (base frequency from the V3 status when the driver has
+  it); read-back verification accepts exactly that adjustment.
 
 ## Keyboard lighting (Lighting tab)
 

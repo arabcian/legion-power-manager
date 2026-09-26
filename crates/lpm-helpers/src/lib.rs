@@ -11,6 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
+pub mod amdgpu;
 pub mod bootguard;
 pub mod fan_table;
 pub mod memory_spd;

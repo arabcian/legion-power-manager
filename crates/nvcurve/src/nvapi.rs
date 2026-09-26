@@ -19,6 +19,8 @@ pub mod fid {
     pub const GET_PERF_LIMITS: u32 = 0xE440_B867;
     pub const GET_VOLT_BOOST_PERCENT: u32 = 0x9DF2_3CA1;
     pub const SET_CLOCK_BOOST_TABLE: u32 = 0x0733_E009;
+    pub const THERM_CHANNEL_GET_STATUS: u32 = 0x65FE_3AAD;
+    pub const REGISTER_OP: u32 = 0x2EB3_C140;
 }
 
 // ── Struct layouts (verified on GB202, driver 590.48.01) ────────────────────
