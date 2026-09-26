@@ -3,9 +3,70 @@
 #include <QHash>
 #include <QPalette>
 #include <QProxyStyle>
+#include <QSettings>
 #include <QStyleFactory>
 
 namespace theme {
+
+namespace {
+struct Palette {
+    const char *id, *name;
+    //          BG0  BG1  BG2  BG3  BG4  WELL BORDER BORDER_SOFT FG  FG_DIM MUTED ACCENT ACCENT_SOFT
+    //          OK   WARN DANGER DANGER_SOFT INFO PURPLE
+    const char *c[19];
+};
+const Palette PALETTES[] = {
+    {"graphite", "Graphite", {"#121316", "#191a1e", "#202126", "#292a30", "#34363d", "#0e0f11", "#2f3137", "#24252a",
+        "#e8e6e3", "#b4b2ae", "#86868d", "#eba55b", "#a9773f", "#8fc486", "#e6c065", "#e8776c", "#8e4841", "#7fb1d5", "#b79be2"}},
+    {"gruvbox", "Gruvbox", {"#1d2021", "#282828", "#302e2d", "#3c3836", "#504945", "#161819", "#45403d", "#34302e",
+        "#ebdbb2", "#d5c4a1", "#928374", "#fe8019", "#b35f1c", "#b8bb26", "#fabd2f", "#fb4934", "#8f2a22", "#83a598", "#d3869b"}},
+    {"dracula", "Dracula", {"#1e1f29", "#282a36", "#2f3240", "#383a4a", "#44475a", "#191a21", "#3d4051", "#313341",
+        "#f8f8f2", "#c9c9d9", "#7d86ad", "#bd93f9", "#7f62b8", "#50fa7b", "#f1fa8c", "#ff5555", "#9a3b3b", "#8be9fd", "#ff79c6"}},
+    {"tokyo-night", "Tokyo Night", {"#16161e", "#1a1b26", "#1f2335", "#292e42", "#343a55", "#121218", "#2f344d", "#232639",
+        "#c0caf5", "#a9b1d6", "#737aa2", "#7aa2f7", "#4b6cb7", "#9ece6a", "#e0af68", "#f7768e", "#8c4050", "#7dcfff", "#bb9af7"}},
+    {"nord", "Nord", {"#242933", "#2e3440", "#353c4a", "#3b4252", "#434c5e", "#20252e", "#4c566a", "#3a4150",
+        "#eceff4", "#d8dee9", "#8a93a6", "#88c0d0", "#5e8a99", "#a3be8c", "#ebcb8b", "#bf616a", "#7d4148", "#81a1c1", "#b48ead"}},
+    {"catppuccin", "Catppuccin Mocha", {"#181825", "#1e1e2e", "#262637", "#313244", "#45475a", "#11111b", "#3b3d52", "#2a2b3c",
+        "#cdd6f4", "#bac2de", "#7f849c", "#cba6f7", "#8a6fb3", "#a6e3a1", "#f9e2af", "#f38ba8", "#8b4a60", "#89b4fa", "#f5c2e7"}},
+    // Originals: Legion black with its red, and a cold blue-green night.
+    {"crimson", "Crimson", {"#111112", "#18181a", "#1f1f22", "#28282c", "#333338", "#0c0c0d", "#2e2e33", "#222226",
+        "#eeeeee", "#b8b8bc", "#87878e", "#e5484d", "#9c3236", "#7fc98f", "#f0c05a", "#ff7a59", "#8f4632", "#7aa7d9", "#b39ddb"}},
+    {"glacier", "Glacier", {"#0f1519", "#141c21", "#1a242a", "#213038", "#2b3d46", "#0b1013", "#26363e", "#1c282e",
+        "#e2eef2", "#a9c0c8", "#6f8a94", "#5ed3c4", "#3a8a80", "#8ed49a", "#e8c86a", "#ef7b7b", "#8a4646", "#7ab8e8", "#b4a2e6"}},
+};
+QString g_current = QStringLiteral("graphite");
+bool g_restart = false;
+QSettings settings() {
+    return QSettings(QSettings::IniFormat, QSettings::UserScope, QStringLiteral("legion-power-manager"), QStringLiteral("gui"));
+}
+} // namespace
+
+QList<QPair<QString, QString>> themes() {
+    QList<QPair<QString, QString>> out;
+    for (const Palette &p : PALETTES) out.append({QString::fromLatin1(p.id), QString::fromLatin1(p.name)});
+    return out;
+}
+QString currentTheme() { return g_current; }
+
+void load() {
+    const QString want = settings().value(QStringLiteral("theme")).toString();
+    const Palette *p = &PALETTES[0];
+    for (const Palette &x : PALETTES) if (want == QLatin1String(x.id)) p = &x;
+    g_current = QString::fromLatin1(p->id);
+    const char **tok[] = {&BG0, &BG1, &BG2, &BG3, &BG4, &WELL, &BORDER, &BORDER_SOFT, &FG, &FG_DIM, &MUTED,
+                          &ACCENT, &ACCENT_SOFT, &OK, &WARN, &DANGER, &DANGER_SOFT, &INFO, &PURPLE};
+    for (int i = 0; i < 19; ++i) *tok[i] = p->c[i];
+}
+
+bool saveTheme(const QString &id) {
+    QSettings s = settings();
+    s.setValue(QStringLiteral("theme"), id);
+    s.sync();
+    return s.status() == QSettings::NoError;
+}
+
+void requestRestart() { g_restart = true; QCoreApplication::quit(); }
+bool restartRequested() { return g_restart; }
 
 QString profileAccent(const QString &p) {
     static const QHash<QString, QString> m{
@@ -101,7 +162,7 @@ QPushButton:focus { border-color: @ACCENT_SOFT; }
 QPushButton:disabled { background: transparent; color: @MUTED; border-color: @BORDER_SOFT; }
 QPushButton:checked { background: @BG4; border-color: @ACCENT_SOFT; }
 QPushButton#btnAccent { background: @ACCENT; border-color: @ACCENT; color: @BG0; font-weight: 600; }
-QPushButton#btnAccent:hover { background: #f3b774; border-color: #f3b774; }
+QPushButton#btnAccent:hover { background: @ACCENT_HI; border-color: @ACCENT_HI; }
 QPushButton#btnAccent:pressed { background: @ACCENT_SOFT; border-color: @ACCENT_SOFT; }
 QPushButton#btnAccent:focus { border-color: @FG; }
 QPushButton#btnDanger { background: transparent; border-color: @DANGER_SOFT; color: @DANGER; }
@@ -209,7 +270,7 @@ QMenuBar { background: @BG0; } QMenuBar::item:selected { background: @BG3; }
     // Longest names first so @BG doesn't eat @BG0 etc.
     const std::pair<const char *, QString> toks[] = {
         {"@BORDER_SOFT", BORDER_SOFT}, {"@ACCENT_SOFT", ACCENT_SOFT}, {"@DANGER_SOFT", DANGER_SOFT},
-        {"@DANGER_TINT", rgba(DANGER, 0.14)},
+        {"@DANGER_TINT", rgba(DANGER, 0.14)}, {"@ACCENT_HI", QColor(QString::fromLatin1(ACCENT)).lighter(112).name()},
         {"@FG_DIM", FG_DIM}, {"@BORDER", BORDER}, {"@ACCENT", ACCENT}, {"@DANGER", DANGER},
         {"@MUTED", MUTED}, {"@PURPLE", PURPLE}, {"@INFO", INFO}, {"@WARN", WARN}, {"@WELL", WELL}, {"@OK", OK},
         {"@BG0", BG0}, {"@BG1", BG1}, {"@BG2", BG2}, {"@BG3", BG3}, {"@BG4", BG4}, {"@FG", FG},

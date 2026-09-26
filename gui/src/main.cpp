@@ -26,6 +26,8 @@
 #include <QTimer>
 #include <QSocketNotifier>
 #include <csignal>
+#include <cstdio>
+#include <vector>
 #include <fcntl.h>
 #include <cstdio>
 #include <unistd.h>
@@ -106,6 +108,7 @@ int main(int argc, char **argv) {
     app.setApplicationName("Legion Power Manager");
     app.setApplicationVersion(LPM_VERSION);
     app.setDesktopFileName("legion-power-manager");
+    theme::load();  // palette tokens first: the icon below is drawn in them
     app.setWindowIcon(appIcon(128));
     app.setQuitOnLastWindowClosed(false);  // the window is a view onto a tray app
 
@@ -186,5 +189,17 @@ int main(int argc, char **argv) {
                     }
             app.quit();
         });
-    return app.exec();
+    const int rc = app.exec();
+    if (!theme::restartRequested()) return rc;
+    // Theme change: start again in place with the window open. Lock and socket
+    // go first, or the new process would find this one still running.
+    server.close();
+    lock.unlock();
+    std::vector<char *> av(argv, argv + argc);
+    char window[] = "--window";
+    if (!args.contains(QStringLiteral("--window"))) av.push_back(window);
+    av.push_back(nullptr);
+    ::execv("/proc/self/exe", av.data());
+    std::perror("legion-power-manager: restart failed");
+    return rc;
 }

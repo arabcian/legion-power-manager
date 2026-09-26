@@ -172,7 +172,25 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
     head->setContentsMargins(2, 0, 0, 2);
     head->addWidget(title);
     head->addWidget(muted(sub.join("   ·   ")));
-    root->addLayout(head);
+    auto *headRow = new QHBoxLayout;
+    headRow->addLayout(head, 1);
+    auto *themeBox = new QComboBox;
+    themeBox->setToolTip("Colour theme. Applied by restarting the app (a few seconds).");
+    for (const auto &[id, name] : theme::themes()) themeBox->addItem(name, id);
+    themeBox->setCurrentIndex(std::max(0, themeBox->findData(theme::currentTheme())));
+    connect(themeBox, &QComboBox::activated, this, [this, themeBox](int i) {
+        const QString id = themeBox->itemData(i).toString();
+        if (id == theme::currentTheme()) return;
+        if (!theme::saveTheme(id)) { showStatus("Could not save the theme choice.", 6000); return; }
+        if (QMessageBox::question(this, "Theme", "Restart Legion Power Manager now to apply " + themeBox->itemText(i) + "?")
+            == QMessageBox::Yes) theme::requestRestart();
+        else showStatus("Theme applies at the next start.", 6000);
+    });
+    auto *themeLabel = muted("Theme");
+    themeLabel->setWordWrap(false);
+    headRow->addWidget(themeLabel, 0, Qt::AlignVCenter);
+    headRow->addWidget(themeBox, 0, Qt::AlignVCenter);
+    root->addLayout(headRow);
 
     guardBanner_ = new QFrame;
     guardBanner_->setObjectName("guardBanner");
