@@ -1,3 +1,18 @@
+                        Screenshots   
+                    
+<img width="1692" height="1311" alt="1" src="https://github.com/user-attachments/assets/fa57554d-040f-46a5-baaa-5063a5313ec4" />
+<img width="1114" height="843" alt="Screenshot_20260925_182105" src="https://github.com/user-attachments/assets/12793dde-8cb3-4df7-be7d-4f9590aabd09" />
+<img width="1114" height="843" alt="Screenshot_20260925_182124" src="https://github.com/user-attachments/assets/4297f2d4-32b1-497d-ad32-31ff462c5cd1" />
+<img width="1114" height="843" alt="Screenshot_20260925_182136" src="https://github.com/user-attachments/assets/58672d9a-f48f-4d9f-acb6-d2c35fcfb83b" />
+<img width="1114" height="843" alt="Screenshot_20260925_182150" src="https://github.com/user-attachments/assets/fe38b896-4893-4439-a5dd-66aef7d45142" />
+<img width="1114" height="843" alt="Screenshot_20260925_182202" src="https://github.com/user-attachments/assets/961fc36c-9181-43e5-a9f4-b93acba6b9ec" />
+<img width="1114" height="989" alt="Screenshot_20260925_182224" src="https://github.com/user-attachments/assets/a1dbd6cd-f917-4819-8461-57326970b064" />
+<img width="1114" height="989" alt="Screenshot_20260925_182237" src="https://github.com/user-attachments/assets/0d855a20-9b5a-4799-9964-ecfa5845e74f" />
+<img width="1186" height="1144" alt="Screenshot_20260925_182256" src="https://github.com/user-attachments/assets/05c776ed-1cbf-476b-a346-b540f8943a0c" />
+<img width="2004" height="859" alt="Screenshot_20260925_184218" src="https://github.com/user-attachments/assets/479f1609-b4bc-4f23-8e77-73ab03816d37" />
+<img width="1269" height="899" alt="Screenshot_20260926_091306" src="https://github.com/user-attachments/assets/513b94e3-6620-4eca-a3ef-1f1493e3db34" />
+
+
 # Legion Power Manager 2 — Rust + C++/Qt6
 
 > ⚠️ **This tool writes low-level hardware and firmware settings. Read [DISCLAIMER.md](DISCLAIMER.md) before using it.**
