@@ -1,6 +1,11 @@
 #include "platformprofile.h"
 #include <QDir>
+#include <QCoreApplication>
 #include <QFile>
+#include <QSocketNotifier>
+#include <QTimer>
+#include <fcntl.h>
+#include <unistd.h>
 #include <algorithm>
 
 namespace pp {
@@ -65,6 +70,49 @@ QStringList offeredProfiles(const std::optional<Handler> &h) {
     QStringList out;
     for (const QString &p : VALID_PROFILES) if (names.contains(p)) out << p;
     return out;
+}
+
+// ── change notifications ────────────────────────────────────────────────────
+
+static constexpr int SAFETY_POLL_MS = 30000, FALLBACK_POLL_MS = 2500;
+
+Watcher &Watcher::instance() {
+    // Parented to the application: its notifiers go away before the event dispatcher does.
+    static Watcher *w = new Watcher(QCoreApplication::instance());
+    return *w;
+}
+
+Watcher::Watcher(QObject *parent) : QObject(parent), handler_(primaryHandler()) {
+    current_ = currentProfile(handler_);
+    if (handler_) watch(handler_->path());
+    watch(LEGACY_PROFILE);
+    auto *t = new QTimer(this);
+    t->setTimerType(Qt::VeryCoarseTimer);  // may be batched with other wake-ups
+    connect(t, &QTimer::timeout, this, &Watcher::check);
+    t->start(fds_.isEmpty() ? FALLBACK_POLL_MS : SAFETY_POLL_MS);
+    connect(this, &QObject::destroyed, [fds = fds_] { for (int fd : fds) ::close(fd); });
+}
+
+void Watcher::watch(const QString &path) {
+    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    char buf[64];
+    if (::read(fd, buf, sizeof buf) < 0) { ::close(fd); return; }  // a sysfs attribute is armed by a read
+    fds_ << fd;
+    auto *n = new QSocketNotifier(fd, QSocketNotifier::Exception, this);  // POLLPRI = sysfs_notify
+    connect(n, &QSocketNotifier::activated, this, [this, fd] {
+        char b[64];
+        ::lseek(fd, 0, SEEK_SET);
+        [[maybe_unused]] const auto r = ::read(fd, b, sizeof b);  // re-arm
+        check();
+    });
+}
+
+void Watcher::check() {
+    const auto now = currentProfile(handler_);
+    if (!now || now == current_) return;
+    current_ = now;
+    Q_EMIT changed(*now);
 }
 
 } // namespace pp

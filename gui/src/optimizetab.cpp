@@ -4,6 +4,7 @@
 #include "ryzentab.h"
 #include "scenes.h"
 #include "bootadvisor.h"
+#include "lazywidget.h"
 #include "sysinfo.h"
 #include "theme.h"
 
@@ -796,7 +797,7 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
         groups_->addTab(scroll, QStringLiteral("%1  %2").arg(group).arg(available));
     }
     groups_->addTab(buildLaunchPage(), "Game launch");
-    groups_->addTab(new BootAdvisor, "Boot options");
+    groups_->addTab(new LazyWidget([] { return new BootAdvisor; }), "Boot options");  // built on first open
     if (tabIndex >= 0 && tabIndex < groups_->count()) groups_->setCurrentIndex(tabIndex);
     // Dev aids for screenshots (like LPM_TAB): LPM_OPT_SUBTAB=N, LPM_OPT_LOAD=<preset>.
     if (qEnvironmentVariableIsSet("LPM_OPT_SUBTAB")) groups_->setCurrentIndex(qEnvironmentVariableIntValue("LPM_OPT_SUBTAB"));

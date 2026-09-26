@@ -113,6 +113,8 @@ private:
     void next();
     void finish();
     void pollPower();
+    void retunePoll();
+    void watchUevents();
     void checkGameEnd();
     void applyForSource(bool onAc);
     void startupApply();
@@ -132,4 +134,5 @@ private:
     int stableReads_ = 0;
     int gameGoneReads_ = 0;
     bool sawGameScene_ = false;
+    int uevFd_ = -1;  // uevent socket; -1 → poll at the fast cadence as before
 };

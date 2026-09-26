@@ -4,7 +4,9 @@
 // (1–6), previews it on a drawing of the keyboard built from the controller's
 // own key map, and writes it on Apply. Brightness, logo and the active
 // profile apply immediately (tray and scenes use the same calls).
+#include "kblayout.h"
 #include "lighting.h"
+#include <QPainterPath>
 #include <QSet>
 #include <functional>
 #include <QWidget>
@@ -45,12 +47,17 @@ protected:
     void mouseReleaseEvent(QMouseEvent *e) override;
 
 private:
-    struct Cell { int code; QRectF rect; bool bar; QString label; };
+    struct Cell { int code; QRectF rect; bool bar; QString label; QPainterPath shape; };
     void layoutCells();
+    void layoutMatrix();
+    void layoutPhysical();
+    QRectF physBounds() const;  // key units, perimeter included
     int codeAt(const QPointF &p) const;
     void touch(int code);
 
     lighting::KeyMap map_;
+    QList<kblayout::Key> phys_;      // empty → draw the controller matrix
+    QHash<int, QString> legends_;
     QList<Cell> cells_;
     QHash<int, QColor> colors_;
     QSet<int> animated_, sel_;
@@ -112,6 +119,8 @@ private:
     QSet<int> zoneKeys(lighting::Zone z) const;
 
     lighting::KeyMap map_;
+    QList<kblayout::Key> phys_;      // empty → draw the controller matrix
+    QHash<int, QString> legends_;
     QList<lighting::Effect> loaded_, work_;
     int active_ = 0, editProfile_ = 0, brightness_ = 0, lastOn_ = 5;
     bool logo_ = false, ready_ = false, busy_ = false, filling_ = false;

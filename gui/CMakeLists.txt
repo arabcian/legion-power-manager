@@ -33,6 +33,9 @@ add_executable(legion-power-manager
     src/bundle.cpp       src/bundle.h
     src/lighting.cpp     src/lighting.h
     src/lightingtab.cpp  src/lightingtab.h
+    src/kblayout.cpp     src/kblayout.h
+    src/amdgpu.cpp       src/amdgpu.h
+    src/amdgputab.cpp    src/amdgputab.h
 )
 # Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
 # with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the
@@ -69,6 +72,12 @@ if(LPM_LTO)
     else()
         message(WARNING "LTO not supported by this toolchain: ${_ipo_msg}")
     endif()
+endif()
+# Smaller binary / fewer relocations: drop unreferenced sections, link only
+# libraries actually used, no PLT indirection for Qt calls.
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(legion-power-manager PRIVATE -ffunction-sections -fdata-sections -fno-plt)
+    target_link_options(legion-power-manager PRIVATE -Wl,--gc-sections -Wl,--as-needed -Wl,-O1)
 endif()
 if(LPM_NATIVE)
     target_compile_options(legion-power-manager PRIVATE -march=native -mtune=native)
@@ -114,6 +123,22 @@ elseif(NOT LPM_PGO STREQUAL "")
     message(FATAL_ERROR "LPM_PGO must be '', 'generate' or 'use'")
 endif()
 target_link_libraries(legion-power-manager PRIVATE Qt6::Widgets Qt6::Network ${CMAKE_DL_LIBS})
+
+# Lighting tab key legends from the active XKB layout (TR-Q İ/Ş/Ğ…). Optional:
+# without it the keyboard drawing uses fixed US legends.
+option(LPM_XKB "Key legends from the active keyboard layout (libxkbcommon)" ON)
+if(LPM_XKB)
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(XKBCOMMON IMPORTED_TARGET xkbcommon)
+    endif()
+    if(XKBCOMMON_FOUND)
+        target_link_libraries(legion-power-manager PRIVATE PkgConfig::XKBCOMMON)
+        target_compile_definitions(legion-power-manager PRIVATE LPM_HAVE_XKB)
+    else()
+        message(WARNING "libxkbcommon not found: keyboard legends fall back to US")
+    endif()
+endif()
 
 include(GNUInstallDirs)
 install(TARGETS legion-power-manager RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

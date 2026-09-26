@@ -21,6 +21,7 @@
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <array>
 #include <cmath>
 #include <dlfcn.h>
 
@@ -53,6 +54,14 @@ public:
     std::optional<unsigned> temp() { unsigned v; return temp_ && temp_(dev_, 0, &v) == 0 ? std::optional(v) : std::nullopt; }
     std::optional<unsigned> powerMw() { unsigned v; return power_ && power_(dev_, &v) == 0 ? std::optional(v) : std::nullopt; }
     std::optional<unsigned> clock(unsigned type) { unsigned v; return clock_ && clock_(dev_, type, &v) == 0 ? std::optional(v) : std::nullopt; }
+    std::optional<unsigned> architecture() { unsigned v; return arch_ && arch_(dev_, &v) == 0 ? std::optional(v) : std::nullopt; }
+    std::optional<unsigned long long> eventReasons() {
+        unsigned long long v; return reasons_ && reasons_(dev_, &v) == 0 ? std::optional(v) : std::nullopt;
+    }
+    struct PowerMizer { unsigned current, mode, supported; };  // nvmlDevicePowerMizerModes_v1_t
+    std::optional<PowerMizer> powerMizer() {
+        PowerMizer m{}; return pm_ && pm_(dev_, &m) == 0 ? std::optional(m) : std::nullopt;
+    }
 private:
     explicit Nvml(void *h) : lib_(h) {
         auto sym = [&](const char *n) { return dlsym(lib_, n); };
@@ -62,6 +71,10 @@ private:
         temp_ = reinterpret_cast<int (*)(void *, unsigned, unsigned *)>(sym("nvmlDeviceGetTemperature"));
         power_ = reinterpret_cast<int (*)(void *, unsigned *)>(sym("nvmlDeviceGetPowerUsage"));
         clock_ = reinterpret_cast<int (*)(void *, unsigned, unsigned *)>(sym("nvmlDeviceGetClockInfo"));
+        arch_ = reinterpret_cast<int (*)(void *, unsigned *)>(sym("nvmlDeviceGetArchitecture"));
+        reasons_ = reinterpret_cast<int (*)(void *, unsigned long long *)>(sym("nvmlDeviceGetCurrentClocksEventReasons"));
+        if (!reasons_) reasons_ = reinterpret_cast<int (*)(void *, unsigned long long *)>(sym("nvmlDeviceGetCurrentClocksThrottleReasons"));
+        pm_ = reinterpret_cast<int (*)(void *, PowerMizer *)>(sym("nvmlDeviceGetPowerMizerMode_v1"));
         if (!init || !byIdx || init() != 0) { shutdown_ = nullptr; return; }
         ok_ = byIdx(0, &dev_) == 0;
     }
@@ -71,7 +84,133 @@ private:
     int (*temp_)(void *, unsigned, unsigned *) = nullptr;
     int (*power_)(void *, unsigned *) = nullptr;
     int (*clock_)(void *, unsigned, unsigned *) = nullptr;
+    int (*arch_)(void *, unsigned *) = nullptr;
+    int (*reasons_)(void *, unsigned long long *) = nullptr;
+    int (*pm_)(void *, PowerMizer *) = nullptr;
 };
+
+// ── NvAPI temperatures (hotspot, VRAM) — in-process, only while visible ─────
+// Same sources as `nvcurve sensors` (crates/nvcurve/src/hal/sensors.rs):
+// thermal channel 9 = hotspot up to Ada, channel 15 = GDDR6/6X memory,
+// channel 10 = GDDR7 memory; Blackwell's hotspot and per-partition GDDR7
+// temperatures come from GPU registers. All values are range-checked.
+class NvApiTemps {
+public:
+    static NvApiTemps *open() {
+        void *h = dlopen("libnvidia-api.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!h) return nullptr;
+        auto *t = new NvApiTemps(h);
+        if (!t->gpu_) { delete t; return nullptr; }
+        return t;
+    }
+    ~NvApiTemps() {
+        if (auto unload = fn<int (*)()>(0xD22BDD7E); unload && gpu_) unload();
+        dlclose(lib_);
+    }
+    std::optional<int> hotspot(bool blackwell) { return blackwell ? regTemp(0x00AD0AA0) : channel(9); }
+    std::optional<int> vram(bool blackwell) {
+        if (!blackwell) return channel(15);
+        if (auto p = partitionsMax()) return p;
+        return channel(10);
+    }
+private:
+    struct Therm { unsigned version; int mask; int values[40]; };
+    struct RegOp { unsigned short flags, status; unsigned offset; unsigned long long writeMask, value; };
+    struct RegOps { unsigned version, count; RegOp op[256]; };
+    static_assert(sizeof(Therm) == 168 && sizeof(RegOp) == 24 && sizeof(RegOps) == 6152);
+
+    template <typename F> F fn(unsigned id) { return qi_ ? reinterpret_cast<F>(qi_(id)) : nullptr; }
+    explicit NvApiTemps(void *h) : lib_(h) {
+        qi_ = reinterpret_cast<void *(*)(unsigned)>(dlsym(lib_, "nvapi_QueryInterface"));
+        auto init = fn<int (*)()>(0x0150E828);
+        auto enumGpus = fn<int (*)(void **, unsigned *)>(0xE5AC921F);
+        if (!init || !enumGpus || init() != 0) return;
+        void *gpus[64] = {};
+        unsigned n = 0;
+        if (enumGpus(gpus, &n) == 0 && n > 0) gpu_ = gpus[0];
+        therm_ = fn<int (*)(void *, Therm *)>(0x65FE3AAD);
+        reg_ = fn<int (*)(void *, RegOps *)>(0x2EB3C140);
+    }
+    bool thermRead(int mask, Therm &t) {
+        t = Therm{};
+        t.version = unsigned(sizeof(Therm)) | (2u << 16);
+        t.mask = mask;
+        return therm_ && therm_(gpu_, &t) == 0;
+    }
+    std::optional<int> channel(int i) {
+        if (!therm_) return std::nullopt;
+        if (mask_ == 0) {  // widest channel mask the driver accepts, probed once
+            Therm t;
+            if (!thermRead(1, t)) { therm_ = nullptr; return std::nullopt; }
+            mask_ = 1;
+            for (int b = 1; b < 31 && thermRead(mask_ | (1 << b), t); ++b) mask_ |= 1 << b;
+        }
+        Therm t;
+        if (!thermRead(mask_, t)) return std::nullopt;
+        const int c = t.values[i] / 256;
+        return c > 0 && c < 255 ? std::optional(c) : std::nullopt;
+    }
+    std::optional<unsigned long long> reg(unsigned offset) {
+        if (!reg_) return std::nullopt;
+        auto *ops = new RegOps{};
+        ops->version = unsigned(sizeof(RegOps)) | (1u << 16);
+        ops->count = 1;
+        ops->op[0].flags = 1 | 4 | 16;  // read, 32-bit, global
+        ops->op[0].offset = offset;
+        const bool ok = reg_(gpu_, ops) == 0 && ops->op[0].status == 0;
+        const unsigned long long v = ops->op[0].value;
+        delete ops;
+        if (!ok) return std::nullopt;
+        return v;
+    }
+    std::optional<int> regTemp(unsigned offset) {
+        auto v = reg(offset);
+        if (!v) return std::nullopt;
+        const int c = int((*v & 0xFFFF) / 256);
+        return c > 0 && c < 255 ? std::optional(c) : std::nullopt;
+    }
+    std::optional<int> partitionsMax() {
+        std::optional<int> best;
+        const bool clamshell = reg(0x00900200).value_or(0) >> 22 & 1;
+        auto parse = [](unsigned long long v) { return 2 * int(std::min<unsigned long long>(v, 0x50)) - 40; };
+        auto poisoned = [](unsigned long long v) { return (v & 0xFFFF0000ull) == 0xBADF0000ull; };
+        for (unsigned p = 0; p <= 8; ++p) {
+            auto st = reg(0x009024D0 + p * 0x4000);
+            if (!st || poisoned(*st)) continue;
+            for (const auto &pair : {std::array{std::pair{0x0u, 24u}, std::pair{0x8u, 26u}},
+                                     std::array{std::pair{0x4u, 25u}, std::pair{0xCu, 27u}}}) {
+                for (const auto &[slot, bit] : pair) {
+                    if (!(*st >> bit & 1)) continue;
+                    auto d = reg(0x009024C0 + p * 0x4000 + slot);
+                    if (!d || *d == 0 || *d == 0xFFFFFFFFull || poisoned(*d)) continue;
+                    const unsigned long long pc0 = *d >> 16 & 0xFF, pc1 = *d >> 24 & 0xFF;
+                    if (pc0 == 0 || pc0 == 0xFF) continue;
+                    for (unsigned long long raw : {pc0, clamshell ? pc1 : 0ull}) {
+                        if (raw == 0 || raw == 0xFF) continue;
+                        const int c = parse(raw);
+                        if (c > 0 && c < 150 && (!best || c > *best)) best = c;
+                    }
+                    break;
+                }
+            }
+        }
+        return best;
+    }
+    void *lib_, *gpu_ = nullptr;
+    void *(*qi_)(unsigned) = nullptr;
+    int (*therm_)(void *, Therm *) = nullptr;
+    int (*reg_)(void *, RegOps *) = nullptr;
+    int mask_ = 0;
+};
+
+static QString throttleText(unsigned long long m) {
+    static const std::pair<unsigned long long, const char *> R[] = {
+        {0x04, "power"}, {0x08, "HW slowdown"}, {0x20, "thermal"}, {0x40, "HW thermal"},
+        {0x80, "power brake"}, {0x02, "app clocks"}, {0x10, "sync boost"}, {0x100, "display"}};
+    QStringList out;
+    for (const auto &[bit, name] : R) if (m & bit) out << QString::fromLatin1(name);
+    return out.isEmpty() ? QString() : out.join(QStringLiteral(", "));
+}
 
 // ── UI ──────────────────────────────────────────────────────────────────────
 
@@ -102,7 +241,13 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     power_ = lbl("Power: -- W", theme::WARN, true);
     clock_ = lbl("Clock: -- MHz", theme::INFO, true);
     memClock_ = lbl("Mem Clock: -- MHz", theme::OK, true);
-    for (QLabel *l : {temp_, power_, clock_, memClock_}) { stats->addWidget(l); stats->addSpacing(10); }
+    hotspot_ = lbl("Hotspot: -- °C", theme::DANGER, true);
+    vram_ = lbl("VRAM: -- °C", theme::PURPLE, true);
+    throttle_ = lbl("Limit: --", theme::FG_DIM);
+    throttle_->setToolTip("Why the GPU is not boosting higher right now (NVML clock event reasons).\n"
+                          "power = at the power limit · thermal = temperature limit · — = boosting freely.\n"
+                          "While undervolting: 'power' at the same clocks with less power means the UV works.");
+    for (QLabel *l : {temp_, hotspot_, vram_, power_, clock_, memClock_, throttle_}) { stats->addWidget(l); stats->addSpacing(10); }
     stats->addStretch();
     sv->addLayout(stats);
 
@@ -312,6 +457,20 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     });
     ch2->addWidget(bCap);
     ch2->addWidget(bUncap);
+    ch2->addSpacing(8);
+    ch2->addWidget(lbl("PowerMizer:", theme::MUTED));
+    powerMizer_ = new QComboBox;
+    powerMizer_->setEnabled(false);
+    powerMizer_->setToolTip("Auto — the driver decides (default)\n"
+                            "Adaptive — clocks drop as soon as load drops\n"
+                            "Prefer maximum performance — clocks stay up: no down-clock stutter, more idle power\n"
+                            "Prefer consistent performance — steady clocks for benchmarking\n"
+                            "Needs driver 580+. Not kept across reboots.");
+    connect(powerMizer_, &QComboBox::activated, this, [this] {
+        runHelper({{"op", "set_powermizer"}, {"mode", powerMizer_->currentData().toString()}}, QString(),
+                  "Could not set PowerMizer", [this](bool, const QJsonObject &) { syncPowerMizer(); });
+    });
+    ch2->addWidget(powerMizer_);
     ch2->addStretch();
     readBtn_ = new QPushButton("Read Curve");
     connect(readBtn_, &QPushButton::clicked, this, &NvidiaTab::readCurve);
@@ -321,11 +480,21 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     resetBtn_ = new QPushButton("Reset Curve");
     resetBtn_->setObjectName("btnDanger");
     connect(resetBtn_, &QPushButton::clicked, this, &NvidiaTab::resetCurve);
+    auto *bResetAll = new QPushButton("Reset All");
+    bResetAll->setObjectName("btnDanger");
+    bResetAll->setToolTip("Everything back to stock: curve offsets, NVML offsets in every P-state (other tools\n"
+                          "can leave some in P2/P5), core and VRAM clock locks, power limit, PowerMizer → Auto.");
+    connect(bResetAll, &QPushButton::clicked, this, [this] {
+        if (QMessageBox::question(this, "Reset All", "Put every NVIDIA setting back to stock?") != QMessageBox::Yes) return;
+        runHelper({{"op", "reset_all"}}, "Everything is back to stock.", "Reset All incomplete",
+                  [this](bool, const QJsonObject &) { syncPowerMizer(); readCurve(); });
+    });
     ch2->addWidget(readBtn_);
     ch2->addWidget(bApply);
     ch2->addWidget(resetBtn_);
+    ch2->addWidget(bResetAll);
     root->addWidget(ctl);
-    actionButtons_ = {bSave, bDef, bApplyProf, bDel, bLock, bUnlock, bCap, bUncap, readBtn_, bApply, resetBtn_};
+    actionButtons_ = {bSave, bDef, bApplyProf, bDel, bLock, bUnlock, bCap, bUncap, readBtn_, bApply, resetBtn_, bResetAll};
 
     log_ = new QPlainTextEdit;
     log_->setObjectName("terminal");
@@ -343,7 +512,7 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     // do that while the app is starting hidden in the tray).
 }
 
-NvidiaTab::~NvidiaTab() { delete nvml_; }
+NvidiaTab::~NvidiaTab() { delete temps_; delete nvml_; }
 
 void NvidiaTab::showEvent(QShowEvent *e) {
     QWidget::showEvent(e);
@@ -363,6 +532,7 @@ void NvidiaTab::showEvent(QShowEvent *e) {
         }
     }
     if (!nvml_) nvml_ = Nvml::open();
+    syncPowerMizer();
     pollStats();
     statsTimer_->start();
 }
@@ -370,6 +540,9 @@ void NvidiaTab::showEvent(QShowEvent *e) {
 void NvidiaTab::hideEvent(QHideEvent *e) {
     QWidget::hideEvent(e);
     statsTimer_->stop();
+    delete temps_;  // NvAPI_Unload, like NVML below
+    temps_ = nullptr;
+    tempsTried_ = false;
     delete nvml_;  // release /dev/nvidia* so the dGPU can suspend
     nvml_ = nullptr;
 }
@@ -383,6 +556,40 @@ void NvidiaTab::pollStats() {
     if (auto p = nvml_->powerMw()) power_->setText(QStringLiteral("Power: %1 W").arg(*p / 1000.0, 0, 'f', 1));
     if (auto c = nvml_->clock(0)) clock_->setText(QStringLiteral("Clock: %1 MHz").arg(*c));
     if (auto m = nvml_->clock(2)) memClock_->setText(QStringLiteral("Mem Clock: %1 MHz").arg(*m));
+    if (auto r = nvml_->eventReasons()) {
+        const QString t = throttleText(*r);
+        throttle_->setText(QStringLiteral("Limit: ") + (t.isEmpty() ? QStringLiteral("—") : t));
+        throttle_->setStyleSheet(QStringLiteral("color:%1;").arg(t.isEmpty() ? theme::FG_DIM : theme::WARN));
+    }
+    if (!tempsTried_) {
+        tempsTried_ = true;
+        temps_ = NvApiTemps::open();
+        blackwell_ = nvml_->architecture().value_or(0) >= 10;
+        if (!temps_)
+            for (QLabel *l : {hotspot_, vram_})
+                l->setToolTip("NvAPI unavailable for this user — `sudo nvcurve sensors` reads it as root");
+    }
+    if (temps_) {
+        const auto h = temps_->hotspot(blackwell_), v = temps_->vram(blackwell_);
+        hotspot_->setText(h ? QStringLiteral("Hotspot: %1 °C").arg(*h) : QStringLiteral("Hotspot: — °C"));
+        vram_->setText(v ? QStringLiteral("VRAM: %1 °C").arg(*v) : QStringLiteral("VRAM: — °C"));
+    }
+}
+
+void NvidiaTab::syncPowerMizer() {
+    if (!nvml_) return;
+    static const std::pair<unsigned, const char *> MODES[] = {
+        {2, "auto"}, {0, "adaptive"}, {1, "max"}, {3, "consistent"}};
+    static const char *const LABELS[] = {"Adaptive", "Prefer max performance", "Auto", "Prefer consistent"};
+    const auto pm = nvml_->powerMizer();
+    const QSignalBlocker b(powerMizer_);
+    powerMizer_->clear();
+    if (!pm) { powerMizer_->addItem(QStringLiteral("n/a")); powerMizer_->setEnabled(false); return; }
+    for (const auto &[id, key] : MODES)
+        if (pm->supported & (1u << id)) powerMizer_->addItem(QString::fromLatin1(LABELS[id]), QString::fromLatin1(key));
+    for (const auto &[id, key] : MODES)
+        if (id == pm->current) powerMizer_->setCurrentIndex(powerMizer_->findData(QString::fromLatin1(key)));
+    powerMizer_->setEnabled(powerMizer_->count() > 1);
 }
 
 void NvidiaTab::log(const QString &s) {

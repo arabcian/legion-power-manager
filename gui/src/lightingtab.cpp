@@ -69,6 +69,12 @@ KeyboardView::KeyboardView(QWidget *parent) : QWidget(parent) {
 
 void KeyboardView::setKeyMap(const KeyMap &m) {
     map_ = m;
+    phys_ = kblayout::forMap(m);
+    legends_ = kblayout::legends(phys_);
+    setToolTip(QStringLiteral("Click a key to select it · drag to select several · Ctrl/Shift-click to add or remove")
+               + (phys_.isEmpty() ? QStringLiteral("\nLayout: controller matrix (unknown board)")
+                                  : QStringLiteral("\nLayout: %1 · legends: %2")
+                                        .arg(kblayout::formName(kblayout::formOf(m)), kblayout::activeLayoutName())));
     sel_.clear();
     layoutCells();
     updateGeometry();
@@ -93,8 +99,20 @@ QSize KeyboardView::minimumSizeHint() const { return {360, heightForWidth(360)};
 
 int KeyboardView::heightForWidth(int w) const {
     if (map_.isEmpty()) return 160;
+    const bool logo = map_.extra.count(0) < map_.extra.size();
+    if (!phys_.isEmpty()) {
+        const QRectF b = physBounds();
+        const double u = double(w) / b.width();
+        return int(std::ceil(u * KEY_ASPECT * (b.height() + (logo ? LOGO_ROWS : 0)))) + 2;
+    }
     const double u = double(w) / map_.cols;
-    return int(std::ceil(u * KEY_ASPECT * (map_.rows + (map_.extra.count(0) < map_.extra.size() ? LOGO_ROWS : 0)))) + 2;
+    return int(std::ceil(u * KEY_ASPECT * (map_.rows + (logo ? LOGO_ROWS : 0)))) + 2;
+}
+
+QRectF KeyboardView::physBounds() const {
+    QRectF b;
+    for (const kblayout::Key &k : phys_) b = b.isNull() ? k.rect : b.united(k.rect);
+    return b.adjusted(-0.1, -0.1, 0.1, 0.1);
 }
 
 void KeyboardView::resizeEvent(QResizeEvent *e) {
@@ -105,6 +123,50 @@ void KeyboardView::resizeEvent(QResizeEvent *e) {
 void KeyboardView::layoutCells() {
     cells_.clear();
     if (map_.isEmpty()) return;
+    if (!phys_.isEmpty()) layoutPhysical();
+    else layoutMatrix();
+}
+
+void KeyboardView::layoutPhysical() {
+    const bool logo = map_.extra.count(0) < map_.extra.size();
+    const QRectF b = physBounds();
+    const double rowsTotal = b.height() + (logo ? LOGO_ROWS : 0);
+    const double u = std::min(double(width()) / b.width(), double(height()) / (rowsTotal * KEY_ASPECT));
+    const double rh = u * KEY_ASPECT, gap = std::max(1.5, u * 0.06);
+    const double x0 = (width() - u * b.width()) / 2.0, y0 = 1;
+    auto px = [&](const QRectF &r) {
+        return QRectF(x0 + (r.x() - b.x()) * u, y0 + (r.y() - b.y()) * rh, r.width() * u, r.height() * rh);
+    };
+    // One cell per code; a code with several rects (ISO Enter) becomes one outline.
+    QHash<int, int> index;
+    for (const kblayout::Key &k : phys_) {
+        QRectF r = px(k.rect);
+        if (!k.bar) r.adjust(gap, gap, -gap, -gap);
+        if (const auto it = index.constFind(k.code); it != index.cend()) {
+            Cell &c = cells_[*it];
+            const double rad = std::min(5.0, r.height() * 0.18);
+            QPainterPath part;
+            // extend the part up into the first rect so the union has no seam
+            part.addRoundedRect(r.adjusted(0, -2 * gap - 2 * rad, 0, 0), rad, rad);
+            if (c.shape.isEmpty()) c.shape.addRoundedRect(c.rect, rad, rad);
+            c.shape = c.shape.united(part).simplified();
+            continue;
+        }
+        index.insert(k.code, int(cells_.size()));
+        cells_.append({k.code, r, k.bar, k.bar ? QString() : legends_.value(k.code, k.label), {}});
+    }
+    if (logo) {
+        const QList<int> codes = [&] { QList<int> v; for (int k : map_.extra) if (k) v << k; return v; }();
+        const double w = u * 4, top = y0 + b.height() * rh + rh * 0.35;
+        double x = x0 + (u * b.width() - codes.size() * (w + u)) / 2.0 + u / 2;
+        for (int k : codes) {
+            cells_.append({k, QRectF(x, top, w, rh * 0.8), false, QStringLiteral("LOGO"), {}});
+            x += w + u;
+        }
+    }
+}
+
+void KeyboardView::layoutMatrix() {
     const bool logo = map_.extra.count(0) < map_.extra.size();
     const double rowsTotal = map_.rows + (logo ? LOGO_ROWS : 0);
     const double u = std::min(double(width()) / map_.cols, double(height()) / (rowsTotal * KEY_ASPECT));
@@ -118,14 +180,14 @@ void KeyboardView::layoutCells() {
             r = horizontal ? QRectF(r.left(), r.center().y() - h * 0.14, r.width(), h * 0.28)
                            : QRectF(r.center().x() - u * 0.14, r.top(), u * 0.28, r.height());
         }
-        cells_.append({s.code, r, bar, bar ? QString() : keyLabel(s.code)});
+        cells_.append({s.code, r, bar, bar ? QString() : keyLabel(s.code), {}});
     }
     if (logo) {
         const QList<int> codes = [&] { QList<int> v; for (int k : map_.extra) if (k) v << k; return v; }();
         const double w = u * 4, top = y0 + map_.rows * h + h * 0.35;
         double x = x0 + (u * map_.cols - codes.size() * (w + u)) / 2.0 + u / 2;
         for (int k : codes) {
-            cells_.append({k, QRectF(x, top, w, h * 0.8), false, QStringLiteral("LOGO")});
+            cells_.append({k, QRectF(x, top, w, h * 0.8), false, QStringLiteral("LOGO"), {}});
             x += w + u;
         }
     }
@@ -142,7 +204,8 @@ void KeyboardView::paintEvent(QPaintEvent *) {
     const QColor off(QString::fromLatin1(theme::BG3)), border(QString::fromLatin1(theme::BORDER)),
         accent(QString::fromLatin1(theme::ACCENT));
     QFont f = font();
-    const double keyH = cells_.first().bar ? 20 : cells_.first().rect.height();
+    double keyH = 20;  // a regular 1u key sets the legend size (the F-row and arrows are shorter)
+    for (const Cell &c : cells_) if (!c.bar && c.code == 0x42) { keyH = c.rect.height(); break; }
     f.setPixelSize(std::clamp(int(keyH * 0.34), 7, 13));
     p.setFont(f);
     for (const Cell &c : cells_) {
@@ -153,13 +216,20 @@ void KeyboardView::paintEvent(QPaintEvent *) {
         p.setPen(QPen(border, 1));
         p.setBrush(fill);
         const double rad = c.bar ? 2 : std::min(5.0, c.rect.height() * 0.18);
-        p.drawRoundedRect(c.rect, rad, rad);
+        if (!c.shape.isEmpty()) p.drawPath(c.shape);
+        else p.drawRoundedRect(c.rect, rad, rad);
         if (selected) {  // two-tone ring: readable on any key colour, amber included
             p.setBrush(Qt::NoBrush);
-            p.setPen(QPen(QColor(QString::fromLatin1(theme::BG0)), 3));
-            p.drawRoundedRect(c.rect.adjusted(-1.5, -1.5, 1.5, 1.5), rad + 1, rad + 1);
-            p.setPen(QPen(fill.lightnessF() > 0.6 ? QColor(QString::fromLatin1(theme::FG)) : accent, 1.6));
-            p.drawRoundedRect(c.rect.adjusted(-1.5, -1.5, 1.5, 1.5), rad + 1, rad + 1);
+            const QPen outer(QColor(QString::fromLatin1(theme::BG0)), 3),
+                inner(fill.lightnessF() > 0.6 ? QColor(QString::fromLatin1(theme::FG)) : accent, 1.6);
+            for (const QPen &pen : {outer, inner}) {
+                p.setPen(pen);
+                if (!c.shape.isEmpty()) {
+                    p.drawPath(c.shape);
+                } else {
+                    p.drawRoundedRect(c.rect.adjusted(-1.5, -1.5, 1.5, 1.5), rad + 1, rad + 1);
+                }
+            }
         }
         if (!c.label.isEmpty()) {
             p.setPen(lit ? readable(fill) : QColor(QString::fromLatin1(theme::MUTED)));
@@ -176,7 +246,7 @@ void KeyboardView::paintEvent(QPaintEvent *) {
 
 int KeyboardView::codeAt(const QPointF &pt) const {
     for (const Cell &c : cells_)
-        if (c.rect.adjusted(-2, -3, 2, 3).contains(pt)) return c.code;
+        if (c.shape.isEmpty() ? c.rect.adjusted(-2, -3, 2, 3).contains(pt) : c.shape.contains(pt)) return c.code;
     return 0;
 }
 

@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "amdgputab.h"
 #include "fwattrtab.h"
 #include "hometab.h"
 #include "inteltab.h"
@@ -14,6 +15,12 @@
 #include <QCloseEvent>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QTimer>
+#include <malloc.h>
+
+// glibc keeps heap freed by the window's tabs, dialogs and previews mapped;
+// once it is back in the tray, hand that memory to the kernel.
+static void trimHeap() { ::malloc_trim(0); }
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("Legion Power Manager");
@@ -34,6 +41,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(home_, &HomeTab::profileChanged, fw, &FwattrTab::refreshLockState);
     nvidia_ = new NvidiaTab;
     tabs_->addTab(nvidia_, "NVIDIA Curve Optimizer");
+    // AMD GPU tuning: discrete Radeon or the CPU's integrated graphics (Hybrid mode).
+    if (AmdGpuTab::present()) {
+        amdgpu_ = new AmdGpuTab;
+        tabs_->addTab(amdgpu_, "AMD GPU");
+    }
     // One CPU voltage tab per vendor: Curve Optimizer (AMD SMU) or the
     // OC-mailbox undervolt tab (Intel). The other one is never created, so
     // nothing polls ryzen_smu on Intel or touches MSR 0x150 on AMD.
@@ -56,6 +68,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     tabs_->insertTab(scenesAt, new ScenesTab(this), "Scenes");
 
     statusBar()->showMessage("Legion Power Manager " LPM_VERSION, 4000);
+}
+
+void MainWindow::hideEvent(QHideEvent *e) {
+    QMainWindow::hideEvent(e);
+    QTimer::singleShot(2000, this, [this] { if (!isVisible()) trimHeap(); });
 }
 
 void MainWindow::closeEvent(QCloseEvent *e) {

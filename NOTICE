@@ -60,3 +60,12 @@ legion-spectrum-control
 
 Rust crates vendored by make-dist.sh keep their own licenses (Apache-2.0,
 MIT, Unicode-3.0); see vendor/*/LICENSE* in the release tarball.
+
+LACT — Linux GPU Configuration Tool
+  https://github.com/ilya-zlobintsev/LACT
+  License: MIT, Copyright (c) 2023 Ilya Zlobintsev
+  Its collection of real amdgpu sysfs dumps (tests/snapshots) was used as a
+  reference for the pp_od_clk_voltage / pp_power_profile_mode / PMFW fan file
+  formats of each GPU generation, and its daemon for the write order the
+  driver accepts. No LACT code is included; the AMD GPU tab and amdgpu-helper
+  are an independent implementation.

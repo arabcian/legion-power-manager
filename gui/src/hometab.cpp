@@ -34,10 +34,11 @@
 #include <QPushButton>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QHideEvent>
 #include <QShowEvent>
 #include <QVBoxLayout>
 
-static constexpr int POLL_MS = 2500, LIVE_POLL_MS = 2000, SMI_TIMEOUT_MS = 3000;
+static constexpr int LIVE_POLL_MS = 2000, SMI_TIMEOUT_MS = 3000;
 // nvidia-smi while the dGPU idles: every query resets the driver's idle timer,
 // so polling it every 2 s kept the GPU out of D3cold for as long as the Home
 // tab was open. Idle → one query every 15 s, long enough for it to suspend.
@@ -215,13 +216,13 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
 
     rebuild();
 
-    auto *poll = new QTimer(this);
-    connect(poll, &QTimer::timeout, this, &HomeTab::refreshSelection);
-    poll->start(POLL_MS);
-    auto *live = new QTimer(this);
-    connect(live, &QTimer::timeout, this, &HomeTab::refreshLive);
-    live->start(LIVE_POLL_MS);
-    QTimer::singleShot(0, this, &HomeTab::refreshLive);
+    // Profile changes arrive as sysfs notifications (Fn+Q, scenes, helpers): no polling.
+    connect(&pp::Watcher::instance(), &pp::Watcher::changed, this, &HomeTab::refreshSelection);
+    // Live readings only while the tab is on screen: hidden in the tray the
+    // app used to wake every 2 s just to find out it had nothing to do.
+    live_ = new QTimer(this);
+    live_->setInterval(LIVE_POLL_MS);
+    connect(live_, &QTimer::timeout, this, &HomeTab::refreshLive);
 }
 
 // ── nvidia-smi (async, bounded) ─────────────────────────────────────────────
@@ -1084,6 +1085,7 @@ void HomeTab::applyProfile(const QString &profile) {
     privileged::run(helperPath(), req, this, [this, profile, previous](const privileged::Result &r) {
         applying_ = false;
         for (QPushButton *b : std::as_const(buttons_)) b->setEnabled(true);
+        pp::Watcher::instance().check();  // don't wait for the notification to update everyone
         if (!r.reached) {
             showStatus(QString());
             QMessageBox::critical(this, "Authorization failed", r.error);
@@ -1114,8 +1116,16 @@ void HomeTab::applyProfile(const QString &profile) {
 
 void HomeTab::showEvent(QShowEvent *e) {
     QWidget::showEvent(e);
+    refreshSelection();
+    refreshLive();
+    live_->start();
     refreshGuard();
     if (gpuMode_ && !gpuModeRead_) { gpuModeRead_ = true; readGpuMode(); }
+}
+
+void HomeTab::hideEvent(QHideEvent *e) {
+    QWidget::hideEvent(e);
+    live_->stop();
 }
 
 void HomeTab::refreshGuard() {

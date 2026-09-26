@@ -17,6 +17,7 @@ class QSpinBox;
 class QTimer;
 class VfCurveWidget;
 class Nvml;
+class NvApiTemps;
 
 class NvidiaTab : public QWidget {
     Q_OBJECT
@@ -67,9 +68,11 @@ private:
     void toggleDefault();
     void deleteProfile();
     void pollStats();
+    void syncPowerMizer();
 
     VfCurveWidget *vf_;
-    QLabel *temp_, *power_, *clock_, *memClock_;
+    QLabel *temp_, *power_, *clock_, *memClock_, *hotspot_, *vram_, *throttle_;
+    QComboBox *powerMizer_ = nullptr;
     QLabel *selLabel_, *voltLabel_, *freqLabel_, *offLabel_;
     QSpinBox *pointSpin_, *flattenSpin_, *coreSpin_, *memSpin_, *lockMinSpin_, *lockMaxSpin_;
     QSpinBox *coreCapSpin_ = nullptr;  // NVML core clock cap (MHz, 0 = none)
@@ -80,6 +83,8 @@ private:
     QPushButton *readBtn_, *resetBtn_;
     QTimer *statsTimer_;
     Nvml *nvml_ = nullptr;
+    NvApiTemps *temps_ = nullptr;   // opened with NVML, closed on hide
+    bool tempsTried_ = false, blackwell_ = false;
 
     QVector<QPointF> base_;          // (mV, base MHz) of GPU-domain points
     QHash<int, int> pointOffsets_;   // per-point MHz, on top of coreOffset_

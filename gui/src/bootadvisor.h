@@ -22,7 +22,7 @@ protected:
 
 private:
     struct Item {
-        QString group;          // section: Latency / Performance / Power saving / Graphics & tools / NVIDIA
+        QString group;          // section: Latency / Performance / Stability / Power saving / Graphics & tools / NVIDIA
         bool modprobe;          // false: kernel command line; true: /etc/modprobe.d
         QString module;         // modprobe: module name ("nvidia")
         QString text;           // "amd_pstate=active" / "NVreg_X=1"
@@ -31,6 +31,7 @@ private:
         bool caution;           // trade-off worth a warning colour
         std::function<bool()> applicable;
         std::function<int()> state;   // 1 = already in effect, 0 = not set, -1 = unknown
+        QString excl;           // items sharing a key are mutually exclusive (ticking one unticks the others)
         QCheckBox *box = nullptr;
         QLabel *status = nullptr;
     };

@@ -47,6 +47,7 @@ Q_SIGNALS:
 
 protected:
     void showEvent(QShowEvent *e) override;
+    void hideEvent(QHideEvent *e) override;
 
 private:
     void rebuild();
@@ -54,6 +55,7 @@ private:
     void readGpuMode();
     void setGpuMode(const QString &mode, bool force);
     QComboBox *gpuMode_ = nullptr;
+    QTimer *live_ = nullptr;  // runs only while the tab is on screen
     bool gpuModeRead_ = false;
     // Banner when lpm-boot-guard / the login guard paused presets after a crash.
     void refreshGuard();

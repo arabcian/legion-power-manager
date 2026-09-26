@@ -30,7 +30,6 @@
 // helper still refuses any path outside /sys/class/firmware-attributes.
 static const QString BASE = qEnvironmentVariableIsSet("LPM_FWATTR_BASE")
     ? qEnvironmentVariable("LPM_FWATTR_BASE") : QStringLiteral("/sys/class/firmware-attributes");
-static constexpr int PROFILE_POLL_MS = 2000;
 
 static QString helperPath() { return privileged::helperPath(QStringLiteral("fwattr-helper")); }
 static QString gpuHelperPath() { return privileged::helperPath(QStringLiteral("legion-gpu-helper")); }
@@ -235,9 +234,8 @@ FwattrTab::FwattrTab(QWidget *parent) : QWidget(parent) {
     connect(statusTimer_, &QTimer::timeout, status_, &QLabel::clear);
 
     rebuild();
-    auto *poll = new QTimer(this);
-    connect(poll, &QTimer::timeout, this, &FwattrTab::refreshLockState);
-    poll->start(PROFILE_POLL_MS);
+    // Lock state follows profile-change notifications instead of a 2 s poll.
+    connect(&pp::Watcher::instance(), &pp::Watcher::changed, this, &FwattrTab::refreshLockState);
     refreshLockState();
 }
 
@@ -256,7 +254,10 @@ void FwattrTab::setBusy(bool b) {
 void FwattrTab::refreshLockState() {
     // Firmware only honours these writes in Custom. No platform-profile
     // interface at all → nothing to lock against.
-    const auto profile = pp::currentProfile(pp::primaryHandler());
+    // Cached handler + value (the old code rescanned /sys/class/platform-profile every 2 s).
+    pp::Watcher &w = pp::Watcher::instance();
+    w.check();
+    const auto profile = w.current();
     const bool locked = profile && *profile != QLatin1String("custom");
     if (locked == locked_) return;
     locked_ = locked;

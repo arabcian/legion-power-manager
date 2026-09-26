@@ -22,7 +22,11 @@
 #include <QTimer>
 #include <QGuiApplication>
 #include <QSessionManager>
+#include <QSocketNotifier>
+#include <cstring>
 #include <fcntl.h>
+#include <linux/netlink.h>
+#include <sys/socket.h>
 #include <sys/file.h>
 #include <unistd.h>
 
@@ -266,7 +270,10 @@ void resumeLoginGuard() { writeObject(loginGuardFile(), {{"state", "ok"}, {"boot
 
 using namespace scenes;
 
-static constexpr int POWER_POLL_MS = 3000, STABLE_READS = 2, STARTUP_DELAY_MS = 4000;
+// Fast cadence only while something is pending (a debounce, a deferred switch,
+// a game scene); otherwise charger changes arrive as kernel uevents and the
+// slow tick is just a safety net (and notices a game scene appearing).
+static constexpr int POWER_POLL_MS = 3000, IDLE_POLL_MS = 20000, STABLE_READS = 2, STARTUP_DELAY_MS = 4000;
 static constexpr int GAME_ORPHAN_READS = 5;  // ~15 s without a game while the game scene is still set
 
 SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadAuto()) {
@@ -277,7 +284,8 @@ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadA
     // No automatic scenes in install.sh's PGO training run (it uses the real
     // GUI, and privileged::run is disabled there anyway).
     if (qEnvironmentVariableIsSet("LPM_PGO_TRAIN")) return;
-    powerTimer_->start();  // cheap: a handful of sysfs reads every 3 s
+    watchUevents();
+    retunePoll();
     // Session start: bring the machine to the scene for the current source,
     // after the tabs have finished their own startup reads.
     if (auto_.enabled && ac_) QTimer::singleShot(STARTUP_DELAY_MS, this, &SceneEngine::startupApply);
@@ -336,7 +344,38 @@ bool SceneEngine::setAuto(const Auto &a, QString *err) {
     return true;
 }
 
+void SceneEngine::retunePoll() {
+    const bool busy = candidate_ || deferred_ || sawGameScene_ || gameGoneReads_ > 0 || uevFd_ < 0;
+    const int want = busy ? POWER_POLL_MS : IDLE_POLL_MS;
+    powerTimer_->setTimerType(busy ? Qt::CoarseTimer : Qt::VeryCoarseTimer);
+    if (powerTimer_->interval() != want || !powerTimer_->isActive()) powerTimer_->start(want);
+}
+
+/// Kernel uevents (NETLINK_KOBJECT_UEVENT, group 1 — readable without
+/// privileges): a charger plug/unplug wakes us at once instead of a 3 s poll.
+void SceneEngine::watchUevents() {
+    const int fd = ::socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT);
+    if (fd < 0) return;
+    sockaddr_nl sa{};
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = 1;
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&sa), sizeof sa) != 0) { ::close(fd); return; }
+    uevFd_ = fd;
+    auto *n = new QSocketNotifier(fd, QSocketNotifier::Read, this);
+    connect(n, &QSocketNotifier::activated, this, [this, fd] {
+        static constexpr char KEY[] = "SUBSYSTEM=power_supply";
+        char buf[8192];
+        bool power = false;
+        for (ssize_t len; (len = ::recv(fd, buf, sizeof buf, 0)) > 0;)
+            power |= ::memmem(buf, size_t(len), KEY, sizeof KEY - 1) != nullptr;
+        if (!power) return;
+        pollPower();  // starts the debounce; retunePoll switches to the fast cadence
+    });
+    connect(this, &QObject::destroyed, [fd] { ::close(fd); });
+}
+
 void SceneEngine::pollPower() {
+    struct Retune { SceneEngine *e; ~Retune() { e->retunePoll(); } } retune{this};
     checkGameEnd();
     const auto now = onAc();
     if (!now) return;
