@@ -1,3 +1,19 @@
+                                                              Screenshots
+
+
+<img width="1269" height="899" alt="Screenshot_20260926_091306" src="https://github.com/user-attachments/assets/86ea9b33-1947-48ef-ba5d-edae1a04bb89" />
+<img width="2004" height="859" alt="Screenshot_20260925_184218" src="https://github.com/user-attachments/assets/5e744976-d825-4449-bac3-53fa42ea64a4" />
+<img width="1186" height="1144" alt="Screenshot_20260925_182256" src="https://github.com/user-attachments/assets/9ec4ea2f-c3b0-4a3f-abbd-27caf5a34924" />
+<img width="1114" height="989" alt="Screenshot_20260925_182237" src="https://github.com/user-attachments/assets/2a736103-6be8-4575-b3c5-1ff608b09095" />
+<img width="1114" height="989" alt="Screenshot_20260925_182224" src="https://github.com/user-attachments/assets/b85de5a7-4cf2-4a74-aa23-fdad333ea88d" />
+<img width="1114" height="843" alt="Screenshot_20260925_182202" src="https://github.com/user-attachments/assets/6b9956ab-d17c-49c3-bc8e-efa8da9ddb4e" />
+<img width="1114" height="843" alt="Screenshot_20260925_182150" src="https://github.com/user-attachments/assets/66ccab2a-2eba-485a-97da-2fd624cfdf7f" />
+<img width="1114" height="843" alt="Screenshot_20260925_182136" src="https://github.com/user-attachments/assets/aa89559c-ea45-40f7-b8a6-e0f546e31868" />
+<img width="1114" height="843" alt="Screenshot_20260925_182124" src="https://github.com/user-attachments/assets/2a3b04c4-7375-4b95-b262-57f7f7933fb1" />
+<img width="1114" height="843" alt="Screenshot_20260925_182105" src="https://github.com/user-attachments/assets/8661f571-56e7-4019-8acc-87bdde2a4b7e" />
+<img width="1692" height="1311" alt="1" src="https://github.com/user-attachments/assets/53ec7829-732d-4112-81fe-efb39d550c5b" />
+
+
 # Legion Power Manager
 
 **Legion Space / Vantage for Linux — and then some.**
