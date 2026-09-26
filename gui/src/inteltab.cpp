@@ -162,7 +162,8 @@ IntelTab::IntelTab(QWidget *parent) : QWidget(parent) {
     const char *heads[] = {"Plane", "Offset", "Current"};
     for (int c = 0; c < 3; ++c) vg->addWidget(muted(QString::fromLatin1(heads[c])), 0, c);
     const QList<QPair<QString, QString>> planes{{"core", "CPU Core"}, {"cache", "CPU Cache"}, {"gpu", "Integrated GPU"},
-                                                {"uncore", "System Agent"}, {"analogio", "Analog I/O"}};
+                                                {"uncore", "System Agent"}, {"analogio", "Analog I/O"},
+                                                {"memss", "Memory Subsystem (MemSS)"}, {"ngu", "NGU fabric"}};
     for (int i = 0; i < planes.size(); ++i) {
         auto *on = new QCheckBox(planes[i].second);
         auto *sp = dspin(UV_MIN, 0.0, 1.0, 1, " mV");
@@ -174,6 +175,8 @@ IntelTab::IntelTab(QWidget *parent) : QWidget(parent) {
         vg->addWidget(sp, i + 1, 1);
         vg->addWidget(cur, i + 1, 2);
         volt_.append({planes[i].first, on, sp, cur});
+        // Arrow Lake domains stay hidden until the CPU confirms them.
+        if (i >= 5) for (QWidget *w : {static_cast<QWidget *>(on), static_cast<QWidget *>(sp), static_cast<QWidget *>(cur)}) w->hide();
     }
     link_ = new QCheckBox("Link Core && Cache");
     link_->setChecked(true);
@@ -504,7 +507,8 @@ void IntelTab::log(const QString &msg, const QString &level) {
 
 QJsonObject IntelTab::currentProfile() const {
     QJsonObject v, i;
-    for (const Row &r : volt_) v[r.key] = r.on->isChecked() ? QJsonValue(r.val->value()) : QJsonValue();
+    for (const Row &r : volt_)
+        if (!r.on->isHidden()) v[r.key] = r.on->isChecked() ? QJsonValue(r.val->value()) : QJsonValue();
     for (const Row &r : icc_) i[r.key] = r.on->isChecked() ? QJsonValue(r.val->value()) : QJsonValue();
     auto pl = [](const PlRow &p) { return p.on->isChecked() ? QJsonValue(QJsonObject{{"watts", p.w->value()}, {"seconds", p.s->value()}}) : QJsonValue(); };
     const int bd = bdprochot_->currentIndex(), ct = ctdp_->currentIndex();
@@ -796,6 +800,12 @@ void IntelTab::showStatus(const QJsonObject &s) {
     const QJsonObject v = s.value("voltage").toObject();
     for (Row &r : volt_) {
         const QJsonObject o = v.value(r.key).toObject();
+        // Only planes the CPU answers for (status 0) are shown: System Agent on
+        // Arrow Lake, MemSS/NGU everywhere else, are not offered at all.
+        const bool supported = o.contains("mv") && o.value("status").toInt(-1) == 0;
+        for (QWidget *w : {static_cast<QWidget *>(r.on), static_cast<QWidget *>(r.val), static_cast<QWidget *>(r.cur)})
+            w->setVisible(supported);
+        if (!supported) { r.on->setChecked(false); continue; }
         r.cur->setText(o.contains("mv") ? QStringLiteral("%1 mV").arg(o.value("mv").toDouble(), 0, 'f', 1) : QStringLiteral("error"));
         r.cur->setToolTip(o.contains("raw") ? "raw " + o.value("raw").toString() : o.value("error").toString());
     }
