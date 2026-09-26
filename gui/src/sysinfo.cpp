@@ -25,6 +25,26 @@ static Opt joined(const QStringList &l) { return l.isEmpty() ? Opt() : Opt(l.joi
 
 Opt dmi(const QString &f) { return rd(QStringLiteral("/sys/class/dmi/id/") + f); }
 
+bool supportedMachine(QString *reason) {
+    // Word-anchored: "Legion Pro 7", "LOQ 15IRH8", "IdeaPad Gaming 3" — not "Legionnaire".
+    static const QRegularExpression family(QStringLiteral("\\b(legion|loq|ideapad gaming)\\b"),
+                                           QRegularExpression::CaseInsensitiveOption);
+    const QString vendor = dmi(QStringLiteral("sys_vendor")).value_or(QString());
+    const QString version = dmi(QStringLiteral("product_version")).value_or(QString());
+    const QString fam = dmi(QStringLiteral("product_family")).value_or(QString());
+    const QString shown = !version.isEmpty() ? version : !fam.isEmpty() ? fam : dmi(QStringLiteral("product_name")).value_or(QString());
+    const bool lenovo = vendor.compare(QLatin1String("LENOVO"), Qt::CaseInsensitive) == 0;
+    if (lenovo && (family.match(version).hasMatch() || family.match(fam).hasMatch())) return true;
+    if (reason) {
+        QString what = QStringList{vendor, shown}.filter(QRegularExpression(QStringLiteral("\\S"))).join(' ');
+        if (what.isEmpty()) what = QStringLiteral("no DMI information");
+        *reason = QStringLiteral("This computer (%1) is not supported.\n\nLegion Power Manager runs only on "
+                                 "Lenovo Legion, LOQ and IdeaPad Gaming laptops: it writes Lenovo-specific "
+                                 "firmware and embedded-controller settings.").arg(what);
+    }
+    return false;
+}
+
 Opt dmiClean(const QString &f) {
     static const QSet<QString> junk{"", "none", "not specified", "n/a", "to be filled by o.e.m.", "default string"};
     auto v = dmi(f);

@@ -1,4 +1,5 @@
 #include "scenestab.h"
+#include "lighting.h"
 #include "bundle.h"
 #include "fwattrtab.h"
 #include "hometab.h"
@@ -156,6 +157,22 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     addRow("Optimizations", tuning_,
            "An Optimizations preset. Switching presets restores every knob the new one does not set, "
            "so nothing from the previous scene lingers. A running game's tuning is never touched.");
+    if (win_->lighting()) {
+        lightProfile_ = new QComboBox;
+        lightProfile_->addItem("Unchanged", -1);
+        for (int p = lighting::MIN_PROFILE; p <= lighting::MAX_PROFILE; ++p) lightProfile_->addItem(QStringLiteral("Profile %1").arg(p), p);
+        lightBright_ = new QComboBox;
+        lightBright_->addItem("Unchanged", -1);
+        lightBright_->addItem("Off", 0);
+        for (int b = 1; b <= lighting::MAX_BRIGHTNESS; ++b) lightBright_->addItem(QStringLiteral("Brightness %1").arg(b), b);
+        auto *lh = new QWidget;
+        auto *ll = new QHBoxLayout(lh);
+        ll->setContentsMargins(0, 0, 0, 0);
+        ll->addWidget(lightProfile_, 1);
+        ll->addWidget(lightBright_, 1);
+        addRow("Keyboard lighting", lh, "A lighting profile of the keyboard controller (edit them in the Lighting tab) "
+                                        "and its brightness. Off turns the backlight off.");
+    }
     command_ = new QLineEdit;
     command_->setPlaceholderText("optional, e.g.  kscreen-doctor output.eDP-1.mode.2560x1600@60");
     addRow("Run command", command_, "Runs as you, without a shell, after everything else — for things this app "
@@ -175,7 +192,7 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     right->addWidget(editor_);
 
     empty_ = muted("No scenes yet. A scene bundles a power profile, firmware limits, CPU and GPU curves and an "
-                   "Optimizations preset under one name — create one with New…");
+                   "Optimizations preset (and keyboard lighting) under one name — create one with New…");
     empty_->setWordWrap(true);
     right->addWidget(empty_);
 
@@ -216,7 +233,7 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     connect(apply_, &QPushButton::clicked, this, &ScenesTab::applyCurrent);
     connect(fwCapture_, &QPushButton::clicked, this, &ScenesTab::captureFirmware);
     connect(fwClear_, &QPushButton::clicked, this, [this] { firmware_.clear(); updateFirmwareLabel(); updateDirty(); });
-    for (QComboBox *c : {profile_, cpu_, gpu_, tuning_})
+    for (QComboBox *c : {profile_, cpu_, gpu_, tuning_, lightProfile_, lightBright_})
         if (c) connect(c, &QComboBox::currentIndexChanged, this, [this] { if (!filling_) updateDirty(); });
     connect(command_, &QLineEdit::textChanged, this, [this] { if (!filling_) updateDirty(); });
     connect(auto_, &QCheckBox::toggled, this, [this] { if (!filling_) storeAuto(); });
@@ -281,6 +298,10 @@ void ScenesTab::setEditor(const Scene &s) {
     }
     fillChoice(gpu_, win_->nvidia()->profileNames(), "Reset curve", s.gpu);
     fillChoice(tuning_, win_->optimize()->presetNames(), "Restore originals", s.tuning);
+    if (lightProfile_) {
+        lightProfile_->setCurrentIndex(std::max(0, lightProfile_->findData(s.lightProfile)));
+        lightBright_->setCurrentIndex(std::max(0, lightBright_->findData(s.lightBrightness)));
+    }
     command_->setText(s.command);
     firmware_ = s.firmware;
     editor_->setTitle(s.name.isEmpty() ? QStringLiteral("Scene") : s.name);
@@ -298,6 +319,13 @@ Scene ScenesTab::fromEditor() const {
     if (cpu_) s.cpu = decode(cpu_->currentData().toString());
     s.gpu = decode(gpu_->currentData().toString());
     s.tuning = decode(tuning_->currentData().toString());
+    if (lightProfile_) {
+        s.lightProfile = lightProfile_->currentData().toInt();
+        s.lightBrightness = lightBright_->currentData().toInt();
+    } else {  // no keyboard here: keep what the scene file says
+        s.lightProfile = loaded_.lightProfile;
+        s.lightBrightness = loaded_.lightBrightness;
+    }
     s.command = command_->text().trimmed();
     return s;
 }

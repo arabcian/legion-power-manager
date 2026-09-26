@@ -2,6 +2,8 @@
 #include "fwattrtab.h"
 #include "hometab.h"
 #include "inteltab.h"
+#include "lighting.h"
+#include "lightingtab.h"
 #include "mainwindow.h"
 #include "nvidiatab.h"
 #include "optimizetab.h"
@@ -94,6 +96,9 @@ std::optional<Scene> load(const QString &name) {
     s.cpu = choiceFrom(o.value("cpu_curve"));
     s.gpu = choiceFrom(o.value("gpu_curve"));
     s.tuning = choiceFrom(o.value("tuning"));
+    const QJsonObject light = o.value("lighting").toObject();
+    if (const int p = light.value("profile").toInt(-1); p >= 0 && p <= 6) s.lightProfile = p;
+    if (const int b = light.value("brightness").toInt(-1); b >= 0 && b <= 9) s.lightBrightness = b;
     s.command = o.value("command").toString().trimmed();
     return s;
 }
@@ -113,6 +118,12 @@ bool save(const Scene &s, QString *err, const QJsonObject &tuningValues) {
         QJsonObject t = o.value("tuning").toObject();
         t["values"] = tuningValues;
         o["tuning"] = t;
+    }
+    if (s.lightProfile >= 0 || s.lightBrightness >= 0) {
+        QJsonObject light;
+        if (s.lightProfile >= 0) light["profile"] = s.lightProfile;
+        if (s.lightBrightness >= 0) light["brightness"] = s.lightBrightness;
+        o["lighting"] = light;
     }
     if (!s.command.isEmpty()) o["command"] = s.command;
     return writeObject(sceneFile(s.name), o, err);
@@ -552,7 +563,23 @@ void SceneEngine::start(const Scene &s) {
         });
     }
 
-    // 6. User command (display mode, audio profile…) — as the user, no shell.
+    // 6. Keyboard lighting — as the user when the udev rule allows it, pkexec otherwise.
+    if (s.lightProfile >= 0 || s.lightBrightness >= 0) {
+        addStep("Lighting", [this, p = s.lightProfile, b = s.lightBrightness](Done done) {
+            if (!lighting::present()) { done(true, "no Spectrum keyboard here; skipped"); return; }
+            QJsonObject req{{"op", "set"}};
+            if (p >= 0) req["profile"] = p;
+            if (b >= 0) req["brightness"] = b;
+            lighting::run(req, this, [this, done](const privileged::Result &r) {
+                if (!r.ok()) { done(false, r.message().isEmpty() ? QStringLiteral("failed") : r.message()); return; }
+                if (LightingTab *lt = win_->lighting()) lt->refreshIfClean();
+                done(true, QStringLiteral("profile %1 · brightness %2").arg(r.json.value("profile").toInt())
+                               .arg(r.json.value("brightness").toInt()));
+            });
+        });
+    }
+
+    // 7. User command (display mode, audio profile…) — as the user, no shell.
     if (!s.command.isEmpty()) {
         addStep("Command", [cmd = s.command](Done done) {
             QStringList argv = QProcess::splitCommand(cmd);

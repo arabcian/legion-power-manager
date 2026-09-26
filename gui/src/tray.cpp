@@ -1,6 +1,7 @@
 #include "tray.h"
 #include "hometab.h"
 #include "inteltab.h"
+#include "lightingtab.h"
 #include "mainwindow.h"
 #include "nvidiatab.h"
 #include "optimizetab.h"
@@ -202,6 +203,37 @@ void Tray::rebuild() {
         notify("Optimizations", "Restoring original values…");
     });
     om->setEnabled(!opt->busy());
+
+    // Keyboard lighting (Spectrum controller) — immediate, no cooldown needed.
+    if (LightingTab *lt = win_->lighting()) {
+        QMenu *lm = menu_->addMenu("Keyboard Lighting");
+        if (!lt->ready()) {
+            disabledEntry(lm, "(keyboard not read — see the Lighting tab)");
+        } else {
+            for (int p = lighting::MIN_PROFILE; p <= lighting::MAX_PROFILE; ++p) {
+                QAction *a = lm->addAction(QStringLiteral("Profile %1").arg(p));
+                a->setCheckable(true);
+                a->setChecked(p == lt->activeProfile());
+                connect(a, &QAction::triggered, this, [this, lt, p] {
+                    if (lt->hasUnappliedChanges()) { notify("Keyboard lighting", "The Lighting tab has changes not applied yet — apply or revert them first."); return; }
+                    lt->activateProfile(p);
+                });
+            }
+            lm->addSeparator();
+            QAction *off = lm->addAction("Lights off");
+            off->setCheckable(true);
+            off->setChecked(lt->brightness() == 0);
+            connect(off, &QAction::triggered, this, [lt](bool checked) { lt->setLightsOn(!checked); });
+            QMenu *bm = lm->addMenu("Brightness");
+            for (int b = 1; b <= lighting::MAX_BRIGHTNESS; ++b) {
+                QAction *a = bm->addAction(QString::number(b));
+                a->setCheckable(true);
+                a->setChecked(b == lt->brightness());
+                connect(a, &QAction::triggered, this, [lt, b] { lt->setBrightness(b); });
+            }
+        }
+        lm->setEnabled(!lt->busy());
+    }
 
     // Fans: all to max / Auto, or one fan at a fixed RPM (multiples of 100).
     const QList<HomeTab::FanInfo> fans = home->fanInfo();

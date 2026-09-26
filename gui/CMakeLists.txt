@@ -31,6 +31,8 @@ add_executable(legion-power-manager
     src/scenestab.cpp    src/scenestab.h
     src/bootadvisor.cpp  src/bootadvisor.h
     src/bundle.cpp       src/bundle.h
+    src/lighting.cpp     src/lighting.h
+    src/lightingtab.cpp  src/lightingtab.h
 )
 # Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
 # with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the

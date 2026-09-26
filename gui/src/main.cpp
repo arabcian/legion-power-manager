@@ -10,12 +10,14 @@
 // raises the running one, without it exits quietly; if the lock cannot be
 // taken for any other reason the program refuses to start.
 #include "mainwindow.h"
+#include "sysinfo.h"
 #include "theme.h"
 #include "tray.h"
 #include <QApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QLockFile>
+#include <QMessageBox>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QStandardPaths>
@@ -111,6 +113,18 @@ int main(int argc, char **argv) {
     if (args.contains("--version") || args.contains("-V")) { std::printf("legion-power-manager %s\n", LPM_VERSION); return 0; }
     const bool withWindow = args.contains("--window") || qEnvironmentVariableIsSet("LPM_SCREENSHOT")
                             || qEnvironmentVariableIsSet("LPM_PGO_TRAIN");
+
+    // Legion / LOQ / IdeaPad Gaming only. The root helpers refuse other
+    // machines as well; this just says so before anything is shown. The
+    // install-time PGO training run (helpers disabled) may build elsewhere.
+    if (QString why; !qEnvironmentVariableIsSet("LPM_PGO_TRAIN") && !sysinfo::supportedMachine(&why)) {
+        std::fprintf(stderr, "legion-power-manager: %s\n", qPrintable(QString(why).replace('\n', ' ')));
+        if (withWindow) {  // started from the menu; the login autostart stays silent
+            theme::apply(app);
+            QMessageBox::critical(nullptr, QStringLiteral("Legion Power Manager"), why);
+        }
+        return 1;
+    }
 
     // Taken before any window, tray or helper exists; held until main() returns.
     QLockFile lock(lockPath());

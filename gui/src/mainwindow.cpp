@@ -2,6 +2,8 @@
 #include "fwattrtab.h"
 #include "hometab.h"
 #include "inteltab.h"
+#include "lighting.h"
+#include "lightingtab.h"
 #include "nvidiatab.h"
 #include "optimizetab.h"
 #include "ryzentab.h"
@@ -44,6 +46,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     }
     optimize_ = new OptimizeTab;
     tabs_->addTab(optimize_, "Optimizations");
+    // Per-key RGB keyboard (Legion Gen10 Spectrum controller) — only when present.
+    if (lighting::present()) {
+        lighting_ = new LightingTab;
+        tabs_->addTab(lighting_, "Lighting");
+    }
 
     scenes_ = new SceneEngine(this);
     tabs_->insertTab(scenesAt, new ScenesTab(this), "Scenes");

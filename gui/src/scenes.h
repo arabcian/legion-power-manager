@@ -2,7 +2,7 @@
 // Scenes: one named state for the whole machine, built from the profiles the
 // tabs already save — platform profile, firmware limits, CPU curve (Ryzen CO
 // or Intel undervolt), NVIDIA curve, Optimizations preset, and an optional
-// user command. A scene only *references* those profiles by name, so there is
+// user command, plus the keyboard lighting profile/brightness. A scene only *references* those profiles by name, so there is
 // no second copy of any setting to drift out of sync.
 //
 // SceneEngine applies a scene step by step through the same root helpers the
@@ -38,6 +38,8 @@ struct Scene {
     QString platformProfile;       // empty = unchanged
     QMap<QString, int> firmware;   // firmware-attribute name → value; empty = unchanged
     Choice cpu, gpu, tuning;       // tuning Reset = restore originals
+    int lightProfile = -1;         // keyboard lighting profile 1-6; -1 = unchanged
+    int lightBrightness = -1;      // keyboard brightness 0-9; -1 = unchanged
     QString command;               // optional; run as the user, no shell
     bool operator==(const Scene &) const = default;
 };

@@ -17,6 +17,11 @@ std::optional<QString> dmi(const QString &field);         // raw
 std::optional<QString> dmiClean(const QString &field);    // placeholder strings filtered
 Opt cpuModel();
 
+/// Lenovo Legion, LOQ or IdeaPad Gaming laptop (DMI sys_vendor + marketing
+/// name) — the only machines this program runs on. Same rule as the helpers
+/// (crates/lpm-helpers/src/machine.rs). `reason` is set when it returns false.
+bool supportedMachine(QString *reason = nullptr);
+
 enum class CpuVendor { Amd, Intel, Other };
 /// vendor_id from /proc/cpuinfo (read once; LPM_CPU_VENDOR=amd|intel overrides, dev only).
 CpuVendor cpuVendor();
