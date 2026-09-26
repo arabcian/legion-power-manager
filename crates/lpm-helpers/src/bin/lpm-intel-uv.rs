@@ -182,6 +182,8 @@ fn main() {
     let code = match cmd.as_str() {
         "read" => { let v = intel_uv::read_status(); print_status(&v); if v["ok"] == true { 0 } else { 1 } }
         "reset" => print_apply(&intel_uv::apply(&intel_uv::reset_profile())),
+        // Read-only: Arrow Lake D2D/NGU + classic mailbox read of domains 0..15.
+        "probe-fabric" => { let v = intel_uv::probe_fabric(); println!("{}", serde_json::to_string_pretty(&v).unwrap()); if v["ok"] == true { 0 } else { 1 } }
         "boot" => print_apply(&intel_uv_daemon::apply_boot()),
         "daemon" => intel_uv_daemon::run_daemon(),
         "monitor" => monitor(args.get(1).map(|s| s.parse().unwrap_or_else(|_| usage())).unwrap_or(1.0f64).max(0.1)),

@@ -41,6 +41,7 @@ fn run() -> Value {
     let mut out = match obj.get("op").and_then(Value::as_str) {
         Some("status") => intel_uv::read_status(),
         Some("probe_uv_lock") => intel_uv::probe_uv_lock(),
+        Some("probe_fabric") => intel_uv::probe_fabric(),
         Some("apply") => match profile() { Ok((_, p)) => intel_uv::apply(&p), Err(e) => e },
         Some("reset") => intel_uv::apply(&intel_uv::reset_profile()),
         Some("set_boot") => {

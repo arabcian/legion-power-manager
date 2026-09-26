@@ -193,6 +193,65 @@ pub fn encode_pl_term(raw: u64, second: bool, watts: f64, seconds: Option<f64>, 
     Ok(v)
 }
 
+// ── Arrow Lake fabric probe (read-only) ─────────────────────────────────────
+//
+// Arrow Lake moved the fabric clocks to a second mailbox (CapFrameX /
+// LibreHardwareMonitor, verified on Core Ultra 9 285K): write
+// `cmd | 0x8000_0000` to MSR 0x607, wait for bit 31 to clear, read the word
+// from MSR 0x608.
+//   0x1237 → D2D ratio  (& 0x7FFF, ×100 MHz)
+//   0x0022 → NGU ratio  ((>> 8) & 0xFF, ×100 MHz)
+// Only these two *read* commands are ever sent. The classic mailbox read
+// (0x10) is also issued for domains 0..15, so every domain's ratio byte and
+// voltage-offset field can be compared with XTU/BIOS values to map D2D, NGU,
+// MemSS and friends before anything is written. (Domain 7 = NGU per CapFrameX.)
+
+pub const MSR_VR_MAILBOX_IF: u64 = 0x607;
+pub const MSR_VR_MAILBOX_DATA: u64 = 0x608;
+const VR_RUN: u64 = 0x8000_0000;
+const VR_READ_COMMANDS: &[(u64, &str)] = &[(0x1237, "d2d"), (0x0022, "ngu")];
+
+fn vr_read(m: &Msr, cmd: u64) -> io::Result<u64> {
+    debug_assert!(VR_READ_COMMANDS.iter().any(|c| c.0 == cmd));
+    let _g = m.txn()?;
+    m.write(MSR_VR_MAILBOX_IF, cmd | VR_RUN)?;
+    for _ in 0..1000 {
+        if m.read(MSR_VR_MAILBOX_IF)? & VR_RUN == 0 { return m.read(MSR_VR_MAILBOX_DATA); }
+        std::thread::sleep(std::time::Duration::from_micros(10));
+    }
+    Err(io::Error::new(io::ErrorKind::TimedOut, "VR mailbox busy"))
+}
+
+pub fn probe_fabric() -> Value {
+    let m = match Msr::open(true) {
+        Ok(m) => m,
+        Err(e) => return json!({"ok": false, "error": format!("/dev/cpu/0/msr: {e}")}),
+    };
+    let mut vr = serde_json::Map::new();
+    for &(cmd, name) in VR_READ_COMMANDS {
+        vr.insert(name.into(), match vr_read(&m, cmd) {
+            Ok(raw) => {
+                let ratio = if name == "d2d" { raw & 0x7FFF } else { (raw >> 8) & 0xFF };
+                json!({"raw": format!("{raw:#x}"), "ratio": ratio, "mhz": ratio * 100})
+            }
+            Err(e) => json!({"error": e.to_string()}),
+        });
+    }
+    // Classic mailbox, read command per domain: status byte (bits 32..39,
+    // 0 = success), ratio (low byte), voltage offset (bits 21..31, 1/1.024 mV).
+    let domains: Vec<Value> = (0u64..16).map(|d| match m.mailbox(uv_read_cmd(d)) {
+        Ok(r) => {
+            let status = (r >> 32) & 0xFF;
+            let ticks = ((r >> 21) & 0x7FF) as i64;
+            let ticks = if ticks & 0x400 != 0 { ticks - 0x800 } else { ticks };
+            json!({"domain": d, "raw": format!("{r:#018x}"), "status": status,
+                   "ratio": r & 0xFF, "offset_mv": (ticks as f64 / 1.024 * 10.0).round() / 10.0})
+        }
+        Err(e) => json!({"domain": d, "error": e.to_string()}),
+    }).collect();
+    json!({"ok": true, "vr_mailbox": vr, "oc_mailbox_domains": domains})
+}
+
 // ── MSR access ─────────────────────────────────────────────────────────────
 
 pub struct Msr { f: File }
