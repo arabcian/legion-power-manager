@@ -270,7 +270,7 @@ void OptimizeTab::buildUi() {
     auto *btext = new QVBoxLayout;
     btext->setSpacing(0);
     banner_ = new QLabel;
-    banner_->setStyleSheet("font-weight: 700; background: transparent;");
+    banner_->setStyleSheet("font-weight: 600; background: transparent;");
     bannerDetail_ = muted({});
     btext->addWidget(banner_);
     btext->addWidget(bannerDetail_);
@@ -790,7 +790,10 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
             grid->addWidget(r.include, line, 0);
             grid->addWidget(r.name, line, 1);
             grid->addWidget(r.cur, line, 2);
-            grid->addWidget(editor, line, 3, Qt::AlignLeft);
+            // One column width for every editor, so the value controls line up.
+            editor->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+            editor->setMaximumWidth(340);
+            grid->addWidget(editor, line, 3);
             grid->addWidget(r.revert, line, 4);
             ++line;
             updateRow(r, rows[i].toObject());
@@ -961,9 +964,8 @@ void OptimizeTab::updateStateBanner() {
         bannerDetail_->setText("Nothing changed by Legion Power Manager is in effect. Every change you apply is recorded and reversible.");
     }
     active_ = state_.value("active").toBool();
-    theme::setSheet(frame, QStringLiteral("#tuneBanner { background:%1; border:1px solid %2; border-left:3px solid %3; border-radius:%4px; }")
-                             .arg(theme::BG1, theme::BORDER_SOFT, accent).arg(theme::RADIUS));
-    theme::setSheet(banner_, QStringLiteral("font-weight:700; background:transparent; color:%1;").arg(accent));
+    theme::setSheet(frame, theme::banner(accent, QStringLiteral("#tuneBanner")));
+    theme::setSheet(banner_, QStringLiteral("font-weight:600; background:transparent; color:%1;").arg(accent));
     restoreBtn_->setEnabled(active_ && !busy_);
 
     const QString bootName = boot_.value("preset").toString();

@@ -32,6 +32,9 @@
 #include <QMessageBox>
 #include <QProcess>
 #include <QPushButton>
+#include <QIcon>
+#include <QPainter>
+#include <QPixmap>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QHideEvent>
@@ -115,18 +118,42 @@ static QLabel *muted(const QString &text, QWidget *parent = nullptr) {
     return l;
 }
 
+/// The profile's colour as a small dot (the Legion power-button LED, in miniature).
+static QIcon profileDot(const QString &accent) {
+    QIcon icon;
+    for (const qreal dpr : {1.0, 2.0}) {
+        QPixmap pm(QSize(10, 10) * dpr);
+        pm.setDevicePixelRatio(dpr);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(accent));
+        p.drawEllipse(QRectF(1, 1, 8, 8));
+        p.end();
+        icon.addPixmap(pm);
+    }
+    return icon;
+}
+
 static QPushButton *profileButton(const QString &label, const QString &accent) {
     auto *b = new QPushButton(label);
     b->setCheckable(true);
     b->setCursor(Qt::PointingHandCursor);
-    b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    b->setFixedHeight(26);
+    b->setIcon(profileDot(accent));
+    b->setIconSize(QSize(10, 10));
+    // Rows grow a little into the card's height instead of leaving it empty.
+    b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    b->setMinimumHeight(28);
+    b->setMaximumHeight(36);
+    const QByteArray a = accent.toLatin1();
     b->setStyleSheet(QStringLiteral(
-        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-left: 3px solid %4;"
-        " border-radius: 5px; padding: 3px 10px; font-weight: 600; text-align: left; }"
-        "QPushButton:hover { background: %5; color: %6; }"
-        "QPushButton:checked { background: %4; color: %7; border-color: %4; }")
-        .arg(theme::BG2, theme::FG_DIM, theme::BORDER_SOFT, accent, theme::BG3, theme::FG, theme::BG0));
+        "QPushButton { background: %1; color: %2; border: 1px solid %3; border-radius: 7px;"
+        " padding: 3px 12px; font-weight: 500; text-align: left; }"
+        "QPushButton:hover { background: %4; color: %5; border-color: %6; }"
+        "QPushButton:checked { background: %7; color: %5; border-color: %8; font-weight: 600; }")
+        .arg(theme::BG2, theme::FG_DIM, theme::BORDER_SOFT, theme::BG3, theme::FG, theme::BORDER,
+             theme::rgba(a.constData(), 0.15), theme::rgba(a.constData(), 0.70)));
     return b;
 }
 
@@ -140,12 +167,34 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
     title->setProperty("role", "title");
     QStringList sub{sysinfo::cpuModel().value_or("unknown CPU")};
     if (handler_) sub << "driver: " + handler_->name;
-    root->addWidget(title);
-    root->addWidget(muted(sub.join("   ·   ")));
+    auto *head = new QVBoxLayout;
+    head->setSpacing(1);
+    head->setContentsMargins(2, 0, 0, 2);
+    head->addWidget(title);
+    head->addWidget(muted(sub.join("   ·   ")));
+    auto *headRow = new QHBoxLayout;
+    headRow->addLayout(head, 1);
+    auto *themeBox = new QComboBox;
+    themeBox->setToolTip("Colour theme. Applied by restarting the app (a few seconds).");
+    for (const auto &[id, name] : theme::themes()) themeBox->addItem(name, id);
+    themeBox->setCurrentIndex(std::max(0, themeBox->findData(theme::currentTheme())));
+    connect(themeBox, &QComboBox::activated, this, [this, themeBox](int i) {
+        const QString id = themeBox->itemData(i).toString();
+        if (id == theme::currentTheme()) return;
+        if (!theme::saveTheme(id)) { showStatus("Could not save the theme choice.", 6000); return; }
+        if (QMessageBox::question(this, "Theme", "Restart Legion Power Manager now to apply " + themeBox->itemText(i) + "?")
+            == QMessageBox::Yes) theme::requestRestart();
+        else showStatus("Theme applies at the next start.", 6000);
+    });
+    auto *themeLabel = muted("Theme");
+    themeLabel->setWordWrap(false);
+    headRow->addWidget(themeLabel, 0, Qt::AlignVCenter);
+    headRow->addWidget(themeBox, 0, Qt::AlignVCenter);
+    root->addLayout(headRow);
 
     guardBanner_ = new QFrame;
-    guardBanner_->setStyleSheet(QStringLiteral("QFrame { background: rgba(219,123,110,0.12); border: 1px solid %1; border-radius: 8px; }"
-                                               "QLabel { background: transparent; border: none; }").arg(theme::DANGER_SOFT));
+    guardBanner_->setObjectName("guardBanner");
+    guardBanner_->setStyleSheet(theme::banner(theme::DANGER, QStringLiteral("#guardBanner")));
     auto *gb = new QHBoxLayout(guardBanner_);
     gb->setContentsMargins(10, 6, 8, 6);
     guardText_ = new QLabel;
@@ -678,8 +727,7 @@ QGroupBox *HomeTab::buildDeviceBox() {
     if (bannerRow >= 0 && !fans_.isEmpty()) {
         maxBanner_ = new QFrame;
         maxBanner_->setObjectName("maxBanner");
-        maxBanner_->setStyleSheet(QStringLiteral("#maxBanner { border: 1px solid %1; border-radius: 6px; background: rgba(230,160,60,0.10); }")
-                                      .arg(theme::WARN));
+        maxBanner_->setStyleSheet(theme::banner(theme::WARN, QStringLiteral("#maxBanner")));
         auto *bl = new QHBoxLayout(maxBanner_);
         bl->setContentsMargins(10, 6, 8, 6);
         maxBannerText_ = new QLabel;
@@ -709,6 +757,7 @@ QGroupBox *HomeTab::buildDeviceBox() {
         });
         }
         auto *mh = new QHBoxLayout;
+        mh->setSpacing(6);
         mh->addStretch(1);
         if (curveBtn) mh->addWidget(curveBtn);
         mh->addWidget(maxAllBtn_);
@@ -1080,6 +1129,7 @@ void HomeTab::rebuild() {
         b->setChecked(current == name);
         group_->addButton(b);
         buttons_.insert(name, b);
+        grid_->setRowStretch(i, 1);
         grid_->addWidget(b, i++, 0);
     }
     grid_->setColumnStretch(0, 1);

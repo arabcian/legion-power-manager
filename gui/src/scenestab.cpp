@@ -69,7 +69,9 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     auto *ll = new QVBoxLayout(listBox);
     list_ = new QListWidget;
     list_->setFrameShape(QFrame::NoFrame);
-    list_->setStyleSheet(QStringLiteral("QListWidget { background: transparent; outline: none; }"
+    list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);  // long names elide instead
+    list_->setTextElideMode(Qt::ElideRight);
+    list_->setStyleSheet(QStringLiteral("QListWidget { background: transparent; border: none; padding: 0; outline: none; }"
                                         "QListWidget::item { padding: 4px 6px; border-radius: 5px; color: %1; }"
                                         "QListWidget::item:selected { background: %2; color: %3; }"
                                         "QListWidget::item:hover:!selected { background: %4; }")
@@ -111,7 +113,7 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     left->addWidget(listBox, 1);
     auto *leftHost = new QWidget;
     leftHost->setLayout(left);
-    leftHost->setFixedWidth(190);
+    leftHost->setFixedWidth(216);
     root->addWidget(leftHost);
 
     // ── right: editor + automatic switching ──

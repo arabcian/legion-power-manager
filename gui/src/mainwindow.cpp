@@ -14,10 +14,12 @@
 #include "sysinfo.h"
 #include "tray.h"
 #include <QCloseEvent>
-#include <QStatusBar>
+#include <QLabel>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTimer>
 #include <malloc.h>
+#include <algorithm>
 
 // glibc keeps heap freed by the window's tabs, dialogs and previews mapped;
 // once it is back in the tray, hand that memory to the kernel.
@@ -26,12 +28,24 @@ static void trimHeap() { ::malloc_trim(0); }
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("Legion Power Manager");
     setWindowIcon(appIcon(128));
-    resize(980, 700);
+    resize(1040, 720);
     setMinimumSize(820, 520);
 
     tabs_ = new QTabWidget;
+    tabs_->setObjectName("mainTabs");  // header-band styling in theme.cpp
+    tabs_->setAttribute(Qt::WA_StyledBackground, true);  // paint the band behind the tab bar
     tabs_->setDocumentMode(true);
+    tabs_->setUsesScrollButtons(true);
     setCentralWidget(tabs_);
+    // App mark at the start of the tab band; the version lives in its tooltip
+    // (it used to take a whole status-bar row for four seconds). Floated over
+    // the band rather than set as a corner widget: in document mode a corner
+    // widget moves the page's top rule up through the tab labels.
+    mark_ = new QLabel(tabs_);
+    mark_->setObjectName("appMark");
+    mark_->setPixmap(appIcon(64).pixmap(QSize(18, 18)));
+    mark_->setToolTip(QStringLiteral("Legion Power Manager " LPM_VERSION));
+    mark_->adjustSize();
 
     home_ = new HomeTab;
     tabs_->addTab(home_, "Home");
@@ -85,8 +99,13 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     scenes_ = new SceneEngine(this);
     tabs_->insertTab(scenesAt, new ScenesTab(this), "Scenes");
+}
 
-    statusBar()->showMessage("Legion Power Manager " LPM_VERSION, 4000);
+void MainWindow::showEvent(QShowEvent *e) {
+    QMainWindow::showEvent(e);
+    // Centred on the tab band (its height is known once the style has polished it).
+    mark_->move(10, std::max(0, (tabs_->tabBar()->height() - mark_->height()) / 2));
+    mark_->raise();
 }
 
 void MainWindow::hideEvent(QHideEvent *e) {

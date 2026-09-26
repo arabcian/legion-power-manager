@@ -90,7 +90,7 @@ static QString kindName(Od::Kind k) {
 AmdGpuTab::AmdGpuTab(QWidget *parent) : QWidget(parent) {
     cards_ = cards();
     auto *outer = new QVBoxLayout(this);
-    outer->setContentsMargins(10, 10, 10, 10);
+    outer->setContentsMargins(12, 10, 12, 10);
     outer->setSpacing(8);
 
     auto *top = new QHBoxLayout;
@@ -105,14 +105,12 @@ AmdGpuTab::AmdGpuTab(QWidget *parent) : QWidget(parent) {
     banner_ = new QLabel;
     banner_->setWordWrap(true);
     banner_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    banner_->setStyleSheet(QStringLiteral(
-        "background: %1; border: 1px solid %2; border-left: 3px solid %3; border-radius: %4px; padding: 5px 9px; color: %5;")
-        .arg(theme::BG2, theme::ACCENT_SOFT, theme::ACCENT).arg(theme::RADIUS).arg(theme::FG_DIM));
+    banner_->setStyleSheet(theme::banner(theme::ACCENT) + QStringLiteral(" padding: 6px 10px;"));
     banner_->hide();
     outer->addWidget(banner_);
 
     live_ = new QLabel(QStringLiteral("—"));
-    live_->setStyleSheet(QStringLiteral("font-family: monospace; color: %1;").arg(theme::FG_DIM));
+    live_->setStyleSheet(QStringLiteral("font-family: monospace; color: %1; padding-left: 2px;").arg(theme::MUTED));
     outer->addWidget(live_);
 
     auto *scroll = new QScrollArea;
@@ -126,8 +124,8 @@ AmdGpuTab::AmdGpuTab(QWidget *parent) : QWidget(parent) {
 
     // Trial bar: shown after Apply until the user keeps or reverts.
     trialBar_ = new QFrame;
-    trialBar_->setStyleSheet(QStringLiteral("QFrame { background: %1; border: 1px solid %2; border-radius: %3px; }")
-                                 .arg(theme::BG2, theme::WARN).arg(theme::RADIUS));
+    trialBar_->setObjectName("trialBar");
+    trialBar_->setStyleSheet(theme::banner(theme::WARN, QStringLiteral("#trialBar")));
     auto *tb = new QHBoxLayout(trialBar_);
     trialLabel_ = new QLabel;
     tb->addWidget(trialLabel_, 1);

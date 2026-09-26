@@ -35,7 +35,12 @@ public:
     bool applyNamedProfile(const QString &name);
     void applyReset();
 
+protected:
+    void showEvent(QShowEvent *e) override;
+
 private:
+    void buildUi();
+    void refreshTopology();
     struct Slot {
         int ccd, slot;
         QLineEdit *entry;

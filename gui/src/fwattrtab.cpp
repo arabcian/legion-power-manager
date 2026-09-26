@@ -153,10 +153,7 @@ FwattrTab::FwattrTab(QWidget *parent) : QWidget(parent) {
 
     banner_ = new QLabel;
     banner_->setWordWrap(true);
-    banner_->setStyleSheet(QStringLiteral(
-        "background: %1; border: 1px solid %2; border-left: 3px solid %3; border-radius: %4px;"
-        " padding: 5px 9px; color: %5;").arg(theme::BG2, theme::ACCENT_SOFT, theme::ACCENT)
-        .arg(theme::RADIUS).arg(theme::FG_DIM));
+    banner_->setStyleSheet(theme::banner(theme::ACCENT) + QStringLiteral(" padding: 6px 10px;"));
     banner_->hide();
     lay->addWidget(banner_);
 
@@ -343,7 +340,8 @@ void FwattrTab::rebuild() {
                     slider->setSingleStep(a.viaWmi() ? 1 : a.step);
                     slider->setPageStep(a.viaWmi() ? 1 : a.step);
                     slider->setValue(a.current);
-                    if (a.viaWmi()) slider->setStyleSheet(QStringLiteral("QSlider::sub-page:horizontal { background: %1; }").arg(theme::PURPLE));
+                    if (a.viaWmi()) slider->setStyleSheet(QStringLiteral("QSlider::sub-page:horizontal { background: %1; }"
+                                                                         "QSlider::sub-page:horizontal:disabled { background: %2; }").arg(theme::PURPLE, theme::BG4));
                     g->addWidget(slider, r, 1);
                 } else {
                     auto *w = new QLabel(QStringLiteral("⚠ no range"));

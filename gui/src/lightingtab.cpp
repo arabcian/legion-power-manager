@@ -2,6 +2,7 @@
 #include "theme.h"
 #include <QCheckBox>
 #include <QColorDialog>
+#include <QFrame>
 #include <QComboBox>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -293,18 +294,21 @@ LightingTab::LightingTab(QWidget *parent) : QWidget(parent) {
 
 void LightingTab::buildUi() {
     auto *root = new QVBoxLayout(this);
-    root->setContentsMargins(10, 8, 10, 8);
+    root->setContentsMargins(12, 10, 12, 10);
     root->setSpacing(6);
 
+    auto *bannerFrame = new QFrame;
+    bannerFrame->setObjectName("lightBanner");
+    bannerFrame->setStyleSheet(theme::banner(theme::WARN, QStringLiteral("#lightBanner")));
+    auto *bannerRow = new QHBoxLayout(bannerFrame);
+    bannerRow->setContentsMargins(10, 5, 6, 5);
     banner_ = new QLabel;
     banner_->setWordWrap(true);
-    banner_->setStyleSheet(QStringLiteral("color: %1;").arg(theme::WARN));
     elevate_ = mini("Use administrator rights", "Read and write the keyboard through pkexec this time");
-    auto *bannerRow = new QHBoxLayout;
     bannerRow->addWidget(banner_, 1);
     bannerRow->addWidget(elevate_);
-    root->addLayout(bannerRow);
-    banner_->hide();
+    root->addWidget(bannerFrame);
+    bannerFrame->hide();
     elevate_->hide();
 
     // ── device: profile / brightness / logo ──
@@ -595,7 +599,7 @@ void LightingTab::showStatus(const QString &msg, const char *color) {
 
 void LightingTab::showBanner(const QString &msg, bool offerElevate) {
     banner_->setText(msg);
-    banner_->setVisible(!msg.isEmpty());
+    banner_->parentWidget()->setVisible(!msg.isEmpty());  // the callout frame
     elevate_->setVisible(offerElevate);
 }
 

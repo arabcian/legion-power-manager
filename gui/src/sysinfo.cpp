@@ -35,7 +35,12 @@ bool supportedMachine(QString *reason) {
     const QString fam = dmi(QStringLiteral("product_family")).value_or(QString());
     const QString shown = !version.isEmpty() ? version : !fam.isEmpty() ? fam : dmi(QStringLiteral("product_name")).value_or(QString());
     const bool lenovo = vendor.compare(QLatin1String("LENOVO"), Qt::CaseInsensitive) == 0;
-    if (lenovo && (family.match(version).hasMatch() || family.match(fam).hasMatch())) return true;
+    // China-market names that may omit "Legion" (Y9000P, R9000K, GeekPro G5000…);
+    // same list as the helpers (crates/lpm-helpers/src/machine.rs, CN_MODELS).
+    static const QRegularExpression cn(QStringLiteral("(^|[^A-Za-z0-9])(Y9000|R9000|Y7000|R7000|G5000)"),
+                                       QRegularExpression::CaseInsensitiveOption);
+    if (lenovo && (family.match(version).hasMatch() || family.match(fam).hasMatch()
+                   || cn.match(version).hasMatch() || cn.match(fam).hasMatch())) return true;
     if (reason) {
         QString what = QStringList{vendor, shown}.filter(QRegularExpression(QStringLiteral("\\S"))).join(' ');
         if (what.isEmpty()) what = QStringLiteral("no DMI information");

@@ -1,4 +1,6 @@
 #include "ryzentab.h"
+#include <QButtonGroup>
+#include <QShowEvent>
 #include "platformprofile.h"
 #include "privileged.h"
 #include "theme.h"
@@ -110,9 +112,64 @@ static QGroupBox *box(const QString &title, const char *objName) {
 }
 
 RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) {
+    profilesReady_ = QDir().mkpath(ryzen::profilesDir());
+    buildUi();
+}
+
+static bool sameTopology(const ryzen::Layout &a, const ryzen::Layout &b) {
+    if (a.ccdCount != b.ccdCount || a.cores.keys() != b.cores.keys()) return false;
+    for (auto it = a.cores.cbegin(); it != a.cores.cend(); ++it) {
+        const auto &x = it.value(), &y = b.cores.value(it.key());
+        if (x.size() != y.size()) return false;
+        for (int i = 0; i < x.size(); ++i) if (x[i].cpus != y[i].cpus) return false;
+    }
+    return true;
+}
+
+// CCDs come and go at runtime (Optimizations parks one by taking its CPUs
+// offline; an offline CPU has no cache/ node, so its CCD is invisible to
+// detect()). Read the topology again every time the tab is opened and rebuild
+// the grid when it changed, keeping the typed offsets, profile and log.
+void RyzenTab::showEvent(QShowEvent *e) {
+    QWidget::showEvent(e);
+    refreshTopology();
+}
+
+void RyzenTab::refreshTopology() {
+    if (busy_) return;  // never tear the grid down under a running apply
+    ryzen::Layout now = ryzen::detect();
+    if (sameTopology(now, layout_)) return;
+    const int before = ccdCount_;
+    const QJsonObject state = currentState();
+    const QString profile = profileCombo_->currentText(), logText = log_->toPlainText();
+
+    for (QObject *o : findChildren<QObject *>(QString(), Qt::FindDirectChildrenOnly))
+        if (o->isWidgetType() || qobject_cast<QButtonGroup *>(o)) delete o;
+    delete layout();
+    slots_.clear(); ccdColumns_.clear(); fillEntries_.clear(); applyButtons_.clear(); activeCcds_.clear();
+
+    layout_ = std::move(now);
+    buildUi();
+
+    if (const int i = profileCombo_->findText(profile); i >= 0) profileCombo_->setCurrentIndex(i);
+    if (state.value("coall").isDouble()) coall_->setText(QString::number(state.value("coall").toInt()));
+    for (const auto &v : state.value("cores").toArray()) {
+        const QJsonObject c = v.toObject();
+        for (Slot &s : slots_) {
+            if (s.ccd != c.value("ccd").toInt() || s.slot != c.value("slot").toInt()) continue;
+            s.disable->setChecked(c.value("disabled").toBool());
+            if (c.value("coper").isDouble()) s.entry->setText(QString::number(c.value("coper").toInt()));
+        }
+    }
+    const QString fresh = log_->toPlainText();
+    log_->setPlainText(logText);
+    log(QStringLiteral("CCD topology changed (%1 → %2 CCD(s)); the per-core grid was rebuilt.").arg(before).arg(ccdCount_), "cmd");
+    for (const QString &l : fresh.split('\n', Qt::SkipEmptyParts)) log_->appendPlainText(l);
+}
+
+void RyzenTab::buildUi() {
     ccdCount_ = layout_.ccdCount ? layout_.ccdCount : CCD_FALLBACK;
     if (qEnvironmentVariableIsSet("LPM_RYZEN_CCDS")) ccdCount_ = qEnvironmentVariableIntValue("LPM_RYZEN_CCDS");  // dev only
-    profilesReady_ = QDir().mkpath(ryzen::profilesDir());
 
     QList<int> mismatch;
     for (int c = 0; c < ccdCount_; ++c)
@@ -598,6 +655,7 @@ void RyzenTab::deleteProfile() {
 }
 
 bool RyzenTab::applyNamedProfile(const QString &name) {
+    refreshTopology();  // the tray can apply while the tab is hidden: use today's CCDs
     if (busy_) { log("Previous operation still running, please wait.", "err"); return false; }
     const int i = profileCombo_->findText(name);
     if (i < 0) { reloadProfiles(); QMessageBox::warning(this, "No Profile", "Profile '" + name + "' no longer exists."); return false; }
