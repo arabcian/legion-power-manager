@@ -82,7 +82,7 @@ src_install() {
 	udev_dorules packaging/udev/70-legion-power-manager-lighting.rules
 	keepdir /etc/nvcurve/profiles
 
-	dodoc README.md NOTICE DISCLAIMER.md
+	dodoc README.md NOTICE DISCLAIMER.md docs/TECHNICAL.md
 }
 
 pkg_postinst() {
