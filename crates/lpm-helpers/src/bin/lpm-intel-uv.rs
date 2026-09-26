@@ -176,6 +176,7 @@ fn measure(csv: bool, secs: f64) -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else { usage() };
+    if let Err(e) = lpm_helpers::machine::check() { eprintln!("lpm-intel-uv: {e}"); std::process::exit(1); }
     unsafe { libc::signal(libc::SIGINT, handler(on_int)); libc::signal(libc::SIGTERM, handler(on_int)); }
     if cmd != "measure" && unsafe { libc::geteuid() } != 0 { eprintln!("lpm-intel-uv: needs root (MSR access)"); std::process::exit(1); }
     let code = match cmd.as_str() {

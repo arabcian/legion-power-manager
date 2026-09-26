@@ -18,6 +18,7 @@ pub mod intel_uv;
 pub mod intel_uv_daemon;
 pub mod legion_wmi;
 pub mod lighting;
+pub mod machine;
 pub mod tune;
 
 /// Process-wide setup every root helper runs first.
@@ -28,11 +29,19 @@ pub mod tune;
 /// which is a straight path to planting a boot profile. Also disables core
 /// dumps, so a crash never leaves root memory (MSR/EC state, profiles) in a
 /// file some other tool might pick up.
+///
+/// Then refuses to run at all on a machine that is not a Lenovo Legion, LOQ
+/// or IdeaPad Gaming laptop (one JSON error line, exit 1): the helpers write
+/// Lenovo-specific firmware/EC state that means something else elsewhere.
 pub fn init() {
     unsafe {
         libc::umask(0o022);
         let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
+    if let Err(e) = machine::check() {
+        emit(&json!({"ok": false, "unsupported": true, "error": e}));
+        std::process::exit(1);
     }
 }
 

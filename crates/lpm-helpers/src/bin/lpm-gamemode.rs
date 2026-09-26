@@ -758,6 +758,18 @@ fn usage() -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(e) = lpm_helpers::machine::check() {
+        log!("lpm-gamemode: {e}");
+        // RUN / WRAP still start the game — only without any tuning.
+        if let Some(mode) = args.first().map(|s| s.to_ascii_uppercase()).filter(|m| m == "RUN" || m == "WRAP") {
+            let (_, cmd) = split_cmd(&args[1..]);
+            if cmd.is_empty() { log!("lpm-gamemode {mode}: no command"); std::process::exit(2); }
+            let err = Command::new(&cmd[0]).args(&cmd[1..]).exec();
+            log!("lpm-gamemode: {}: {err}", cmd[0]);
+            std::process::exit(127);
+        }
+        std::process::exit(1);
+    }
     let fail = |e: String| { log!("lpm-gamemode: {e}"); 1 };
     let code = match args.first().map(|s| s.to_ascii_uppercase()).as_deref() {
         Some("PRE") => { OWNER.store(launcher_pid(), Ordering::SeqCst); pre(args.get(1).map(String::as_str)) }
