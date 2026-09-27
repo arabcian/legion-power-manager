@@ -161,6 +161,12 @@ const NO: Options = Options::None;
 
 /// Keys that hot-plug CPUs: applied after every other knob, restored before them.
 pub const HOTPLUG_KEYS: &[&str] = &["cpu.smt", "cpu.ccd_park"];
+/// After each cpu*/online or smt/control write.
+pub const HOTPLUG_SETTLE_WRITE: std::time::Duration = std::time::Duration::from_millis(5);
+/// After a whole hot-plug knob, before sysfs is read again.
+pub const HOTPLUG_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+/// Between two ordinary knobs.
+pub const KNOB_GAP: std::time::Duration = std::time::Duration::from_millis(2);
 
 pub const TUNABLES: &[Tunable] = &[
     // ── CPU ───────────────────────────────────────────────────────────────
@@ -502,8 +508,12 @@ fn numbered(dir: &Path, prefix: &str) -> Vec<(u32, PathBuf)> {
     v
 }
 
+/// Active policies only: a policy whose CPUs are all offline (parked CCD)
+/// keeps its files, but every read and write on them returns EBUSY.
 pub fn policies() -> Vec<PathBuf> {
-    numbered(&Path::new(CPU_DIR).join("cpufreq"), "policy").into_iter().map(|x| x.1).collect()
+    numbered(&Path::new(CPU_DIR).join("cpufreq"), "policy").into_iter().map(|x| x.1)
+        .filter(|p| read(&p.join("affected_cpus")).map_or(false, |s| !s.trim().is_empty()))
+        .collect()
 }
 
 pub fn cpus() -> Vec<(u32, PathBuf)> { numbered(Path::new(CPU_DIR), "cpu") }
@@ -785,19 +795,23 @@ fn parked_record() -> Option<(String, String, Vec<usize>)> {
 /// The record describes the current state only if exactly its CPUs are offline.
 fn match_park_record(v: &serde_json::Value, offline: &[usize]) -> Option<(String, String, Vec<usize>)> {
     let cpus: Vec<usize> = v["cpus"].as_array()?.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect();
-    if cpus.is_empty() || offline != cpus.as_slice() { return None; }
+    // Valid while every parked CPU is still offline (SMT may add more offline CPUs).
+    if cpus.is_empty() || !cpus.iter().all(|c| offline.contains(c)) { return None; }
     let role = v["role"].as_str()?.to_owned();
     let label = v["label"].as_str().map(str::to_owned).unwrap_or_else(|| format!("park {role}"));
     Some((role, label, cpus))
 }
 
 /// Called by tune-helper (root) after a successful park.
-pub fn record_ccd_park(role: &str, label: Option<&str>) -> Result<(), String> {
+pub fn record_ccd_park(role: &str, label: Option<&str>, cpus: &[usize]) -> Result<(), String> {
     if role == "none" {
         let _ = std::fs::remove_file(CCD_PARK_RECORD);
         return Ok(());
     }
-    let body = serde_json::json!({"role": role, "label": label, "cpus": offline_cpus()});
+    // Only the CPUs this park took offline: with SMT off, offline_cpus() also
+    // holds the other CCD's sibling threads, which "none" must not bring back.
+    let cpus: Vec<usize> = if cpus.is_empty() { offline_cpus() } else { cpus.to_vec() };
+    let body = serde_json::json!({"role": role, "label": label, "cpus": cpus});
     crate::write_root_file(CCD_PARK_RECORD, body.to_string().as_bytes())
 }
 
@@ -982,6 +996,12 @@ fn is_irq_file(p: &Path) -> bool {
 /// Per-file refusals do not fail the knob: kernel-managed IRQs return EIO,
 /// and some PCI functions (or a locked-down kernel) refuse config writes —
 /// lutris-game-tune ran setpci with `|| true` for the same reason.
+/// The kernel refuses pcie_aspm's policy with EPERM when ASPM control was
+/// not granted to the OS (FADT "ASPM not supported" or _OSC denied).
+pub fn firmware_owned(t: &Tunable, err: &str) -> bool {
+    matches!(t.target, Target::File(p) if p.ends_with("pcie_aspm/parameters/policy")) && err.contains("os error 1)")
+}
+
 pub fn best_effort(t: &Tunable) -> bool { matches!(t.target, Target::Irq | Target::PciLatency | Target::PciAspm) }
 
 // ── command-backed targets (Wi-Fi power save, sched_ext) ─────────────────
@@ -1011,7 +1031,7 @@ fn run_tool(bin: &Path, args: &[&str], timeout: std::time::Duration) -> Option<(
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
             _ => { let _ = child.kill(); let _ = child.wait(); return None; }
         }
     };
@@ -1468,7 +1488,13 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
             fs.into_iter().map(|f| (f, list.clone())).collect()
         }
         Target::CcdPark => {
-            if value == "none" { return Ok(fs.into_iter().map(|f| (f, "1".to_owned())).collect()); }
+            if value == "none" {
+                // Bring back what the park took; onlining SMT-offline siblings fails with EPERM.
+                if let Some((_, _, cpus)) = parked_record() {
+                    return Ok(cpus.iter().map(|c| (Path::new(CPU_DIR).join(format!("cpu{c}/online")), "1".to_owned())).collect());
+                }
+                return Ok(fs.into_iter().map(|f| (f, "1".to_owned())).collect());
+            }
             // Already parked with this role (its CPUs are no longer resolvable): same writes, all no-ops.
             if let Some((_, _, cpus)) = parked_record().filter(|(r, _, _)| r == value) {
                 return Ok(cpus.iter().map(|c| (Path::new(CPU_DIR).join(format!("cpu{c}/online")), "0".to_owned())).collect());
@@ -1537,7 +1563,11 @@ pub fn write_checked(f: &Path, data: &str) -> Result<(), String> {
     // CPU hot-plug changes the L3 grouping: never serve a stale topology after it.
     if f.file_name().map_or(false, |n| n == "online" || n == "control") { invalidate_topology(); }
     let r = write_checked_inner(f, data);
-    if f.file_name().map_or(false, |n| n == "online" || n == "control") { invalidate_topology(); }
+    if f.file_name().map_or(false, |n| n == "online" || n == "control") {
+        // Let the kernel finish the hot-plug (cache/, cpufreq policy) before the next read.
+        std::thread::sleep(HOTPLUG_SETTLE_WRITE);
+        invalidate_topology();
+    }
     r
 }
 

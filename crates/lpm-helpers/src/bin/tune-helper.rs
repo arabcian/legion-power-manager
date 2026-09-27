@@ -132,8 +132,10 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
         }
     }
     // Table order, not request order: pstate mode first, hot-plug last.
+    let mut first = true;
     for t in TUNABLES {
         let Some(raw) = values.get(t.key) else { continue };
+        if !std::mem::take(&mut first) { std::thread::sleep(tune::KNOB_GAP); }
         if t.debugfs && !tune::ensure_debugfs() {
             results.push(json!({"key": t.key, "ok": true, "skipped": "debugfs unavailable"}));
             continue;
@@ -154,6 +156,8 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             Ok(p) => p,
             Err(e) => { results.push(json!({"key": t.key, "ok": false, "error": e})); all_ok = false; continue; }
         };
+        let park_cpus: Vec<usize> = plan.iter().filter(|(_, d)| d == "0")
+            .filter_map(|(f, _)| f.parent()?.file_name()?.to_str()?.strip_prefix("cpu")?.parse().ok()).collect();
         let (mut written, mut refused, mut errs) = (0, 0, Vec::new());
         // Pass 1: read every original, record the fresh ones. They are
         // persisted in ONE state save *before* any write, so a crash or kill
@@ -185,12 +189,14 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
         // Pass 2: write. A failed write changed nothing, so its fresh
         // baseline entry is dropped again (saved with the rest at the end).
         let mut unchanged: Vec<PathBuf> = Vec::new();
+        let mut fw_owned = false;
         for (f, data, fresh) in todo {
             match tune::write_value(t, &f, &data) {
                 Ok(()) => written += 1,
                 Err(e) => {
                     if fresh { unchanged.push(f); }
-                    if tune::best_effort(t) { refused += 1; } else { errs.push(e); }
+                    if tune::firmware_owned(t, &e) { fw_owned = true; }
+                    else if tune::best_effort(t) { refused += 1; } else { errs.push(e); }
                 }
             }
         }
@@ -198,7 +204,12 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             st.baseline.retain(|(k, q, _)| !(k == t.key && unchanged.contains(q)));
         }
         if t.key == "cpu.ccd_park" && errs.is_empty() {
-            if let Err(e) = tune::record_ccd_park(&v, park_label.as_deref()) { errs.push(format!("park record: {e}")); }
+            if let Err(e) = tune::record_ccd_park(&v, park_label.as_deref(), &park_cpus) { errs.push(format!("park record: {e}")); }
+        }
+        if fw_owned && errs.is_empty() && written == 0 {
+            // Not changeable on this machine: same as an absent feature, not a failure.
+            results.push(json!({"key": t.key, "ok": true, "skipped": "firmware owns PCIe ASPM (FADT / _OSC); the policy cannot be changed from Linux"}));
+            continue;
         }
         let mut r = json!({"key": t.key, "value": v, "written": written});
         if refused > 0 { r["refused"] = json!(refused); }
@@ -211,6 +222,7 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             r["error"] = json!(errs.join("; "));
         }
         results.push(r);
+        if tune::is_hotplug(t.key) && written > 0 { std::thread::sleep(tune::HOTPLUG_SETTLE); tune::invalidate_topology(); }
     }
     (results, all_ok)
 }
@@ -227,8 +239,17 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
     // dropping them would lose the only record of the original value while the
     // knob is still changed. A later restore (GUI, POST, service stop) retries.
     let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut hotplug_done = false;
     for &i in &order {
         let (key, f, orig) = &st.baseline[i];
+        // CPUs come back first: give them time before their cpufreq files are written.
+        if !hotplug_done && !tune::is_hotplug(key) {
+            hotplug_done = true;
+            if order.first().map_or(false, |&j| tune::is_hotplug(&st.baseline[j].0)) {
+                std::thread::sleep(tune::HOTPLUG_SETTLE);
+                tune::invalidate_topology();
+            }
+        }
         let res = match tune::find(key) { Some(t) => tune::write_value(t, f, orig), None => tune::write_checked(f, orig) };
         match res {
             Ok(()) => n += 1,
@@ -316,9 +337,16 @@ fn op_apply(req: &Value) -> Value {
 fn op_release(req: &Value) -> Value {
     let owner = session_owner(req);
     locked(|st| {
+        // No game session (PRE failed / already released / pruned): a POST must
+        // not restore manual or boot tuning that game mode never owned.
+        if st.refcount() == 0 {
+            return json!({"ok": true, "restored": false, "message": "no game session active"});
+        }
         if st.refcount() > 1 {
-            // This game's own session if it can be identified, else the oldest.
-            let i = st.sessions.iter().position(|s| owner.0.is_some() && *s == owner).unwrap_or(0);
+            // The caller's own session; else an untracked one; never another live game's.
+            let i = st.sessions.iter().position(|s| owner.0.is_some() && *s == owner)
+                .or_else(|| st.sessions.iter().position(|s| s.0.is_none()))
+                .unwrap_or(0);
             st.sessions.remove(i);
             return json!({"ok": true, "restored": false, "message": format!("{} game(s) still running", st.refcount())});
         }

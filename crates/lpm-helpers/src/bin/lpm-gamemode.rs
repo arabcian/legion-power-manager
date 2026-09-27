@@ -167,10 +167,13 @@ fn game_start(name: Option<&str>) -> (bool, i32) {
     let _start_lock = user_lock("gamemode-start.lock");
     let cfg = read_json(&config_dir().join("tune.json")).unwrap_or(Value::Null);
     let first = game_refcount() == 0;
-    match cfg["game_scene"].as_str().filter(|n| valid_name(n)) {
+    let paused = scenes_paused();
+    if paused && cfg["game_scene"].as_str().is_some() { log!("lpm-gamemode: scenes are paused — game scene skipped"); }
+    match cfg["game_scene"].as_str().filter(|n| valid_name(n) && !paused) {
         Some(scene) if first => enter_game_scene(scene, cfg["undervolt_cpu"] == true, cfg["undervolt_gpu"] == true),
         Some(_) => log!("lpm-gamemode: another game is running — its scene stays"),
-        None => { undervolt(false); }
+        None if first => { undervolt(false); }
+        None => {}
     }
     match apply(name, "game") {
         Ok(ok) => (true, (!ok) as i32),
@@ -262,9 +265,20 @@ fn enter_game_scene(scene: &str, cpu: bool, gpu: bool) {
     write_scene_state(&st);
 }
 
+fn scenes_paused() -> bool {
+    read_json(&config_dir().join("scenes.json")).map_or(false, |v| v["paused"] == true)
+}
+
 fn leave_game_scene() {
     let mut st = read_scene_state();
     if st.get("game_scene").map_or(true, Value::is_null) { return; }
+    if scenes_paused() {
+        st["game_scene"] = Value::Null;
+        st["before_game"] = Value::Null;
+        write_scene_state(&st);
+        log!("lpm-gamemode: last game closed — scenes are paused, no scene change");
+        return;
+    }
     let auto = read_json(&config_dir().join("scenes.json")).unwrap_or(Value::Null);
     let target = if auto["auto"] == true {
         let key = if on_ac().unwrap_or(true) { "on_ac" } else { "on_battery" };
