@@ -32,7 +32,6 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
         mem_offset_mhz: p.mem_offset_mhz,
         mem_locked_min_mhz: p.mem_locked_min_mhz,
         mem_locked_max_mhz: p.mem_locked_max_mhz,
-        gpu_clock_cap_mhz: p.gpu_clock_cap_mhz,
     };
     for e in validate_limits(idx, &lim) {
         out.warnings.push(format!("Rejected: {}", e.message));
@@ -40,7 +39,6 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
             LimitField::PowerLimit => p.power_limit_w = None,
             LimitField::MemOffset => p.mem_offset_mhz = None,
             LimitField::MemLocked => { p.mem_locked_min_mhz = None; p.mem_locked_max_mhz = None; }
-            LimitField::GpuCap => p.gpu_clock_cap_mhz = None,
         }
     }
 
@@ -50,14 +48,8 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
             out.warnings.push(format!("Mem locked clocks: {e}"));
         }
     }
-    // The profile defines the cap: set it, or remove one left by another
-    // profile (resetting an absent cap is harmless; errors there are noise).
-    match p.gpu_clock_cap_mhz.and_then(to_u32) {
-        Some(cap) => if let Err(e) = limits::set_gpu_locked_clocks(0, cap, idx) {
-            out.warnings.push(format!("Core clock cap: {e}"));
-        },
-        None => { let _ = limits::reset_gpu_locked_clocks(idx); }
-    }
+    // Release a core clock lock left by older builds' cap feature.
+    let _ = limits::reset_gpu_locked_clocks(idx);
     if let Some(off) = p.mem_offset_mhz.and_then(to_i32) {
         if let Err(e) = limits::set_clock_offsets(None, Some(off), idx) {
             out.warnings.push(format!("Mem offset: {e}"));
@@ -74,7 +66,7 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
         if rc != 0 { out.errors.push(format!("Curve reset failed ({rc}): {d}")); }
         return Ok(out);
     }
-    let deltas = match p.deltas() {
+    let mut deltas = match p.deltas() {
         Ok(d) => d,
         Err(e) => { out.errors.push(format!("Curve: malformed curve_deltas in profile {name:?}: {e}")); return Ok(out); }
     };
@@ -83,11 +75,18 @@ pub fn apply_profile(gpu_index: usize, name: &str, cfg: &Config) -> Result<Apply
         out.errors.push(format!("Curve: {}", errs.join("; ")));
         return Ok(out);
     }
-    // One table read serves both the snapshot and the write baseline.
-    let raw = match vfcurve::read_clock_table_raw(g) {
-        Ok(r) => r,
-        Err(e) => { out.errors.push(format!("Curve write failed: cannot read ClockBoostTable: {e}")); return Ok(out); }
+    // One read serves the snapshot, the write baseline and the point list.
+    let (state, raw) = match vfcurve::read_curve_with_raw_ct(g, &gname) {
+        Ok(v) => v,
+        Err(e) => { out.errors.push(format!("Curve write failed: cannot read curve: {e}")); return Ok(out); }
     };
+    // Profiles store only non-zero deltas and the write is sparse (only masked
+    // points change), so a point absent from the profile kept whatever delta
+    // an earlier apply left there — e.g. a previous flatten's negative offset
+    // pulling the new curve down. Every GPU point the profile omits is 0.
+    for pt in state.points.iter().filter(|p| p.domain == crate::types::Domain::Gpu) {
+        deltas.entry(pt.index as i64).or_insert(0);
+    }
     if cfg.auto_snapshot && snapshot::save(g, &gname, &cfg.snapshot_dir, cfg.max_snapshots, Some(raw.bytes())).is_none() {
         warn!("Auto-snapshot failed");
     }
