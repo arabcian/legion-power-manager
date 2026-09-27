@@ -12,6 +12,8 @@
 #                 offscreen training
 #                 run over every tab, then the final build with the profile)
 #   --no-harden   drop stack protector / FORTIFY=3 / CET / full RELRO / PIE on the GUI
+#   --clang       build the GUI with clang++ (+ lld when present) and link the Rust
+#                 helpers with clang; same as ./install-clang.sh
 #
 # Layout:
 #   /usr/bin/legion-power-manager                   GUI (Qt6)
@@ -32,7 +34,7 @@ PREFIX=${PREFIX:-/usr}
 DESTDIR=${DESTDIR:-}
 LIBEXEC="$PREFIX/libexec/legion-power-manager"
 UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
-BUILD=1 LEGACY=0 NATIVE=1 LTO=1 PGO=1 HARDEN=1
+BUILD=1 LEGACY=0 NATIVE=1 LTO=1 PGO=1 HARDEN=1 CLANG=0
 for a in "$@"; do
     case "$a" in
         --no-build) BUILD=0 ;;
@@ -42,6 +44,7 @@ for a in "$@"; do
         --pgo) PGO=1 ;;
         --no-pgo) PGO=0 ;;
         --no-harden) HARDEN=0 ;;
+        --clang) CLANG=1 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
@@ -52,14 +55,46 @@ as_user() { if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then sudo -u "$SUDO_USE
 onoff() { (( $1 )) && echo ON || echo OFF; }
 
 if (( BUILD )); then
+    # ── Toolchain ──
+    cmake_cc=() LLD=0 PROFDATA=llvm-profdata
+    if (( CLANG )); then
+        # sudo's secure_path drops the user's PATH: on Gentoo clang lives only in
+        # /usr/lib/llvm/<N>/bin, so look there too and use absolute paths.
+        llvm_find() {  # llvm_find <tool>
+            local p; p=$(command -v "$1" 2>/dev/null) && { echo "$p"; return; }
+            p=$(compgen -G "/usr/lib/llvm/*/bin/$1" | sort -V | tail -1) && [[ -n $p ]] && { echo "$p"; return; }
+            p=$(compgen -c "$1-" | grep -E "^$1-[0-9]+$" | sort -V | tail -1) && [[ -n $p ]] && command -v "$p"
+        }
+        CLANGXX=$(llvm_find clang++ || true); CLANGC=$(llvm_find clang || true)
+        [[ -n $CLANGXX && -n $CLANGC ]] || { echo "!! --clang: clang/clang++ not found (PATH or /usr/lib/llvm/*/bin)" >&2; exit 1; }
+        echo ">> clang: $CLANGXX"
+        cmake_cc=(-DCMAKE_CXX_COMPILER="$CLANGXX")  # the GUI is CXX-only
+        # lld handles clang's LTO objects without the LLVMgold plugin.
+        if LLDBIN=$(llvm_find ld.lld) && [[ -n $LLDBIN ]]; then
+            LLD=1; cmake_cc+=(-DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld --ld-path=$LLDBIN")
+        fi
+        PROFDATA=$(llvm_find llvm-profdata || true)
+        if [[ -z $PROFDATA ]] && (( PGO )); then echo "!! llvm-profdata not found — building without PGO" >&2; PGO=0; fi
+    fi
+    # A build dir configured with the other compiler cannot be reused.
+    for d in gui/build gui/build-pgo; do
+        c=$(grep -s '^CMAKE_CXX_COMPILER:' "$d/CMakeCache.txt" | cut -d= -f2 || true)
+        [[ -z $c ]] && continue
+        if { (( CLANG )) && [[ $c != *clang* ]]; } || { (( !CLANG )) && [[ $c == *clang* ]]; }; then rm -rf "$d"; fi
+    done
+
     # ── Rust: fat LTO + codegen-units=1 + panic=abort come from Cargo.toml ──
     rustflags=${RUSTFLAGS:-}
     (( NATIVE )) && rustflags+=" -C target-cpu=native"
+    if (( CLANG )); then
+        rustflags+=" -C linker=$CLANGC"
+        (( LLD )) && rustflags+=" -C link-arg=-fuse-ld=lld -C link-arg=--ld-path=$LLDBIN"
+    fi
     as_user env RUSTFLAGS="$rustflags" cargo build --release --locked
 
     # ── GUI ──
     gui_cmake() {  # gui_cmake <builddir> <pgo-mode>
-        as_user cmake -S gui -B "$1" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+        as_user cmake -S gui -B "$1" "${cmake_cc[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DLPM_HELPER_DIR="$LIBEXEC" -DLPM_LTO="$(onoff $LTO)" -DLPM_NATIVE="$(onoff $NATIVE)" \
             -DLPM_HARDEN="$(onoff $HARDEN)" -DLPM_PGO="$2" -DLPM_PGO_DIR="$PWD/gui/build-pgo/profile"
         as_user cmake --build "$1" -j"$(nproc)"
@@ -80,7 +115,7 @@ if (( BUILD )); then
         rm -rf "$rt"
         prof=gui/build-pgo/profile
         if compgen -G "$prof/*.profraw" >/dev/null; then    # clang
-            as_user llvm-profdata merge -o "$prof/default.profdata" "$prof"/*.profraw
+            as_user "$PROFDATA" merge -o "$prof/default.profdata" "$prof"/*.profraw
         fi
         if [[ -z $(find "$prof" -type f 2>/dev/null | head -1) ]]; then
             echo "!! training produced no profile — building without PGO" >&2

@@ -67,6 +67,9 @@ hardening) and installs to `/usr`. Options: `--no-native` for portable
 binaries, `--no-lto`, `--no-pgo`, `--no-harden`, `--remove-legacy` to remove
 the old Python version. Remove with `sudo ./uninstall.sh`.
 
+To build with clang/LLVM instead of GCC: `sudo ./install-clang.sh` (same options;
+uses lld when installed and `llvm-profdata` for PGO).
+
 ### Gentoo
 
 ```sh
