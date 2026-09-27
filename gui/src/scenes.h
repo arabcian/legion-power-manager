@@ -47,6 +47,7 @@ struct Scene {
 struct Auto {
     bool enabled = false;
     QString onAc, onBattery;       // scene names; empty = leave as is
+    bool paused = false;           // no automatic scene changes (power source, login, game); manual Apply still works
 };
 
 QString dir();
@@ -96,6 +97,8 @@ public:
     scenes::Auto autoConfig() const { return auto_; }
     /// Persists the setting; enabling it applies the matching scene at once.
     bool setAuto(const scenes::Auto &a, QString *err = nullptr);
+    bool paused() const { return auto_.paused; }
+    bool setPaused(bool on, QString *err = nullptr);
     std::optional<bool> powerSource() const { return ac_; }
 
 Q_SIGNALS:
@@ -103,6 +106,7 @@ Q_SIGNALS:
     /// `log` holds one line per component, failures prefixed with "✗".
     void finished(const QString &name, bool ok, const QStringList &log);
     void powerSourceChanged(bool onAc);
+    void pausedChanged(bool paused);
 
 private:
     using Done = std::function<void(bool ok, const QString &msg)>;

@@ -576,7 +576,8 @@ void IntelTab::setProfile(const QJsonObject &p) {
             hwpThreshold_->setValue(r.value("load").toObject().value("threshold").toDouble(0.8));
         } else {
             hwpAlgo_->setCurrentIndex(1);
-            const QJsonObject t = r.value("power").toArray().first().toObject();
+            const QJsonArray pw = r.value("power").toArray();
+            const QJsonObject t = pw.isEmpty() ? QJsonObject() : pw.first().toObject();
             hwpDomain_->setCurrentText(t.value("domain").toString("package"));
             hwpCmp_->setCurrentIndex(t.value("gt").toBool(true) ? 0 : 1);
             hwpWatts_->setValue(t.value("watts").toDouble());

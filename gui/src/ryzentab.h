@@ -3,6 +3,8 @@
 // Per-slot CO offsets on the fixed 8-slot-per-CCD SMU grid, all-core
 // offset, reset, and per-user profiles; writes via ryzen-co-helper.
 #include <QJsonObject>
+#include <QMap>
+#include <QSet>
 #include <QWidget>
 #include <functional>
 #include <optional>
@@ -20,7 +22,10 @@ struct PhysCore { QList<int> cpus; std::optional<int> highestPerf; };
 struct Layout {
     int ccdCount = 0;
     QMap<int, QList<PhysCore>> cores;  // per CCD, ascending logical-CPU order
+    QSet<int> parked;                  // CCDs parked by Optimizations (from tune-helper's park record)
 };
+/// CPUs of the CCD parked by Optimizations, if the park is still in effect.
+QList<int> parkedCpus();
 Layout detect();
 QString profilesDir();
 }
@@ -39,14 +44,14 @@ protected:
     void showEvent(QShowEvent *e) override;
 
 private:
-    void buildUi();
-    void refreshTopology();
     struct Slot {
         int ccd, slot;
         QLineEdit *entry;
         QCheckBox *disable;
         QWidget *row;
+        QLabel *cppc;
     };
+    void updateParked();
     enum class Parse { Disabled, Empty, Ok, Invalid, Range };
     std::pair<Parse, int> parse(const Slot &s) const;
     QList<Slot *> activeSlots();
@@ -74,6 +79,9 @@ private:
     QMap<int, QLineEdit *> fillEntries_;
     QList<QPushButton *> applyButtons_;
     QLineEdit *coall_ = nullptr;
+    QMap<int, QLabel *> ccdTitles_;
+    QSet<int> parkedNow_;
+    class QRadioButton *rAll_ = nullptr;
     QComboBox *profileCombo_ = nullptr;
     QPlainTextEdit *log_ = nullptr;
     bool busy_ = false, profilesReady_ = true;

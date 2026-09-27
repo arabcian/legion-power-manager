@@ -141,13 +141,14 @@ Auto loadAuto() {
     a.enabled = o.value("auto").toBool();
     a.onAc = o.value("on_ac").toString();
     a.onBattery = o.value("on_battery").toString();
+    a.paused = o.value("paused").toBool();
     if (!validName(a.onAc)) a.onAc.clear();
     if (!validName(a.onBattery)) a.onBattery.clear();
     return a;
 }
 
 bool saveAuto(const Auto &a, QString *err) {
-    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}}, err);
+    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}, {"paused", a.paused}}, err);
 }
 
 std::optional<bool> onAc() {
@@ -288,7 +289,9 @@ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadA
     retunePoll();
     // Session start: bring the machine to the scene for the current source,
     // after the tabs have finished their own startup reads.
-    if (auto_.enabled && ac_) QTimer::singleShot(STARTUP_DELAY_MS, this, &SceneEngine::startupApply);
+    // A theme change re-execs the app: the hardware is already in the scene's state.
+    if (auto_.enabled && ac_ && !QCoreApplication::arguments().contains(QStringLiteral("--theme-restart")))
+        QTimer::singleShot(STARTUP_DELAY_MS, this, &SceneEngine::startupApply);
 }
 
 // The login scene can carry a CPU/GPU curve: if one is unstable, applying it
@@ -299,7 +302,7 @@ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadA
 static constexpr int LOGIN_WINDOW_MS = 120000;
 
 void SceneEngine::startupApply() {
-    if (!auto_.enabled || !ac_) return;
+    if (!auto_.enabled || auto_.paused || !ac_) return;
     const QString file = loginGuardFile();
     QJsonObject g = readObject(file);
     const QString cur = bootId();
@@ -341,6 +344,20 @@ bool SceneEngine::setAuto(const Auto &a, QString *err) {
     if (!saveAuto(a, err)) return false;
     auto_ = a;
     if (a.enabled && !wasOn && ac_) applyForSource(*ac_);
+    return true;
+}
+
+bool SceneEngine::setPaused(bool on, QString *err) {
+    if (auto_.paused == on) return true;
+    Auto a = auto_;
+    a.paused = on;
+    if (!saveAuto(a, err)) return false;
+    auto_ = a;
+    Q_EMIT pausedChanged(on);
+    Q_EMIT finished(QString(), true, {on ? QStringLiteral("scenes paused — no automatic scene changes until resumed")
+                                         : QStringLiteral("scenes resumed")});
+    // Resuming catches up with the current power source.
+    if (!on && auto_.enabled && ac_) applyForSource(*ac_);
     return true;
 }
 
@@ -430,10 +447,11 @@ void SceneEngine::checkGameEnd() {
     const QString target = auto_.enabled && ac_ ? (*ac_ ? auto_.onAc : auto_.onBattery) : before;
     // Ends the dead session and restores the game tuning (tune-helper prune).
     privileged::run(privileged::helperPath("tune-helper"), QJsonObject{{"op", "prune"}}, this,
-                    [this, target](const privileged::Result &) { if (validName(target)) apply(target); }, 120000);
+                    [this, target](const privileged::Result &) { if (validName(target) && !auto_.paused) apply(target); }, 120000);
 }
 
 void SceneEngine::applyForSource(bool onAc) {
+    if (auto_.paused) { deferred_ = false; return; }
     // Never switch scenes under a running game: lpm-gamemode POST returns to
     // the scene for the then-current power source when the last game exits.
     if (gameSessions() > 0) {
@@ -571,14 +589,18 @@ void SceneEngine::start(const Scene &s) {
     }
 
     // 4. NVIDIA V/F curve.
+    const bool cpuStep = s.cpu.kind != Choice::Unchanged && (win_->ryzen() || win_->intel());
     if (s.gpu.kind != Choice::Unchanged && win_->nvidia()) {
-        addStep("GPU curve", [this, c = s.gpu](Done done) {
-            // Two NvAPI sessions writing the ClockBoostTable at once is asking for trouble.
-            if (win_->nvidia()->busy()) { done(false, "the NVIDIA tab is busy; skipped"); return; }
-            const QJsonObject req = c.kind == Choice::Reset ? QJsonObject{{"op", "reset_gpu_curve"}}
-                                                            : QJsonObject{{"op", "apply_named_profile"}, {"name", c.name}};
-            helper("nvcurve-root-helper", req, [done, c](bool ok, const QString &m) {
-                done(ok, ok ? (c.kind == Choice::Reset ? QStringLiteral("reset") : "'" + c.name + "'") : m);
+        addStep("GPU curve", [this, c = s.gpu, cpuStep](Done done) {
+            // Same 2 s gap after a CPU curve as lpm-gamemode (UNDERVOLT_GAP).
+            QTimer::singleShot(cpuStep ? 2000 : 0, this, [this, c, done] {
+                // Two NvAPI sessions writing the ClockBoostTable at once is asking for trouble.
+                if (win_->nvidia()->busy()) { done(false, "the NVIDIA tab is busy; skipped"); return; }
+                const QJsonObject req = c.kind == Choice::Reset ? QJsonObject{{"op", "reset_gpu_curve"}}
+                                                                : QJsonObject{{"op", "apply_named_profile"}, {"name", c.name}};
+                helper("nvcurve-root-helper", req, [done, c](bool ok, const QString &m) {
+                    done(ok, ok ? (c.kind == Choice::Reset ? QStringLiteral("reset") : "'" + c.name + "'") : m);
+                });
             });
         });
     }

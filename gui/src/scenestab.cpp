@@ -213,13 +213,28 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
                       "A charger that stays connected under heavy load counts as AC even if the battery dips.");
     onAc_ = new QComboBox;
     onBattery_ = new QComboBox;
-    ag->addWidget(auto_, 0, 0, 1, 4);
+    ag->addWidget(auto_, 0, 0, 1, 3);
     ag->addWidget(muted("On AC"), 1, 0);
     ag->addWidget(onAc_, 1, 1);
     ag->addWidget(muted("On battery"), 1, 2);
     ag->addWidget(onBattery_, 1, 3);
     power_ = muted(QString());
     ag->addWidget(power_, 2, 0, 1, 4);
+    pause_ = new QPushButton;
+    pause_->setCheckable(true);
+    pause_->setToolTip("Pause every automatic scene change (power source, login, game scene). Apply still works.");
+    ag->addWidget(pause_, 0, 3, Qt::AlignRight);
+    auto syncPause = [this](bool on) {
+        const QSignalBlocker b(pause_);
+        pause_->setChecked(on);
+        pause_->setText(on ? QStringLiteral("▶ Resume scenes") : QStringLiteral("⏸ Pause scenes"));
+    };
+    syncPause(eng_->paused());
+    connect(eng_, &SceneEngine::pausedChanged, this, syncPause);
+    connect(pause_, &QPushButton::toggled, this, [this, syncPause](bool on) {
+        QString err;
+        if (!eng_->setPaused(on, &err)) { syncPause(!on); setStatus("Could not save the pause setting: " + err, theme::DANGER); }
+    });
     right->addWidget(autoBox);
 
     status_ = new QLabel;
@@ -499,7 +514,10 @@ void ScenesTab::reloadAuto() {
 }
 
 void ScenesTab::storeAuto() {
-    scenes::Auto a{auto_->isChecked(), onAc_->currentData().toString(), onBattery_->currentData().toString()};
+    scenes::Auto a = eng_->autoConfig();  // keeps the pause state
+    a.enabled = auto_->isChecked();
+    a.onAc = onAc_->currentData().toString();
+    a.onBattery = onBattery_->currentData().toString();
     QString err;
     if (!eng_->setAuto(a, &err)) { setStatus("Could not save the automatic switching setting: " + err, theme::DANGER); return; }
     if (a.enabled && a.onAc.isEmpty() && a.onBattery.isEmpty()) setStatus("Pick a scene for AC and/or battery.", theme::WARN);

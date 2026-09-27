@@ -198,6 +198,9 @@ int main(int argc, char **argv) {
     std::vector<char *> av(argv, argv + argc);
     char window[] = "--window";
     if (!args.contains(QStringLiteral("--window"))) av.push_back(window);
+    // Tells the new process this is a theme restart, not a login: no startup scene.
+    char themeRestart[] = "--theme-restart";
+    if (!args.contains(QStringLiteral("--theme-restart"))) av.push_back(themeRestart);
     av.push_back(nullptr);
     ::execv("/proc/self/exe", av.data());
     std::perror("legion-power-manager: restart failed");

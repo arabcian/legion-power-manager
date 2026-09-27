@@ -1,5 +1,4 @@
 #include "ryzentab.h"
-#include <QButtonGroup>
 #include <QShowEvent>
 #include "platformprofile.h"
 #include "privileged.h"
@@ -60,34 +59,76 @@ static std::optional<QString> l3Shared(const QString &cpuDir) {
     return std::nullopt;
 }
 
+QList<int> ryzen::parkedCpus() {
+    // Written by tune-helper (root) when it parks a CCD; valid while all its CPUs are offline.
+    QFile f(QStringLiteral("/run/legion-power-manager/tune/ccd-park.json"));
+    if (!f.open(QIODevice::ReadOnly) || f.size() > 4096) return {};
+    QList<int> cpus;
+    for (const auto &v : QJsonDocument::fromJson(f.readAll()).object().value("cpus").toArray()) cpus << v.toInt();
+    const QList<int> online = expandCpuList(pp::readText(QStringLiteral("/sys/devices/system/cpu/online")).value_or(QString()));
+    if (cpus.isEmpty() || std::any_of(cpus.begin(), cpus.end(), [&](int c) { return online.contains(c); })) return {};
+    std::sort(cpus.begin(), cpus.end());
+    return cpus;
+}
+
 ryzen::Layout ryzen::detect() {
     Layout out;
     const QDir sys(QStringLiteral("/sys/devices/system/cpu"));
-    QSet<QString> keys;
-    for (const QString &c : sys.entryList({"cpu[0-9]*"}, QDir::Dirs))
-        if (auto s = l3Shared(sys.filePath(c))) keys.insert(*s);
+    // Online CPUs only, and L3 lists that overlap are one CCD: during hot-plug
+    // one CPU can still report "0-7,16-23" and its neighbour "0-7" for the
+    // same L3 (same merge rule as tune.rs group_l3).
+    const QList<int> online = expandCpuList(pp::readText(sys.filePath("online")).value_or(QString()));
+    auto isOnline = [&](int c) { return online.isEmpty() || online.contains(c); };
     QList<QList<int>> groups;
-    for (const QString &k : keys) {
-        QList<int> g = expandCpuList(k);
+    for (const QString &c : sys.entryList({"cpu[0-9]*"}, QDir::Dirs)) {
+        const int n = c.mid(3).toInt();
+        if (!isOnline(n)) continue;
+        const auto s = l3Shared(sys.filePath(c));
+        if (!s) continue;
+        QList<int> g;
+        for (int x : expandCpuList(*s)) if (isOnline(x) && !g.contains(x)) g << x;
+        if (!g.contains(n)) g << n;
+        for (int i = groups.size() - 1; i >= 0; --i) {
+            if (std::none_of(groups[i].begin(), groups[i].end(), [&](int x) { return g.contains(x); })) continue;
+            for (int x : groups[i]) if (!g.contains(x)) g << x;
+            groups.removeAt(i);
+        }
         std::sort(g.begin(), g.end());
-        g.erase(std::unique(g.begin(), g.end()), g.end());
-        if (!g.isEmpty()) groups << g;
+        groups << g;
     }
+    // A parked CCD has no online CPU, so sysfs no longer lists it: add it back
+    // from the park record so it keeps its slot in the grid (shown greyed out).
+    const QList<int> parked = parkedCpus();
+    if (!parked.isEmpty() && std::none_of(groups.begin(), groups.end(), [&](const QList<int> &g) {
+            return std::any_of(parked.begin(), parked.end(), [&](int c) { return g.contains(c); }); }))
+        groups << parked;
     std::sort(groups.begin(), groups.end(), [](auto &a, auto &b) { return a.first() < b.first(); });
     out.ccdCount = groups.size();
     for (int ccd = 0; ccd < groups.size(); ++ccd) {
-        QStringList order;
-        QHash<QString, QList<int>> phys;
+        if (groups[ccd] != parked) continue;
+        // Offline CPUs have no topology/: pair thread i with i + n/2 when the die has SMT.
+        out.parked.insert(ccd);
+        const int n = parked.size(), cores = n > SLOTS_PER_CCD ? n / 2 : n;
+        for (int i = 0; i < cores; ++i)
+            out.cores[ccd].append({n > SLOTS_PER_CCD ? QList<int>{parked[i], parked[i + cores]} : QList<int>{parked[i]}, std::nullopt});
+    }
+    for (int ccd = 0; ccd < groups.size(); ++ccd) {
+        if (out.parked.contains(ccd)) continue;
+        // Physical core = its online SMT siblings; offline siblings (SMT off)
+        // must not become extra "cores" and shift the slot numbering.
+        QList<QList<int>> phys;
         for (int cpu : groups[ccd]) {
+            if (std::any_of(phys.begin(), phys.end(), [&](const QList<int> &p) { return p.contains(cpu); })) continue;
             const QString t = sys.filePath(QStringLiteral("cpu%1/topology/").arg(cpu));
-            QString sib = pp::readText(t + "core_cpus_list").value_or(
-                pp::readText(t + "thread_siblings_list").value_or(QString::number(cpu)));
-            if (!phys.contains(sib)) order << sib;
-            phys[sib] << cpu;
+            QList<int> sib;
+            for (int x : expandCpuList(pp::readText(t + "core_cpus_list").value_or(
+                         pp::readText(t + "thread_siblings_list").value_or(QString::number(cpu)))))
+                if (groups[ccd].contains(x)) sib << x;
+            if (!sib.contains(cpu)) sib << cpu;
+            std::sort(sib.begin(), sib.end());
+            phys << sib;
         }
-        for (const QString &sib : order) {
-            QList<int> cpus = phys.value(sib);
-            std::sort(cpus.begin(), cpus.end());
+        for (const QList<int> &cpus : phys) {
             bool ok = false;
             int hp = pp::readText(sys.filePath(QStringLiteral("cpu%1/acpi_cppc/highest_perf").arg(cpus.first())))
                          .value_or(QString()).toInt(&ok);
@@ -112,64 +153,9 @@ static QGroupBox *box(const QString &title, const char *objName) {
 }
 
 RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) {
-    profilesReady_ = QDir().mkpath(ryzen::profilesDir());
-    buildUi();
-}
-
-static bool sameTopology(const ryzen::Layout &a, const ryzen::Layout &b) {
-    if (a.ccdCount != b.ccdCount || a.cores.keys() != b.cores.keys()) return false;
-    for (auto it = a.cores.cbegin(); it != a.cores.cend(); ++it) {
-        const auto &x = it.value(), &y = b.cores.value(it.key());
-        if (x.size() != y.size()) return false;
-        for (int i = 0; i < x.size(); ++i) if (x[i].cpus != y[i].cpus) return false;
-    }
-    return true;
-}
-
-// CCDs come and go at runtime (Optimizations parks one by taking its CPUs
-// offline; an offline CPU has no cache/ node, so its CCD is invisible to
-// detect()). Read the topology again every time the tab is opened and rebuild
-// the grid when it changed, keeping the typed offsets, profile and log.
-void RyzenTab::showEvent(QShowEvent *e) {
-    QWidget::showEvent(e);
-    refreshTopology();
-}
-
-void RyzenTab::refreshTopology() {
-    if (busy_) return;  // never tear the grid down under a running apply
-    ryzen::Layout now = ryzen::detect();
-    if (sameTopology(now, layout_)) return;
-    const int before = ccdCount_;
-    const QJsonObject state = currentState();
-    const QString profile = profileCombo_->currentText(), logText = log_->toPlainText();
-
-    for (QObject *o : findChildren<QObject *>(QString(), Qt::FindDirectChildrenOnly))
-        if (o->isWidgetType() || qobject_cast<QButtonGroup *>(o)) delete o;
-    delete layout();
-    slots_.clear(); ccdColumns_.clear(); fillEntries_.clear(); applyButtons_.clear(); activeCcds_.clear();
-
-    layout_ = std::move(now);
-    buildUi();
-
-    if (const int i = profileCombo_->findText(profile); i >= 0) profileCombo_->setCurrentIndex(i);
-    if (state.value("coall").isDouble()) coall_->setText(QString::number(state.value("coall").toInt()));
-    for (const auto &v : state.value("cores").toArray()) {
-        const QJsonObject c = v.toObject();
-        for (Slot &s : slots_) {
-            if (s.ccd != c.value("ccd").toInt() || s.slot != c.value("slot").toInt()) continue;
-            s.disable->setChecked(c.value("disabled").toBool());
-            if (c.value("coper").isDouble()) s.entry->setText(QString::number(c.value("coper").toInt()));
-        }
-    }
-    const QString fresh = log_->toPlainText();
-    log_->setPlainText(logText);
-    log(QStringLiteral("CCD topology changed (%1 → %2 CCD(s)); the per-core grid was rebuilt.").arg(before).arg(ccdCount_), "cmd");
-    for (const QString &l : fresh.split('\n', Qt::SkipEmptyParts)) log_->appendPlainText(l);
-}
-
-void RyzenTab::buildUi() {
     ccdCount_ = layout_.ccdCount ? layout_.ccdCount : CCD_FALLBACK;
     if (qEnvironmentVariableIsSet("LPM_RYZEN_CCDS")) ccdCount_ = qEnvironmentVariableIntValue("LPM_RYZEN_CCDS");  // dev only
+    profilesReady_ = QDir().mkpath(ryzen::profilesDir());
 
     QList<int> mismatch;
     for (int c = 0; c < ccdCount_; ++c)
@@ -265,7 +251,7 @@ void RyzenTab::buildUi() {
     auto *ml = new QHBoxLayout(modeBox);
     ml->setContentsMargins(0, 0, 0, 0);
     auto *rPrimary = new QRadioButton(QStringLiteral("CCD0 only (%1 slots)").arg(SLOTS_PER_CCD));
-    auto *rAll = new QRadioButton(QStringLiteral("All CCDs (%1 slots)").arg(ccdCount_ * SLOTS_PER_CCD));
+    auto *rAll = rAll_ = new QRadioButton(QStringLiteral("All CCDs (%1 slots)").arg(ccdCount_ * SLOTS_PER_CCD));
     rAll->setChecked(true);
     auto *mg = new QButtonGroup(this);
     mg->addButton(rPrimary);
@@ -314,6 +300,7 @@ void RyzenTab::buildUi() {
 
         // Row 0: title + quick fill
         auto *title = new QLabel(QStringLiteral("CCD%1").arg(ccd));
+        ccdTitles_[ccd] = title;
         title->setStyleSheet(QStringLiteral("color:%1; font-weight:700; font-size:11pt; background:transparent;").arg(accent));
         auto *fillBar = new QHBoxLayout;
         fillBar->setSpacing(6);
@@ -388,7 +375,7 @@ void RyzenTab::buildUi() {
                              "\nHigher = a better core on this die; ★ marks the two best on this CCD.\n" + cpuHint);
             g->addWidget(cppc, r, 3, Qt::AlignCenter);
 
-            slots_.append({ccd, s, e, d, id});
+            slots_.append({ccd, s, e, d, id, cppc});
         }
         // Spare width is shared evenly, so the four columns spread across the
         // card instead of bunching up on the left.
@@ -423,6 +410,7 @@ void RyzenTab::buildUi() {
 
     reloadProfiles();
     for (int c = 0; c < ccdCount_; ++c) activeCcds_.insert(c);
+    updateParked();
 
     log(QStringLiteral("%1 CCD(s), %2 fixed SMU slots each (%3 total).").arg(ccdCount_).arg(SLOTS_PER_CCD).arg(ccdCount_ * SLOTS_PER_CCD));
     if (!layout_.ccdCount) log(QStringLiteral("CCD topology could not be read from sysfs — assuming %1 CCDs. Verify before applying.").arg(CCD_FALLBACK), "err");
@@ -517,8 +505,10 @@ void RyzenTab::applyReset() { runOp("reset", {}); }
 bool RyzenTab::applyPerCore(std::function<void()> then) {
     QJsonArray entries;
     QStringList problems;
-    int skipped = 0;
+    int skipped = 0, parkedSkipped = 0;
+    updateParked();
     for (Slot *s : activeSlots()) {
+        if (parkedNow_.contains(s->ccd)) { parkedSkipped += parse(*s).first == Parse::Ok; continue; }
         const auto [st, v] = parse(*s);
         const QString label = QStringLiteral("CCD%1/S%2").arg(s->ccd).arg(s->slot);
         switch (st) {
@@ -535,6 +525,7 @@ bool RyzenTab::applyPerCore(std::function<void()> then) {
         return false;
     }
     if (entries.isEmpty()) { QMessageBox::information(this, "No Input", "No per-core values have been entered."); return false; }
+    if (parkedSkipped) log(QStringLiteral("Skipping %1 slot(s) on the parked CCD (kept in the profile).").arg(parkedSkipped), "cmd");
     if (skipped) log(QStringLiteral("Skipping %1 disabled slot(s).").arg(skipped));
     runOp("set_coper_batch", {{"entries", entries}}, std::move(then));
     return true;
@@ -604,8 +595,16 @@ void RyzenTab::saveProfile() {
     if (QFile::exists(path) && QMessageBox::question(this, "Overwrite Profile", "Profile '" + name + "' already exists. Overwrite?",
                                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
         return;
+    QJsonObject state = currentState();
+    if (QFile old(path); old.open(QIODevice::ReadOnly) && old.size() <= 256 * 1024) {
+        // A parked CCD is not in the grid: overwriting must not drop its offsets.
+        QJsonArray cores = state.value("cores").toArray();
+        for (const auto &v : QJsonDocument::fromJson(old.readAll()).object().value("cores").toArray())
+            if (v.toObject().value("ccd").toInt() >= ccdCount_) cores.append(v);
+        state["cores"] = cores;
+    }
     QSaveFile f(path);
-    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(currentState()).toJson()) < 0 || !f.commit()) {
+    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(state).toJson()) < 0 || !f.commit()) {
         QMessageBox::critical(this, "Save Error", f.errorString());
         return;
     }
@@ -638,6 +637,9 @@ bool RyzenTab::loadProfile() {
         hit->disable->setChecked(dis);
         if (!dis && c.value("coper").isDouble()) hit->entry->setText(QString::number(c.value("coper").toInt()));
     }
+    bool hidden = false;
+    for (const Slot &s : slots_) hidden |= !activeCcds_.contains(s.ccd) && (s.disable->isChecked() || !s.entry->text().isEmpty());
+    if (hidden) rAll_->setChecked(true);  // same set Scenes / lpm-gamemode apply
     log("Profile loaded: " + name);
     if (missing) log(QStringLiteral("%1 slot(s) in the profile do not exist on this topology (%2 CCD(s)) and were ignored.")
                          .arg(missing).arg(ccdCount_), "err");
@@ -655,7 +657,6 @@ void RyzenTab::deleteProfile() {
 }
 
 bool RyzenTab::applyNamedProfile(const QString &name) {
-    refreshTopology();  // the tray can apply while the tab is hidden: use today's CCDs
     if (busy_) { log("Previous operation still running, please wait.", "err"); return false; }
     const int i = profileCombo_->findText(name);
     if (i < 0) { reloadProfiles(); QMessageBox::warning(this, "No Profile", "Profile '" + name + "' no longer exists."); return false; }
@@ -672,4 +673,39 @@ bool RyzenTab::applyNamedProfile(const QString &name) {
     if (anyCore) return applyPerCore();
     log("Profile '" + name + "' contains no offsets to apply.", "err");
     return false;
+}
+
+// ── parked CCD (Optimizations → Park a CCD) ─────────────────────────────────
+
+void RyzenTab::showEvent(QShowEvent *e) {
+    QWidget::showEvent(e);
+    updateParked();
+}
+
+void RyzenTab::updateParked() {
+    const QList<int> parked = ryzen::parkedCpus();
+    parkedNow_.clear();
+    for (int ccd = 0; ccd < ccdCount_; ++ccd) {
+        QList<int> cpus;
+        for (const auto &pc : layout_.cores.value(ccd)) cpus << pc.cpus;
+        const bool isParked = !parked.isEmpty() && !cpus.isEmpty()
+                              && std::all_of(cpus.begin(), cpus.end(), [&](int c) { return parked.contains(c); });
+        if (isParked) parkedNow_.insert(ccd);
+        if (QWidget *card = ccdColumns_.value(ccd)) {
+            card->setEnabled(!isParked);
+            card->setToolTip(isParked ? QStringLiteral("CCD%1 is parked (offline) by Optimizations. Its offsets are kept in the "
+                                                       "profile but not sent until it is back online.").arg(ccd) : QString());
+        }
+        if (QLabel *t = ccdTitles_.value(ccd))
+            t->setText(isParked ? QStringLiteral("CCD%1  · parked").arg(ccd) : QStringLiteral("CCD%1").arg(ccd));
+        const auto cores = layout_.cores.value(ccd);
+        for (const Slot &s : std::as_const(slots_)) {
+            if (s.ccd != ccd) continue;
+            if (isParked) { s.cppc->setText(QStringLiteral("–")); continue; }
+            // Back online after being parked when the tab was built: read the live value.
+            if (s.cppc->text() == QStringLiteral("–") && s.slot < cores.size())
+                if (auto v = pp::readText(QStringLiteral("/sys/devices/system/cpu/cpu%1/acpi_cppc/highest_perf").arg(cores[s.slot].cpus.first())))
+                    s.cppc->setText(v->trimmed());
+        }
+    }
 }

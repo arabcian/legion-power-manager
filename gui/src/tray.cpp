@@ -112,6 +112,11 @@ void Tray::rebuild() {
             c.enabled = on;
             eng->setAuto(c);
         });
+        QAction *pa = sm->addAction("Pause scenes");
+        pa->setCheckable(true);
+        pa->setChecked(eng->paused());
+        pa->setToolTip("No automatic scene changes (power source, login, game) until unchecked");
+        connect(pa, &QAction::toggled, this, [eng](bool on) { eng->setPaused(on); });
         sm->setEnabled(!eng->busy());
         menu_->addSeparator();
     }
