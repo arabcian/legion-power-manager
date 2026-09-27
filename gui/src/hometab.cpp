@@ -222,6 +222,22 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
         });
     });
 
+    // Scenes paused (Scenes tab): no automatic scene changes until resumed.
+    pauseBanner_ = new QFrame;
+    pauseBanner_->setObjectName("pauseBanner");
+    pauseBanner_->setStyleSheet(theme::banner(theme::WARN, QStringLiteral("#pauseBanner")));
+    auto *pb = new QHBoxLayout(pauseBanner_);
+    pb->setContentsMargins(10, 6, 8, 6);
+    auto *pt = new QLabel(QStringLiteral("<b>⏸ Scenes paused</b> — no automatic scene changes (power source, login, game) until resumed."));
+    pt->setTextFormat(Qt::RichText);
+    pt->setWordWrap(true);
+    pb->addWidget(pt, 1);
+    resumeScenes_ = new QPushButton("▶ Resume scenes");
+    resumeScenes_->setObjectName("btnAccent");
+    pb->addWidget(resumeScenes_);
+    root->addWidget(pauseBanner_);
+    pauseBanner_->hide();
+
     auto *profileBox = new QGroupBox("Power Profile");
     profileBox->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     grid_ = new QGridLayout(profileBox);
@@ -614,8 +630,6 @@ QGroupBox *HomeTab::buildDeviceBox() {
     }
 
 
-    int bannerRow = -1;
-    if (!fanHwmon_.isEmpty()) bannerRow = row++;  // banner sits above the fan rows
     if (!fanHwmon_.isEmpty()) {
         const QDir d(fanHwmon_);
         for (const QString &f : d.entryList({"fan*_target"}, QDir::Files | QDir::System, QDir::Name)) {
@@ -724,23 +738,17 @@ QGroupBox *HomeTab::buildDeviceBox() {
             });
         }
     }
-    if (bannerRow >= 0 && !fans_.isEmpty()) {
-        maxBanner_ = new QFrame;
-        maxBanner_->setObjectName("maxBanner");
-        maxBanner_->setStyleSheet(theme::banner(theme::WARN, QStringLiteral("#maxBanner")));
-        auto *bl = new QHBoxLayout(maxBanner_);
-        bl->setContentsMargins(10, 6, 8, 6);
+    if (!fans_.isEmpty()) {
+        // Max / Full Speed state lives in the button row below: a status label and
+        // a Disable button swap in for "Max all fans" (same row, no layout change).
         maxBannerText_ = new QLabel;
         maxBannerText_->setTextFormat(Qt::RichText);
-        maxBannerText_->setWordWrap(true);
+        maxBannerText_->hide();
         maxBannerBtn_ = new QPushButton("Disable max fans");
         maxBannerBtn_->setObjectName("btnAccent");
         maxBannerBtn_->setToolTip("Return every fan to Auto (the EC only resumes its curve when all targets are 0).");
         connect(maxBannerBtn_, &QPushButton::clicked, this, &HomeTab::exitMaxMode);
-        bl->addWidget(maxBannerText_, 1);
-        bl->addWidget(maxBannerBtn_);
-        maxBanner_->hide();
-        g->addWidget(maxBanner_, bannerRow, 0, 1, 5);
+        maxBannerBtn_->hide();
 
         // Entry point: one click puts every fan at max (and so into the mode above).
         maxAllBtn_ = new QPushButton("Max all fans");
@@ -758,9 +766,11 @@ QGroupBox *HomeTab::buildDeviceBox() {
         }
         auto *mh = new QHBoxLayout;
         mh->setSpacing(6);
+        mh->addWidget(maxBannerText_);
         mh->addStretch(1);
         if (curveBtn) mh->addWidget(curveBtn);
         mh->addWidget(maxAllBtn_);
+        mh->addWidget(maxBannerBtn_);
         g->addLayout(mh, row++, 0, 1, 5);
     }
     if (!fans_.isEmpty() || fullSpeed_) {
@@ -898,23 +908,21 @@ void HomeTab::applyDevice(const DeviceSnap &snap) {
         fullSpeedOn_ = suspect;
     }
     if (fullSpeed_) { QSignalBlocker b(fullSpeed_); fullSpeed_->setChecked(fs.value_or(false)); }
+    // EC Full Speed only drives the fans in Custom; elsewhere targets still work.
+    const bool ecFs = fs && *fs && currentProfile() == QStringLiteral("custom");
     if (fanWarn_) {
-        if (fs && *fs) {
-            fanWarn_->setText(QStringLiteral("<span style='color:%1'>EC Full Speed is on — fan targets are ignored until it is "
-                                             "switched off (untick it, or pick Auto).</span>").arg(theme::WARN));
-        } else if (suspect) {
+        if (suspect) {
             fanWarn_->setText(QStringLiteral("<span style='color:%1'>The fans run at maximum with no target set: the EC's Full Speed "
                 "mode is on (it survives reboots, e.g. switched on in Windows). This kernel has no interface to turn it off — "
                 "lenovo_wmi_other lacks pwm1_enable and legion_laptop is not loaded. Turn it off in Lenovo Vantage / Legion "
                 "Space, or load LenovoLegionLinux's legion_laptop module; an EC reset (power off, hold the power button "
                 "~30 s) also clears it.</span>").arg(theme::WARN));
         }
-        fanWarn_->setVisible((fs && *fs) || suspect);
+        fanWarn_->setVisible(suspect);
     }
 
     bool allMax = !fans_.isEmpty();
     for (int i = 0; i < fans_.size(); ++i) allMax &= fans_[i].max > 0 && targetOf(i) >= fans_[i].max;
-    const bool ecFs = fs && *fs;
     setMaxMode(allMax || ecFs, ecFs && !allMax);
 
     for (int i = 0; i < fans_.size(); ++i) {
@@ -925,7 +933,7 @@ void HomeTab::applyDevice(const DeviceSnap &snap) {
         if (maxMode_) { f.maxBox->setChecked(true); f.autoBox->setChecked(false); continue; }
         // Force the Max display only for a real (read) Full Speed, or an inferred one
         // the user has not overridden yet; after a click the user's choice is shown.
-        if (!f.target->hasFocus() && ((fs && *fs) || (suspect && !fanTouched_))) {
+        if (!f.target->hasFocus() && (ecFs || (suspect && !fanTouched_))) {
             // target 0 would otherwise be shown as "Auto" while the EC holds the fans at max.
             f.maxBox->setChecked(true);
             f.autoBox->setChecked(false);
@@ -955,16 +963,17 @@ void HomeTab::applyDevice(const DeviceSnap &snap) {
 
 void HomeTab::setMaxMode(bool on, bool ecFullSpeed) {
     maxMode_ = on;
-    if (!maxBanner_) return;
-    maxBanner_->setVisible(on);
+    if (!maxBannerBtn_) return;
+    maxBannerText_->setVisible(on);
+    maxBannerBtn_->setVisible(on);
     if (maxAllBtn_) maxAllBtn_->setVisible(!on);
     if (on) {
         maxBannerText_->setText(ecFullSpeed
-            ? QStringLiteral("<b>EC Full Speed is on</b> — all fans run at maximum. Fan controls are locked.")
-            : QStringLiteral("<b>Max fans</b> — every fan runs at its maximum. Fan controls are locked."));
+            ? QStringLiteral("<span style='color:%1'><b>EC Full Speed on</b> — all fans at maximum</span>").arg(theme::WARN)
+            : QStringLiteral("<span style='color:%1'><b>Max fans on</b> — all fans at maximum</span>").arg(theme::WARN));
         maxBannerBtn_->setText(ecFullSpeed ? "Disable full speed" : "Disable max fans");
     }
-    // Grey out every per-fan control (the RPM readout stays live).
+    // The banner stands in for every per-fan control (the RPM readout stays live).
     for (const FanRow &f : std::as_const(fans_)) {
         f.autoBox->setEnabled(!on);
         f.maxBox->setEnabled(!on);
@@ -1145,7 +1154,7 @@ void HomeTab::refreshSelection() {
     const auto current = pp::currentProfile(handler_);
     if (!current) return;
     if (QPushButton *b = buttons_.value(*current)) {
-        if (!b->isChecked()) { b->setChecked(true); updateDescription(current); }
+        if (!b->isChecked()) { b->setChecked(true); updateDescription(current); if (!fans_.isEmpty()) refreshDevice(); }
     } else {
         rebuild();  // a hidden mode became active (hotkey) — give it a button
     }
@@ -1205,6 +1214,16 @@ void HomeTab::showEvent(QShowEvent *e) {
 void HomeTab::hideEvent(QHideEvent *e) {
     QWidget::hideEvent(e);
     live_->stop();
+}
+
+void HomeTab::setSceneEngine(SceneEngine *eng) {
+    if (!eng || !pauseBanner_) return;
+    pauseBanner_->setVisible(eng->paused());
+    connect(eng, &SceneEngine::pausedChanged, pauseBanner_, &QWidget::setVisible);
+    connect(resumeScenes_, &QPushButton::clicked, this, [this, eng] {
+        QString err;
+        if (!eng->setPaused(false, &err)) showStatus("Could not resume scenes: " + err, 8000);
+    });
 }
 
 void HomeTab::refreshGuard() {

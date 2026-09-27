@@ -74,6 +74,7 @@ private:
 
     static bool validFor(const Row &r, const QString &v);
     QString editorValue(const Row &r) const;
+    QString canonicalCcd(const QString &v) const;
     bool setEditorValue(Row &r, const QString &v);
     bool differs(const Row &r) const;
     void markRow(Row &r);

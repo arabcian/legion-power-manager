@@ -98,6 +98,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     }
 
     scenes_ = new SceneEngine(this);
+    home_->setSceneEngine(scenes_);
     tabs_->insertTab(scenesAt, new ScenesTab(this), "Scenes");
 }
 

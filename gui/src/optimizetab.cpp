@@ -623,21 +623,17 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
 
     // Affinity choices follow the live topology.
     if (affinity_ && (topoChanged || affinity_->count() == 0) && !affinity_->view()->isVisible()) {
-        const QString keep = affinity_->currentData().toString();
+        const QString keep = canonicalCcd(affinity_->currentData().toString());
         const QSignalBlocker b(affinity_);
         affinity_->clear();
         affinity_->addItem("none (scheduler decides)", "none");
         const QJsonArray ccds = topology_.value("ccds").toArray();
-        auto ccdText = [&](int i) {
-            for (const auto &c : ccds) if (c.toObject().value("index").toInt() == i)
-                return QStringLiteral("CCD%1: %2").arg(i).arg(c.toObject().value("cpus").toString());
-            return QStringLiteral("CCD%1").arg(i);
-        };
-        if (!topology_.value("cache_ccd").isNull()) affinity_->addItem("V-Cache CCD (" + ccdText(topology_.value("cache_ccd").toInt()) + ")", "cache");
-        if (!topology_.value("frequency_ccd").isNull()) affinity_->addItem("frequency CCD (" + ccdText(topology_.value("frequency_ccd").toInt()) + ")", "frequency");
+        // One entry per CCD, named by its role (no separate cache/frequency aliases).
+        const int cacheCcd = topology_.value("cache_ccd").toInt(-1), freqCcd = topology_.value("frequency_ccd").toInt(-1);
         if (ccds.size() > 1) for (const auto &c : ccds) {
             const int i = c.toObject().value("index").toInt();
-            affinity_->addItem(ccdText(i), QStringLiteral("ccd%1").arg(i));
+            const QString role = i == cacheCcd ? QStringLiteral(" V-Cache") : i == freqCcd ? QStringLiteral(" frequency") : QString();
+            affinity_->addItem(QStringLiteral("CCD%1%2 (%3)").arg(i).arg(role, c.toObject().value("cpus").toString()), QStringLiteral("ccd%1").arg(i));
         }
         if (const QJsonObject h = topology_.value("hybrid").toObject(); !h.isEmpty()) {
             affinity_->addItem("P-cores (" + h.value("pcores").toString() + ")", "pcore");
@@ -722,7 +718,7 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
         auto *grid = new QGridLayout(page);
         grid->setContentsMargins(8, 8, 8, 8);
         grid->setHorizontalSpacing(12);
-        grid->setVerticalSpacing(4);
+        grid->setVerticalSpacing(0);
         const char *heads[] = {"", "Setting", "Live value", "New value", ""};
         for (int c = 0; c < 5; ++c) {
             auto *h = new QLabel(QString::fromLatin1(heads[c]));
@@ -795,6 +791,17 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
             editor->setMaximumWidth(340);
             grid->addWidget(editor, line, 3);
             grid->addWidget(r.revert, line, 4);
+            // Zebra stripe behind every other row, so a setting and its editor
+            // across the wide gap read as one line. Layout itself is unchanged.
+            if (line % 2 == 0) {
+                auto *stripe = new QWidget;
+                stripe->setAttribute(Qt::WA_StyledBackground);
+                stripe->setStyleSheet(QStringLiteral("background: rgba(127,127,127,0.09); border-radius: 4px;"));
+                stripe->setAttribute(Qt::WA_TransparentForMouseEvents);
+                grid->addWidget(stripe, line, 0, 1, 5);
+                stripe->lower();
+            }
+            grid->setRowMinimumHeight(line, editor->sizeHint().height() + 6);  // keeps the old 4px spacing
             ++line;
             updateRow(r, rows[i].toObject());
             if (r.available) ++available;
@@ -906,7 +913,17 @@ QString OptimizeTab::editorValue(const Row &r) const {
     return {};
 }
 
-bool OptimizeTab::setEditorValue(Row &r, const QString &v) {
+/// Legacy "cache"/"frequency" (older presets, built-ins) → the CCD they are here.
+QString OptimizeTab::canonicalCcd(const QString &v) const {
+    if (v == QLatin1String("cache") || v == QLatin1String("frequency")) {
+        const int i = topology_.value(v == QLatin1String("cache") ? "cache_ccd" : "frequency_ccd").toInt(-1);
+        if (i >= 0) return QStringLiteral("ccd%1").arg(i);
+    }
+    return v;
+}
+
+bool OptimizeTab::setEditorValue(Row &r, const QString &v0) {
+    const QString v = r.combo ? canonicalCcd(v0) : v0;
     if (r.spin) {
         bool ok = false;
         const qint64 n = v.toLongLong(&ok);
@@ -1058,7 +1075,7 @@ int OptimizeTab::loadPresetObject(const QJsonObject &p, QStringList *skipped) {
     }
     for (auto it = values.begin(); it != values.end(); ++it) {
         Row *r = row(it.key());
-        const QString v = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
+        const QString v = canonicalCcd(it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong()));
         if (!r || !validFor(*r, v) || !setEditorValue(*r, v)) { if (skipped) *skipped << it.key(); continue; }
         r->touched = true;
         const QSignalBlocker b(r->include);
@@ -1070,7 +1087,7 @@ int OptimizeTab::loadPresetObject(const QJsonObject &p, QStringList *skipped) {
     if (nice_ && !run.isEmpty()) {
         nice_->setValue(std::clamp(run.value("nice").toInt(0), -20, 0));
         autogroup_->setChecked(run.value("autogroup").toBool(true));
-        const int i = affinity_->findData(run.value("affinity").toString("none"));
+        const int i = affinity_->findData(canonicalCcd(run.value("affinity").toString("none")));
         affinity_->setCurrentIndex(i < 0 ? 0 : i);
     }
     return n;
@@ -1224,8 +1241,8 @@ bool OptimizeTab::applyNamedPreset(const QString &name) {
     for (auto it = all.begin(); it != all.end(); ++it) {
         const Row *r = nullptr;
         for (const Row &x : rows_) if (x.key == it.key()) r = &x;
-        const QString v = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
-        if (r && validFor(*r, v)) values[it.key()] = *it;
+        const QString v = canonicalCcd(it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong()));
+        if (r && validFor(*r, v)) values[it.key()] = v;
     }
     if (values.isEmpty()) return false;
     loadPresetObject(p, nullptr);
