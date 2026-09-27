@@ -154,6 +154,20 @@ fn smn_read(addr: u32) -> Result<u32, String> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// The SMN node exists only once ryzen_smu's PCI driver has probed, which can
+/// trail the module load (async probe, a fresh modprobe, resume rebind). The
+/// old single exists() check reported "not loaded" in that window.
+fn smn_ready() -> bool {
+    if Path::new(SMN).exists() { return true; }
+    modprobe("ryzen_smu");
+    if !Path::new("/sys/module/ryzen_smu").exists() { return false; }
+    for _ in 0..30 {
+        if Path::new(SMN).exists() { return true; }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
 fn amd_family() -> Option<u32> {
     let info = crate::cpuinfo_head();
     if !info.lines().any(|l| l.starts_with("vendor_id") && l.contains("AuthenticAMD")) { return None; }
@@ -189,8 +203,13 @@ pub fn read_umc() -> Result<Value, String> {
         Some(f) => return Err(format!("CPU family {f:#x}: UMC map only verified for AM5-generation (Zen 4/5)")),
         None => return Err("not an AMD CPU: live timings are read from the AMD memory controller".into()),
     }
-    if !Path::new(SMN).exists() { modprobe("ryzen_smu"); }
-    if !Path::new(SMN).exists() { return Err("ryzen_smu not loaded (needed for live timings)".into()); }
+    if !smn_ready() {
+        return Err(if Path::new("/sys/module/ryzen_smu").exists() {
+            format!("ryzen_smu is loaded but {SMN} did not appear (driver not bound to the CPU's PCI root yet)")
+        } else {
+            "ryzen_smu not loaded (needed for live timings)".into()
+        });
+    }
     let ch0 = decode_umc(&|off| smn_read(UMC0 + off))?;
     // Second channel: report whether it runs the same timings.
     let ch1 = decode_umc(&|off| smn_read(UMC0 + UMC_STRIDE + off)).ok();

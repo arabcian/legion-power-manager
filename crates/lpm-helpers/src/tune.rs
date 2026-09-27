@@ -753,15 +753,16 @@ pub fn resolve_ccd(groups: &[Ccx], role: &str) -> Option<Ccx> {
 
 fn role_options(groups: &[Ccx], park: bool) -> Vec<(String, String)> {
     let usable = |g: &Ccx| !park || !g.cpus.contains(&0);
+    // One entry per CCD, named by its role. The old separate "cache" /
+    // "frequency" entries duplicated these and re-resolved the role at every
+    // apply / read-back; the CCD index is stable, so it is the value now
+    // ("cache"/"frequency" are still accepted and mapped, see canonical_ccd).
     let mut v = Vec::new();
-    for (role, what) in [("cache", "V-Cache CCD"), ("frequency", "frequency CCD")] {
-        if let Some(g) = resolve_ccd(groups, role).filter(|g| usable(g)) {
-            v.push((role.to_owned(), format!("{what} (CCD{}: {})", g.index, fmt_cpu_list(&g.cpus))));
-        }
-    }
     if groups.len() >= 2 {
+        let (cache, freq) = (resolve_ccd(groups, "cache").map(|g| g.index), resolve_ccd(groups, "frequency").map(|g| g.index));
         for g in groups.iter().filter(|g| usable(g)) {
-            v.push((format!("ccd{}", g.index), format!("CCD{} ({}, {} MB L3)", g.index, fmt_cpu_list(&g.cpus), g.l3_kib / 1024)));
+            let role = if Some(g.index) == cache { " V-Cache" } else if Some(g.index) == freq { " frequency" } else { "" };
+            v.push((format!("ccd{}", g.index), format!("CCD{}{role} ({}, {} MB L3)", g.index, fmt_cpu_list(&g.cpus), g.l3_kib / 1024)));
         }
     }
     for (role, what, ct) in [("pcore", "P-cores", CoreType::P), ("ecore", "E-cores", CoreType::E)] {
@@ -819,9 +820,21 @@ fn possible_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("possible")).ma
 fn present_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("present")).map(|s| cpu_list(&s)).unwrap_or_default() }
 fn online_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("online")).map(|s| cpu_list(&s)).unwrap_or_default() }
 
+/// Legacy role names ("cache"/"frequency", older presets and park records)
+/// mapped onto the CCD index they resolve to here; anything else unchanged.
+pub fn canonical_ccd(v: &str) -> String {
+    if v == "cache" || v == "frequency" {
+        if let Some(g) = resolve_ccd(&ccx_groups(), v) { return format!("ccd{}", g.index); }
+    }
+    v.to_owned()
+}
+
 /// Which role option describes this CPU set, if any.
 fn role_matching(groups: &[Ccx], set: &[usize]) -> Option<String> {
-    for role in ["cache", "frequency", "pcore", "ecore"] {
+    if groups.len() >= 2 {
+        if let Some(g) = groups.iter().find(|g| g.cpus == set) { return Some(format!("ccd{}", g.index)); }
+    }
+    for role in ["pcore", "ecore"] {
         if resolve_ccd(groups, role).map_or(false, |g| g.cpus == set) { return Some(role.into()); }
     }
     groups.iter().find(|g| g.cpus == set).map(|g| format!("ccd{}", g.index))
@@ -1312,6 +1325,7 @@ pub fn options(t: &Tunable) -> Vec<(String, String)> {
             v.extend(role_options(&ccx_groups(), true).into_iter().map(|(k, l)| (k, format!("park {l}"))));
             // The parked CCD is invisible to ccx_groups(): keep its option.
             if let Some((role, label, _)) = parked_record() {
+                let role = canonical_ccd(&role);
                 if !v.iter().any(|(k, _)| *k == role) { v.push((role, label)); }
             }
             v
@@ -1394,7 +1408,7 @@ fn current_with(t: &Tunable, fs: Vec<PathBuf>) -> Option<String> {
             return Some(seen.unwrap_or_else(|| "all".into()));
         }
         Target::CcdPark => {
-            if let Some((role, _, _)) = parked_record() { return Some(role); }
+            if let Some((role, _, _)) = parked_record() { return Some(canonical_ccd(&role)); }
             let online = online_cpus();
             let off: Vec<usize> = present_cpus().into_iter().filter(|c| !online.contains(c)).collect();
             if !off.is_empty() && hybrid().map_or(false, |h| h.ecores == off) { return Some("ecore".into()); }
@@ -1450,6 +1464,7 @@ pub fn validate(t: &Tunable, v: &Value) -> Result<String, String> {
         }
         Kind::Bool => bool_norm(&s).map(str::to_owned).ok_or_else(|| format!("'{s}' is not 0/1")),
         Kind::Choice => {
+            let s = if matches!(t.target, Target::WqCpumask | Target::Irq | Target::CcdPark) { canonical_ccd(&s) } else { s };
             let opts = options(t);
             if opts.iter().any(|(v, _)| *v == s) { Ok(s) } else {
                 Err(format!("'{s}' is not offered here ({})", opts.iter().map(|o| o.0.as_str()).collect::<Vec<_>>().join(", ")))
@@ -1817,8 +1832,8 @@ mod tests {
         sym[1].l3_kib = sym[0].l3_kib;
         assert!(resolve_ccd(&sym, "cache").is_none() && resolve_ccd(&sym, "frequency").is_none());
         // Parking never offers cpu0's CCD.
-        assert!(role_options(&g, true).iter().all(|(k, _)| k != "cache" && k != "ccd0"));
-        assert_eq!(role_matching(&g, &(8..16).chain(24..32).collect::<Vec<_>>()).as_deref(), Some("frequency"));
+        assert!(role_options(&g, true).iter().all(|(k, _)| k != "ccd0"));
+        assert_eq!(role_matching(&g, &(8..16).chain(24..32).collect::<Vec<_>>()).as_deref(), Some("ccd1"));
         assert_eq!(role_matching(&g, &[0, 1]), None);
     }
     #[test]
