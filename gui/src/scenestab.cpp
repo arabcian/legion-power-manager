@@ -155,7 +155,10 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     }
     gpu_ = new QComboBox(this);
     gpu_->hide();
-    if (win_->nvidia()) addRow("GPU curve (NVIDIA)", gpu_, "A profile saved in the NVIDIA tab. Reset clears the curve offsets.");
+    if (win_->nvidia()) {
+        addRow("GPU curve (NVIDIA)", gpu_, "A profile saved in the NVIDIA tab. Reset clears the curve offsets.");
+        gpu_->show();  // hidden above for the no-NVIDIA case; a layout does not un-hide it
+    }
     tuning_ = new QComboBox;
     addRow("Optimizations", tuning_,
            "An Optimizations preset. Switching presets restores every knob the new one does not set, "
