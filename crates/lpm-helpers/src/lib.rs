@@ -23,6 +23,7 @@ pub mod legion_wmi;
 pub mod lighting;
 pub mod machine;
 pub mod nvreg;
+pub mod tools;
 pub mod tune;
 
 /// The first processor block of /proc/cpuinfo (vendor, family, model, name are

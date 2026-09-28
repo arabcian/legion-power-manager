@@ -562,6 +562,7 @@ fn run() -> Value {
         "restore" | "restore_keys" => op_restore(&req),
         "boost" => op_boost(&req),
         "isolate_join" => op_isolate_join(&req),
+        "tool" => lpm_helpers::tools::run(req["tool"].as_str().unwrap_or("")),
         "nvreg_set" => match req["values"].as_object() {
             Some(v) => match lpm_helpers::nvreg::set(v) {
                 Ok(n) => json!({"ok": true, "written": n, "file": lpm_helpers::nvreg::LPM_FILE}),
