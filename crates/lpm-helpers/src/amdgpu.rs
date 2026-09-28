@@ -411,8 +411,9 @@ pub fn apply(card: &Card, s: &Map<String, Value>) -> Result<Vec<String>, String>
     let fan = match s.get("fan").and_then(Value::as_object) { Some(f) => fan_commands(card, f)?, None => Vec::new() };
 
     // ── everything validated: write ──
-    let mut done = Vec::new();
     let od_present = !od_text.trim_matches(|c: char| c == '\0' || c.is_whitespace()).is_empty();
+    let res = (|| -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
     if has_level && (od_present || profile_write.is_some()) {
         put(card, "power_dpm_force_performance_level", "manual")?;
     }
@@ -447,6 +448,13 @@ pub fn apply(card: &Card, s: &Map<String, Value>) -> Result<Vec<String>, String>
         done.push(format!("performance level {want}"));
     }
     Ok(done)
+    })();
+    if res.is_err() {
+        // A failed write must not leave a half-applied overdrive/manual state behind.
+        if od_present { od_reset(card); }
+        if has_level { let _ = put(card, "power_dpm_force_performance_level", "auto"); }
+    }
+    res
 }
 
 pub fn reset(card: &Card) -> Vec<String> {

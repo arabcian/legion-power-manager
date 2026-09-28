@@ -514,6 +514,8 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
         let r = (|| {
             if use_wmae(f) {
                 if !acpi_available() { return Err("acpi_call not available".into()); }
+                // Preflight: the id must answer a read on this firmware before it is written.
+                wmae_get(f.id).map_err(|e| format!("{}: WMAE id not readable on this firmware ({e}); refusing to write", f.label))?;
                 wmae_set(f.id, v)?;
                 let back = wmae_get(f.id)?;
                 if back != v { return Err(format!("readback {back} ≠ {v}")); }
@@ -525,9 +527,11 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
                 Ok(format!("{} = {} {}", f.label, back, f.unit))
             }
         })();
-        all &= r.is_ok();
+        let failed = r.is_err();
+        all &= !failed;
         results.push(match r { Ok(m) => json!({"what": key, "ok": true, "message": m}),
                                Err(m) => json!({"what": key, "ok": false, "message": m}) });
+        if failed { break; }  // never keep writing EC limits after one failed
     }
     json!({"ok": all, "results": results, "custom": in_custom(),
            "note": if in_custom() { Value::Null } else { json!("Not in the Custom platform profile — the firmware overwrites these on the next profile change.") }})

@@ -276,6 +276,11 @@ pub struct Msr { f: File }
 impl Msr {
     /// /dev/cpu/0/msr, loading the msr module first if needed.
     pub fn open(write: bool) -> io::Result<Msr> {
+        // Single entry point of every MSR user (mailbox, monitor, daemon, CLI): the 0x150
+        // mailbox and the other addresses are Intel-only, never touch them on AMD.
+        if !crate::cpuinfo_head().lines().any(|l| l.starts_with("vendor_id") && l.contains("GenuineIntel")) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "not an Intel CPU: MSR access refused"));
+        }
         let dev = Path::new("/dev/cpu/0/msr");
         if !dev.exists() { let _ = modprobe_msr(); }
         let f = OpenOptions::new().read(true).write(write)
