@@ -44,6 +44,7 @@ private:
     QListWidget *list_;
     QGroupBox *editor_;
     QComboBox *profile_, *cpu_ = nullptr, *gpu_, *tuning_;
+    QComboBox *fan_ = nullptr;
     QComboBox *lightProfile_ = nullptr, *lightBright_ = nullptr;  // only with a Spectrum keyboard
     QLabel *fwLabel_;
     QPushButton *fwCapture_, *fwClear_;

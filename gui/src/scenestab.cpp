@@ -1,4 +1,5 @@
 #include "scenestab.h"
+#include "privileged.h"
 #include "lighting.h"
 #include "bundle.h"
 #include "fwattrtab.h"
@@ -147,6 +148,11 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     g->addWidget(fwLabel_, row, 1);
     g->addWidget(fwCapture_, row, 2);
     g->addWidget(fwClear_, row++, 3);
+    fan_ = new QComboBox;
+    fan_->addItem("Unchanged", -1);
+    fan_->addItem("Auto (EC fan curve)", 0);
+    fan_->addItem("Turbo (EC full speed)", 1);
+    addRow("Fan boost", fan_, "EC Full Speed flag (the Turbo fan switch). Applied after the power profile; Capture current reads it too.");
 
     if (win_->ryzen() || win_->intel()) {
         cpu_ = new QComboBox;
@@ -254,7 +260,7 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     connect(apply_, &QPushButton::clicked, this, &ScenesTab::applyCurrent);
     connect(fwCapture_, &QPushButton::clicked, this, &ScenesTab::captureFirmware);
     connect(fwClear_, &QPushButton::clicked, this, [this] { firmware_.clear(); updateFirmwareLabel(); updateDirty(); });
-    for (QComboBox *c : {profile_, cpu_, gpu_, tuning_, lightProfile_, lightBright_})
+    for (QComboBox *c : {profile_, cpu_, gpu_, tuning_, lightProfile_, lightBright_, fan_})
         if (c) connect(c, &QComboBox::currentIndexChanged, this, [this] { if (!filling_) updateDirty(); });
     connect(command_, &QLineEdit::textChanged, this, [this] { if (!filling_) updateDirty(); });
     connect(auto_, &QCheckBox::toggled, this, [this] { if (!filling_) storeAuto(); });
@@ -323,6 +329,7 @@ void ScenesTab::setEditor(const Scene &s) {
         lightProfile_->setCurrentIndex(std::max(0, lightProfile_->findData(s.lightProfile)));
         lightBright_->setCurrentIndex(std::max(0, lightBright_->findData(s.lightBrightness)));
     }
+    fan_->setCurrentIndex(std::max(0, fan_->findData(s.fanFullSpeed)));
     command_->setText(s.command);
     firmware_ = s.firmware;
     editor_->setTitle(s.name.isEmpty() ? QStringLiteral("Scene") : s.name);
@@ -347,6 +354,7 @@ Scene ScenesTab::fromEditor() const {
         s.lightProfile = loaded_.lightProfile;
         s.lightBrightness = loaded_.lightBrightness;
     }
+    s.fanFullSpeed = fan_->currentData().toInt();
     s.command = command_->text().trimmed();
     return s;
 }
@@ -438,6 +446,14 @@ void ScenesTab::captureFirmware() {
     updateFirmwareLabel();
     updateDirty();
     setStatus(note, theme::OK);
+    // The EC fan boost state belongs to the same custom-mode snapshot.
+    privileged::run(privileged::helperPath("legion-profile-helper"), QJsonObject{{"fan_fullspeed", "get"}}, this,
+                    [this, note](const privileged::Result &r) {
+                        if (!r.ok()) return;
+                        fan_->setCurrentIndex(std::max(0, fan_->findData(r.json.value("on").toBool() ? 1 : 0)));
+                        updateDirty();
+                        setStatus(note + QStringLiteral(" Fan boost: %1.").arg(r.json.value("on").toBool() ? "turbo" : "auto"), theme::OK);
+                    });
 }
 
 bool ScenesTab::saveCurrent() {

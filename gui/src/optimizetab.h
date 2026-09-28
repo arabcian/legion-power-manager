@@ -93,6 +93,11 @@ private:
     void setBoot();
     void clearBoot();
 
+    // Autotune: tune-helper {"op":"autotune"} profiles the hardware and
+    // returns a preset for the chosen base (see lpm_helpers::autotune).
+    void runAutotune();
+    void showAutotuneReport(const QJsonObject &d, const QStringList &notLoaded);
+
     void applySelected();
     void applyValues(const QJsonObject &values, const QString &preset);
     void revertRow(const QString &key);
@@ -106,7 +111,9 @@ private:
 
     QLabel *banner_ = nullptr, *bannerDetail_ = nullptr, *status_ = nullptr, *bootLabel_ = nullptr;
     QPushButton *restoreBtn_ = nullptr, *applyBtn_ = nullptr, *gameBtn_ = nullptr, *bootBtn_ = nullptr, *bootClear_ = nullptr;
-    QComboBox *presetCombo_ = nullptr, *affinity_ = nullptr;
+    QComboBox *presetCombo_ = nullptr, *affinity_ = nullptr, *autoGoal_ = nullptr;
+    QPushButton *autoBtn_ = nullptr;
+    bool autoRunning_ = false;
     QSpinBox *nice_ = nullptr;
     QCheckBox *autogroup_ = nullptr, *uvCpu_ = nullptr, *uvGpu_ = nullptr;
     QLabel *uvInfo_ = nullptr;

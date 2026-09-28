@@ -40,6 +40,7 @@ struct Scene {
     Choice cpu, gpu, tuning;       // tuning Reset = restore originals
     int lightProfile = -1;         // keyboard lighting profile 1-6; -1 = unchanged
     int lightBrightness = -1;      // keyboard brightness 0-9; -1 = unchanged
+    int fanFullSpeed = -1;         // EC fan boost (Full Speed): 1 on, 0 auto; -1 = unchanged
     QString command;               // optional; run as the user, no shell
     bool operator==(const Scene &) const = default;
 };

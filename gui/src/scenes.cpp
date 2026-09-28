@@ -103,6 +103,7 @@ std::optional<Scene> load(const QString &name) {
     const QJsonObject light = o.value("lighting").toObject();
     if (const int p = light.value("profile").toInt(-1); p >= 0 && p <= 6) s.lightProfile = p;
     if (const int b = light.value("brightness").toInt(-1); b >= 0 && b <= 9) s.lightBrightness = b;
+    if (const QJsonValue f = o.value("fan_fullspeed"); f.isBool()) s.fanFullSpeed = f.toBool() ? 1 : 0;
     s.command = o.value("command").toString().trimmed();
     return s;
 }
@@ -129,6 +130,7 @@ bool save(const Scene &s, QString *err, const QJsonObject &tuningValues) {
         if (s.lightBrightness >= 0) light["brightness"] = s.lightBrightness;
         o["lighting"] = light;
     }
+    if (s.fanFullSpeed >= 0) o["fan_fullspeed"] = s.fanFullSpeed == 1;
     if (!s.command.isEmpty()) o["command"] = s.command;
     return writeObject(sceneFile(s.name), o, err);
 }
@@ -621,6 +623,17 @@ void SceneEngine::start(const Scene &s) {
                 if (!r.ok()) { done(false, r.message()); return; }
                 done(true, c.kind == Choice::Reset ? QStringLiteral("originals restored") : "'" + c.name + "'");
             }, 120000);
+        });
+    }
+
+    // 5b. EC fan boost (Full Speed flag) — after the platform profile, which the EC may reset it with.
+    if (s.fanFullSpeed >= 0) {
+        addStep("Fan boost", [this, on = s.fanFullSpeed == 1](Done done) {
+            privileged::run(privileged::helperPath("legion-profile-helper"),
+                            QJsonObject{{"device", "fan_fullspeed"}, {"value", on ? "1" : "0"}}, this,
+                            [done, on](const privileged::Result &r) {
+                                done(r.ok(), r.ok() ? QString(on ? "turbo (EC full speed)" : "auto") : r.message());
+                            });
         });
     }
 

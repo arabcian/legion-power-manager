@@ -13,6 +13,10 @@
 #include <QClipboard>
 #include <QAbstractItemView>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QHeaderView>
+#include <QTableWidget>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -43,9 +47,9 @@
 #include <algorithm>
 #include <climits>
 
-static constexpr int POLL_MS = 4000, DESCRIBE_TIMEOUT_MS = 8000, PKEXEC_TIMEOUT_MS = 120000;
+static constexpr int POLL_MS = 4000, DESCRIBE_TIMEOUT_MS = 8000, PKEXEC_TIMEOUT_MS = 120000, AUTOTUNE_TIMEOUT_MS = 20000;
 static constexpr qint64 MAX_PRESET_BYTES = 256 * 1024;
-static const char *GROUPS[] = {"CPU", "Memory", "Scheduler", "Storage", "Network", "Devices", "Stability"};
+static const char *GROUPS[] = {"CPU", "Memory", "Scheduler", "Storage", "Network", "Devices", "Power", "Stability"};
 static const QString GAMEMODE = QStringLiteral("/usr/bin/lpm-gamemode");
 // lpm-gamemode PRE/WRAP apply these curve profiles (exact name) when enabled.
 static const QString UNDERVOLT_PROFILE = QStringLiteral("GAMING");
@@ -324,6 +328,31 @@ void OptimizeTab::buildUi() {
     bootLabel_ = muted({});
     bootLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     pl->addWidget(bootLabel_, 1, 5, 1, 3);
+
+    // Autotune: pick a base, the helper profiles the hardware and fills the rows.
+    auto *autoRow = new QHBoxLayout;
+    autoRow->setSpacing(6);
+    auto *autoLbl = new QLabel(QStringLiteral("Autotune for"));
+    autoGoal_ = new QComboBox;
+    autoGoal_->addItem(QStringLiteral("Power saving"), QStringLiteral("powersave"));
+    autoGoal_->addItem(QStringLiteral("Gaming (latency + throughput)"), QStringLiteral("gaming"));
+    autoGoal_->addItem(QStringLiteral("Bare throughput"), QStringLiteral("throughput"));
+    autoGoal_->addItem(QStringLiteral("Optimal desktop"), QStringLiteral("desktop"));
+    autoGoal_->setCurrentIndex(3);
+    autoGoal_->setToolTip(QStringLiteral("Power saving: battery life and low heat first.\n"
+                                         "Gaming: frame-time consistency and input latency, then throughput.\n"
+                                         "Bare throughput: most work per second for builds, encodes, compute.\n"
+                                         "Optimal desktop: responsive everyday use at sensible power."));
+    autoBtn_ = new QPushButton(QStringLiteral("⚙ Autotune"));
+    autoBtn_->setToolTip(QStringLiteral("Profile this machine (CPU topology, V-Cache/hybrid, cpufreq driver, C-state latencies, RAM, swap,\n"
+                                        "storage, battery, GPUs, kernel) and check every row with the value the chosen base calls for.\n"
+                                        "Nothing is written until you press Apply checked; Save turns it into a preset."));
+    connect(autoBtn_, &QPushButton::clicked, this, &OptimizeTab::runAutotune);
+    autoRow->addWidget(autoLbl);
+    autoRow->addWidget(autoGoal_);
+    autoRow->addWidget(autoBtn_);
+    autoRow->addWidget(muted(QStringLiteral("hardware-aware preset, reviewed before anything is applied")), 1);
+    pl->addLayout(autoRow, 2, 0, 1, 8);
     root->addWidget(pbox);
 
     groups_ = new QTabWidget;
@@ -1211,6 +1240,141 @@ void OptimizeTab::clearBoot() {
           [this](const QJsonObject &) { showStatus("Boot preset cleared.", theme::OK); });
 }
 
+// ── autotune ────────────────────────────────────────────────────────────────
+
+void OptimizeTab::runAutotune() {
+    if (autoRunning_ || busy_) return;
+    if (rows_.isEmpty()) { showStatus(QStringLiteral("The tunable list is not loaded yet."), theme::WARN); return; }
+    if (!QFileInfo(helperPath()).isExecutable()) { helperMissing_ = true; updateStateBanner(); return; }
+    const QString goal = autoGoal_->currentData().toString();
+    autoRunning_ = true;
+    autoBtn_->setEnabled(false);
+    showStatus(QStringLiteral("Profiling the hardware…"), theme::MUTED, 0);
+    // Read-only op: runs unprivileged, like describe.
+    auto *p = new QProcess(this);
+    QPointer<QProcess> guard(p);
+    connect(p, &QProcess::finished, this, [this, p, goal](int, QProcess::ExitStatus) {
+        autoRunning_ = false;
+        autoBtn_->setEnabled(!busy_);
+        const QByteArray out = p->readAllStandardOutput().trimmed();
+        p->deleteLater();
+        const QJsonObject d = QJsonDocument::fromJson(out.mid(out.lastIndexOf('\n') + 1)).object();
+        if (!d.value("ok").toBool()) {
+            showStatus(QStringLiteral("Autotune failed: %1").arg(d.value("error").toString(QStringLiteral("no answer from tune-helper"))), theme::DANGER, 10000);
+            return;
+        }
+        QStringList notLoaded;
+        const int n = loadPresetObject(d.value("preset").toObject(), &notLoaded);
+        loadedPreset_ = d.value("name").toString();
+        showStatus(QStringLiteral("Autotune · %1: %2 setting(s) checked. Review, then Apply checked or Save.")
+                       .arg(d.value("goal_label").toString()).arg(n), theme::OK, 12000);
+        showAutotuneReport(d, notLoaded);
+    });
+    connect(p, &QProcess::errorOccurred, this, [this, p](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        autoRunning_ = false;
+        autoBtn_->setEnabled(!busy_);
+        showStatus(QStringLiteral("tune-helper could not be started."), theme::DANGER);
+        p->deleteLater();
+    });
+    QTimer::singleShot(AUTOTUNE_TIMEOUT_MS, p, [guard] { if (guard && guard->state() != QProcess::NotRunning) guard->kill(); });
+    p->start(helperPath(), {});
+    p->write(QJsonDocument(QJsonObject{{"op", "autotune"}, {"goal", goal}}).toJson(QJsonDocument::Compact));
+    p->closeWriteChannel();
+}
+
+void OptimizeTab::showAutotuneReport(const QJsonObject &d, const QStringList &notLoaded) {
+    const QJsonObject preset = d.value("preset").toObject();
+    const QJsonObject values = preset.value("values").toObject();
+    const QJsonObject why = d.value("rationale").toObject();
+    const QString goal = d.value("goal").toString();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Autotune — %1").arg(d.value("goal_label").toString()));
+    dlg.resize(980, 600);
+    auto *v = new QVBoxLayout(&dlg);
+    v->setSpacing(6);
+    auto *head = new QLabel(QStringLiteral("<b>Machine</b>&nbsp; %1").arg(d.value("profile_summary").toString().toHtmlEscaped()));
+    head->setWordWrap(true);
+    head->setTextFormat(Qt::RichText);
+    head->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    v->addWidget(head);
+
+    auto *table = new QTableWidget(0, 4);
+    table->setHorizontalHeaderLabels({QStringLiteral("Group"), QStringLiteral("Setting"), QStringLiteral("Value"), QStringLiteral("Why (for this machine)")});
+    table->verticalHeader()->hide();
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionMode(QAbstractItemView::NoSelection);
+    table->setWordWrap(true);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    auto add = [table](const QString &g, const QString &name, const QString &val, const QString &reason, bool changes) {
+        const int r = table->rowCount();
+        table->insertRow(r);
+        auto *a = new QTableWidgetItem(g), *b = new QTableWidgetItem(name), *c = new QTableWidgetItem(val), *e = new QTableWidgetItem(reason);
+        if (changes) { QFont f = c->font(); f.setBold(true); c->setFont(f); }
+        else c->setToolTip(QStringLiteral("Already the live value."));
+        for (auto *it : {a, b, c, e}) it->setToolTip(reason);
+        table->setItem(r, 0, a); table->setItem(r, 1, b); table->setItem(r, 2, c); table->setItem(r, 3, e);
+    };
+    int changing = 0;
+    for (const char *gname : GROUPS) {
+        for (const Row &r : rows_) {
+            if (r.group != QLatin1String(gname) || !values.contains(r.key) || notLoaded.contains(r.key)) continue;
+            const QString shown = r.combo ? r.combo->currentText() : editorValue(r);
+            const bool ch = differs(r);
+            changing += ch;
+            add(r.group, r.label, shown + (ch ? QString() : QStringLiteral("  (=)")), why.value(r.key).toString(), ch);
+        }
+    }
+    const QJsonObject run = preset.value("run").toObject();
+    if (why.contains("run"))
+        add(QStringLiteral("Launch"), QStringLiteral("Game launch boost"),
+            QStringLiteral("nice %1 · %2").arg(run.value("nice").toInt()).arg(run.value("affinity").toString()), why.value("run").toString(), true);
+    table->resizeRowsToContents();
+    v->addWidget(table, 1);
+
+    QStringList off;
+    for (const auto &s : d.value("skipped").toArray()) off << s.toObject().value("key").toString();
+    off << notLoaded;
+    off.removeDuplicates();
+    auto *foot = muted(QStringLiteral("%1 row(s) checked, %2 of them change the live value (bold). Nothing has been written yet: "
+                                      "review in the tab, then Apply checked.%3")
+                           .arg(values.size() - notLoaded.size()).arg(changing)
+                           .arg(off.isEmpty() ? QString() : QStringLiteral("\nNot offered on this machine/kernel: ") + off.join(QStringLiteral(", "))));
+    v->addWidget(foot);
+
+    auto *bb = new QDialogButtonBox;
+    auto *save = bb->addButton(QStringLiteral("Save as preset…"), QDialogButtonBox::AcceptRole);
+    QPushButton *saveGame = goal == QLatin1String("gaming") ? bb->addButton(QStringLiteral("Save + ★ use for games"), QDialogButtonBox::AcceptRole) : nullptr;
+    bb->addButton(QStringLiteral("Close"), QDialogButtonBox::RejectRole);
+    v->addWidget(bb);
+    bool forGames = false;
+    connect(save, &QPushButton::clicked, &dlg, &QDialog::accept);
+    if (saveGame) connect(saveGame, &QPushButton::clicked, &dlg, [&] { forGames = true; dlg.accept(); });
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, QStringLiteral("Save autotuned preset"),
+        QStringLiteral("Preset name (letters, digits, space, _ - .):"), QLineEdit::Normal, d.value("name").toString(), &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    if (!validPresetName(name)) { QMessageBox::warning(this, QStringLiteral("Save preset"), QStringLiteral("Invalid name.")); return; }
+    if (QFile::exists(presetsDir() + '/' + name + ".json") &&
+        QMessageBox::question(this, QStringLiteral("Save preset"), "Overwrite \"" + name + "\"?") != QMessageBox::Yes) return;
+    // What is saved is what the tab now holds (the user may have edited rows
+    // while the report was open), plus the autotune record and summary.
+    QJsonObject p{{"values", collectValues()}, {"run", collectRun()}, {"summary", preset.value("summary")}, {"autotune", preset.value("autotune")}};
+    QString err;
+    if (!writeUserPreset(name, p, &err)) { QMessageBox::critical(this, QStringLiteral("Save preset"), err); return; }
+    loadedPreset_ = name;
+    reloadPresets(name);
+    if (forGames) useForGames();
+    else showStatus(QStringLiteral("Saved \"%1\".").arg(name), theme::OK);
+}
+
 // ── apply / restore ─────────────────────────────────────────────────────────
 
 void OptimizeTab::applySelected() {
@@ -1318,6 +1482,7 @@ void OptimizeTab::setBusy(bool b) {
     bootBtn_->setEnabled(!b);
     restoreBtn_->setEnabled(!b && active_);
     bootClear_->setEnabled(!b && !boot_.isEmpty());
+    if (autoBtn_) autoBtn_->setEnabled(!b && !autoRunning_);
 }
 
 void OptimizeTab::showStatus(const QString &msg, const char *color, int ms) {
