@@ -31,8 +31,13 @@ private:
     void onReply(const QJsonObject &r, bool viaRoot);
     void addEvent(const QJsonObject &e);
     void updateSummary();
+    void persist(const QJsonArray &ev, const QString &bootId);
+    void updateLogInfo();
+    static QString logPath();
 
-    QLabel *summary_, *source_, *aer_;
+    QLabel *summary_, *source_, *aer_, *logInfo_;
+    quint64 savedSeq_ = 0;      // highest seq of this boot already in the log file
+    QString savedBoot_;         // boot_id savedSeq_ belongs to
     QTreeWidget *list_;
     QTimer *timer_, *debounce_;
     int kmsgFd_ = -1;

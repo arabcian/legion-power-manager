@@ -4,7 +4,15 @@
 #include "systools.h"
 #include "theme.h"
 
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFile>
 #include <QFileInfo>
+#include <QMessageBox>
+#include <QTextStream>
+#include <QUrl>
+#include <ctime>
 #include <QSocketNotifier>
 #include <QTabWidget>
 #include <QHBoxLayout>
@@ -27,6 +35,7 @@
 static constexpr int DEBOUNCE_MS = 1500;     // one scan for a burst of kernel lines
 static constexpr int POLL_ROOT_MS = 300000;  // restricted kernel log: pkexec, rarely
 static constexpr int MAX_ROWS = 500;
+static constexpr qint64 LOG_MAX_BYTES = 8 << 20;  // then health.log -> health.log.1
 
 static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-helper")); }
 
@@ -83,6 +92,26 @@ HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
     aer_->setTextFormat(Qt::RichText);
     root->addWidget(aer_);
 
+    // Persistent log: every event, across boots, until cleared.
+    auto *logRow = new QHBoxLayout;
+    logInfo_ = new QLabel;
+    logInfo_->setStyleSheet(QStringLiteral("color:%1").arg(theme::MUTED));
+    logRow->addWidget(logInfo_, 1);
+    auto *bOpen = new QPushButton(QStringLiteral("Open saved log"));
+    connect(bOpen, &QPushButton::clicked, this, [] { QDesktopServices::openUrl(QUrl::fromLocalFile(logPath())); });
+    logRow->addWidget(bOpen);
+    auto *bClear = new QPushButton(QStringLiteral("Clear saved log"));
+    connect(bClear, &QPushButton::clicked, this, [this] {
+        if (QMessageBox::question(this, QStringLiteral("Clear saved log"),
+                QStringLiteral("Delete every saved kernel error (all boots)?")) != QMessageBox::Yes) return;
+        QFile::remove(logPath());
+        QFile::remove(logPath() + QStringLiteral(".1"));
+        // Keep savedSeq_: events already seen this boot are not written again.
+        updateLogInfo();
+    });
+    logRow->addWidget(bClear);
+    root->addLayout(logRow);
+
     auto *hint = new QLabel(QStringLiteral(
         "Xid 154 only names the recovery the GPU needs — the cause is the Xid logged just before it. "
         "Xid 13/31/43/45 are usually the application (or an unstable GPU curve); 62/79/119/120 are "
@@ -111,6 +140,22 @@ HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
         needsRoot_ = true;
         timer_->start(POLL_ROOT_MS);
     }
+    // Resume point: highest seq of the current boot already in the file, so a
+    // restart does not write this boot's history twice.
+    {
+        QFile b(QStringLiteral("/proc/sys/kernel/random/boot_id"));
+        if (b.open(QIODevice::ReadOnly)) savedBoot_ = QString::fromLatin1(b.readAll().trimmed());
+        QFile f(logPath());
+        const QString tag = QStringLiteral("boot=") + savedBoot_.left(8) + QStringLiteral(" seq=");
+        if (!savedBoot_.isEmpty() && f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            while (!f.atEnd()) {
+                const QString l = QString::fromUtf8(f.readLine());
+                const int i = l.indexOf(tag);
+                if (i >= 0) savedSeq_ = std::max<quint64>(savedSeq_, l.mid(i + tag.size()).section(QLatin1Char(' '), 0, 0).toULongLong());
+            }
+        }
+    }
+    updateLogInfo();
     QTimer::singleShot(3000, this, &HealthTab::scan);
     updateSummary();
 }
@@ -195,6 +240,7 @@ void HealthTab::onReply(const QJsonObject &r, bool viaRoot) {
             if (!newBad++) firstBad = e.value(QStringLiteral("title")).toString();
         }
     }
+    persist(ev, r.value(QStringLiteral("boot_id")).toString());
     lastSeq_ = std::max<quint64>(lastSeq_, quint64(r.value(QStringLiteral("last_seq")).toDouble()));
 
     if (newBad) {
@@ -249,4 +295,49 @@ void HealthTab::updateSummary() {
     summary_->setText(QStringLiteral("Since boot: ") + QStringList{
         part("NVIDIA Xid", xid_), part("GSP timeout", gsp_), part("machine check", mce_),
         part("PCIe AER", aerN_), part("lockup", lockup_), part("other", other_)}.join(QStringLiteral(" &nbsp;·&nbsp; ")));
+}
+
+QString HealthTab::logPath() {
+    QString dir = qEnvironmentVariable("XDG_STATE_HOME");  // GenericStateLocation needs Qt 6.7
+    if (dir.isEmpty()) dir = QDir::homePath() + QStringLiteral("/.local/state");
+    return dir + QStringLiteral("/legion-power-manager/health.log");
+}
+
+void HealthTab::persist(const QJsonArray &ev, const QString &bootId) {
+    if (!bootId.isEmpty() && bootId != savedBoot_) { savedBoot_ = bootId; savedSeq_ = 0; }
+    QStringList lines;
+    // Kernel timestamps count from boot; wall time = now - uptime + ts.
+    timespec now{};
+    ::clock_gettime(CLOCK_MONOTONIC, &now);
+    const qint64 bootMs = QDateTime::currentMSecsSinceEpoch() - (qint64(now.tv_sec) * 1000 + now.tv_nsec / 1000000);
+    quint64 top = savedSeq_;
+    for (const QJsonValue &v : ev) {
+        const QJsonObject e = v.toObject();
+        const quint64 seq = quint64(e.value(QStringLiteral("seq")).toDouble());
+        if (seq <= savedSeq_) continue;
+        top = std::max(top, seq);
+        const qint64 tsMs = qint64(e.value(QStringLiteral("ts_us")).toDouble() / 1000);
+        lines << QStringLiteral("%1  boot=%2 seq=%3  %4 %5  %6  |  %7")
+                     .arg(QDateTime::fromMSecsSinceEpoch(bootMs + tsMs).toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
+                     .arg(savedBoot_.left(8)).arg(seq)
+                     .arg(e.value(QStringLiteral("level")).toString().toUpper(), -8)
+                     .arg(e.value(QStringLiteral("kind")).toString().toUpper(), -6)
+                     .arg(e.value(QStringLiteral("title")).toString(), e.value(QStringLiteral("text")).toString());
+    }
+    if (lines.isEmpty()) return;
+    const QString path = logPath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    if (QFileInfo(path).size() > LOG_MAX_BYTES) { QFile::remove(path + QStringLiteral(".1")); QFile::rename(path, path + QStringLiteral(".1")); }
+    QFile f(path);
+    if (!f.open(QIODevice::Append | QIODevice::Text)) { logInfo_->setText(QStringLiteral("Saved log: cannot write ") + path); return; }
+    QTextStream(&f) << lines.join(QLatin1Char('\n')) << '\n';
+    savedSeq_ = top;
+    updateLogInfo();
+}
+
+void HealthTab::updateLogInfo() {
+    const QFileInfo a(logPath()), b(logPath() + QStringLiteral(".1"));
+    const qint64 sz = (a.exists() ? a.size() : 0) + (b.exists() ? b.size() : 0);
+    logInfo_->setText(sz ? QStringLiteral("Saved log (all boots): %1 · %2 KiB").arg(a.absoluteFilePath()).arg((sz + 1023) / 1024)
+                         : QStringLiteral("Saved log: empty — new kernel errors are appended to %1").arg(a.absoluteFilePath()));
 }
