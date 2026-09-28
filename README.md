@@ -1,3 +1,6 @@
+Git address : https://github.com/arabcian/legion-power-manager
+
+
 # Legion Power Manager
 
 **Legion Space / Vantage for Linux — and then some.**
@@ -13,24 +16,110 @@ required, no telemetry, works on OpenRC and systemd.
 
 ## Features
 
-| Tab | What you get |
-|---|---|
-| **Home** | Power profile (Quiet → Performance → Custom), live sensors (CPU per-CCD, dGPU, iGPU, fans, NVMe, power, battery), fan control and custom fan curve, battery charge mode, GPU mode (Hybrid / dGPU only), Fn-lock, camera, USB charging, memory timings viewer |
-| **Scenes** | One name for the whole machine — power profile, firmware limits, CPU/GPU curves, tuning preset, keyboard lighting, a custom command. Automatic AC / battery switching, game-start scene, export / import |
-| **Firmware Attributes** | CPU PL1/PL2/PL3, temperature targets, GPU cTGP and Dynamic Boost — including the values the kernel refuses to write |
-| **NVIDIA Curve Optimizer** | Drag-and-edit V/F curve, core/memory offsets, named profiles, apply at boot |
-| **Ryzen Curve Optimizer** *(AMD)* | Per-core and all-core Curve Optimizer, CPPC-ranked cores, profiles |
-| **Intel Undervolt** *(Intel)* | Voltage offsets, IccMax, TCC offset, PL1/PL2, AC/battery profiles, ThrottleStop.ini import, live throttle monitor |
-| **Optimizations** | ~80 documented CPU/memory/scheduler/power/storage knobs, hardware-aware **Autotune** (power saving · gaming · throughput · desktop, also as `lpm-autotune`; see [docs/AUTOTUNE.md](docs/AUTOTUNE.md)), built-in presets, game launch hooks for Lutris and Steam, boot-parameter advisor, one-click *Restore originals* |
-| **Lighting** *(Gen10 Spectrum keyboards)* | Per-key RGB editor on a drawing of your own keyboard, firmware effects, 6 hardware profiles, brightness, lid logo, accent lights |
+The window has one tab per area. Tabs appear only when your hardware and
+drivers support them, so you never see controls that can't work.
 
-Everything important is also in the **tray menu**. Every setting has a tooltip
-that explains what it does and what value to use.
+### Home
+Your everyday dashboard.
+- **Power profile** — Quiet, Balanced, Performance or Custom, switched instantly.
+- **Live sensors** — CPU (per CCD), NVIDIA GPU, integrated GPU, fans, NVMe,
+  power draw and battery.
+- **Fans** — fan control and, on supported models, a **custom fan curve** editor
+  (10 levels, each fan at its own temperature steps).
+- **Battery** — charge mode (e.g. conservation / rapid charge).
+- **Device** — GPU mode (Hybrid or dGPU only, takes effect after reboot),
+  integrated GPU memory mode, Fn-lock, camera, USB charging while off,
+  *Boot on AC* and *Boot on USB-C PD* (instant boot).
+- **Memory** — view your RAM: DDR5 SPD data of every module, live timings from
+  the memory controller, and (on supported BIOS) an editor for **BIOS memory
+  timings** with automatic backup and restore.
+- **Boot guard status** — *Resume boot presets* after a crash (see below).
 
-Built to be safe to experiment with: root helpers validate every value,
-a **boot guard** pauses boot-time presets after a crash, the login scene has
-the same protection, and firmware-persistent changes (BIOS memory timings,
-BIOS CPU OC, GPU MUX) always ask for the administrator password.
+### Scenes
+One click (or a charger plug) sets the whole machine.
+- A scene bundles: power profile, firmware limits, CPU curve, NVIDIA curve,
+  Optimizations preset, keyboard lighting and an optional custom command.
+  Any part can be left *Unchanged*.
+- Scenes point at your saved profiles, so editing a profile updates every scene
+  that uses it.
+- **Automatic switching** between an AC scene and a battery scene, and at login.
+- **Game-start scene** — switch when a game starts, switch back when it exits.
+- **Export / import** everything you built (scenes, presets, CPU/GPU profiles)
+  as one file — for backups, reinstalls or sharing with owners of the same model.
+
+### Firmware
+Firmware power and temperature limits (in the Custom profile).
+- CPU PL1 / PL2 / PL3 and temperature targets.
+- NVIDIA cTGP and Dynamic Boost — including the values the kernel refuses to write.
+- BIOS CPU overclock settings: PBO scalar, boost clock, firmware Curve Optimizer
+  (always asks for the administrator password).
+
+### Ryzen Curve *(AMD CPUs)*
+CPU undervolting with Curve Optimizer.
+- One offset for all cores, or per-core offsets grouped by CCD.
+- Best cores (CPPC ranking) are marked with ★.
+- Named profiles, available from the tray too.
+
+### Intel Undervolt *(Intel CPUs)*
+- Voltage offsets for core, cache, iGPU, system agent and analog I/O.
+- IccMax, TCC offset, PL1 / PL2, BD PROCHOT, cTDP.
+- Separate AC and battery profiles, re-applied at boot and after sleep.
+- ThrottleStop.ini import and a live throttle / voltage / power monitor.
+- Also usable from the terminal: `lpm-intel-uv`.
+
+### NVIDIA Curve
+GPU undervolting and overclocking.
+- Drag-and-edit **V/F curve**, or simple core / memory clock offsets.
+- Extra sensors GeForce drivers normally hide: **hotspot** and **VRAM temperature**,
+  plus the reason the GPU is currently throttling.
+- PowerMizer mode and a one-click *Reset All*.
+- Named profiles; mark one ★ *Default* to apply it at every boot.
+- **Driver options** — a curated, validated set of NVIDIA kernel module options.
+- Also usable from the terminal: `nvcurve`.
+
+### AMD GPU *(Radeon or AMD integrated graphics)*
+- Clock / voltage tuning adapted to your GPU generation (Polaris to RDNA4).
+- Power limit, performance level, power profile and RDNA3+ fan settings.
+- **Safe trial apply** — changes are reverted after 20 s unless you press *Keep*.
+  *Undervolt step* lowers voltage 10 mV at a time until you find the stable limit.
+
+### Optimizations
+System tuning for gaming, battery life or throughput.
+- About 80 documented knobs: CPU, memory, scheduler, power, storage, IRQs.
+- **Autotune** — detects your hardware and builds a preset for power saving,
+  gaming, throughput or desktop use (also `lpm-autotune`, see
+  [docs/AUTOTUNE.md](docs/AUTOTUNE.md)).
+- Built-in presets, your own presets, and a boot-time preset.
+- **Game launch hooks** for Lutris and Steam: apply a preset while a game runs,
+  and optionally give the game its own CCD (V-Cache or frequency CCD).
+- **Boot options advisor** — shows useful kernel / NVIDIA options and builds a
+  line you can copy. It never edits your bootloader.
+- *Restore originals* puts every value back.
+
+### Lighting *(Legion Gen10 Spectrum keyboards)*
+- Per-key RGB editor on a drawing of your own keyboard (click, drag, Ctrl-click).
+- Firmware effects: static, pulse, wave, smooth, rain, ripple, type lighting,
+  rainbow wave / spiral — with speed, direction and colours.
+- The keyboard's 6 hardware profiles (shared with Windows), brightness,
+  lid logo and accent lights.
+
+### Health
+Find hardware and driver problems quickly.
+- Watches the kernel log for faults since boot: NVIDIA Xid errors (with what
+  they mean), GSP timeouts, machine checks, PCIe errors, lockups, amdgpu hangs.
+- Critical events show up as a tray notification.
+- **Tool pages** — the output of common system tools (sensors, lscpu, lspci,
+  dmidecode, smartctl…) in one place, with an option to hide serial numbers.
+
+### Tray and safety
+- Everything important is also in the **tray menu**: power profile, scenes,
+  CPU / GPU curves, keyboard lighting.
+- Every setting has a tooltip explaining what it does and what value to use.
+- Root helpers validate every value before writing.
+- **Boot guard** pauses boot-time presets if the machine crashed while one was
+  active; the login scene has the same protection.
+- Firmware-persistent changes (BIOS memory timings, BIOS CPU OC, GPU MUX)
+  always ask for the administrator password.
 
 ## Supported hardware
 
