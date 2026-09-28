@@ -79,7 +79,7 @@ static const Builtin BUILTINS[] = {
         "snd.hda_power_save":0,"snd.hda_power_save_controller":"0","usb.autosuspend":-1,"gpu.amdgpu_dpm":"low"},
       "run":{"nice":-5,"autogroup":true,"affinity":"cache"}})"},
     {"amd", "Competitive",
-     "Gaming X3D taken to the limit: frequency CCD parked, deep C-states off. Maximum determinism, most heat.",
+     "Gaming X3D taken to the limit: frequency CCD parked (in game mode emptied, not taken offline), deep C-states off. Maximum determinism, most heat.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.boost":"1",
         "cpu.governor_ccd0":"powersave","cpu.governor_ccd1":"powersave","cpu.epp_ccd0":"performance","cpu.epp_ccd1":"balance_power",
@@ -607,6 +607,7 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
     bool topoChanged = topo != topology_;
     topology_ = topo;
     state_ = d.value("state").toObject();
+    isolation_ = d.value("isolation").toObject();  // same describe poll: no extra cost
     boot_ = d.value("boot").toObject();
     const QJsonArray rows = d.value("tunables").toArray();
 
@@ -913,6 +914,13 @@ QString OptimizeTab::editorValue(const Row &r) const {
     return {};
 }
 
+/// Rows whose value is a CCD role (tune.rs maps the same three in validate).
+/// Other rows use "cache"/"frequency" as their own values (cpu.x3d_mode) and
+/// must not be rewritten to "ccdN".
+static bool isCcdRoleKey(const QString &key) {
+    return key == QLatin1String("wq.cpumask") || key == QLatin1String("irq.affinity") || key == QLatin1String("cpu.ccd_park");
+}
+
 /// Legacy "cache"/"frequency" (older presets, built-ins) → the CCD they are here.
 QString OptimizeTab::canonicalCcd(const QString &v) const {
     if (v == QLatin1String("cache") || v == QLatin1String("frequency")) {
@@ -923,7 +931,7 @@ QString OptimizeTab::canonicalCcd(const QString &v) const {
 }
 
 bool OptimizeTab::setEditorValue(Row &r, const QString &v0) {
-    const QString v = r.combo ? canonicalCcd(v0) : v0;
+    const QString v = r.combo && isCcdRoleKey(r.key) ? canonicalCcd(v0) : v0;
     if (r.spin) {
         bool ok = false;
         const qint64 n = v.toLongLong(&ok);
@@ -973,9 +981,15 @@ void OptimizeTab::updateStateBanner() {
         const QString preset = state_.value("preset").toString();
         banner_->setText(games > 0 ? QStringLiteral("Game mode active — %1 game(s) running").arg(games)
                                    : src == "boot" ? QStringLiteral("Boot preset active") : QStringLiteral("Tuning active"));
-        bannerDetail_->setText(QStringLiteral("%1%2 setting(s), %3 file(s) with saved originals. Restoring writes them back.")
+        QString part;
+        if (isolation_.value("active").toBool())
+            part = QStringLiteral("\nGame CPU partition: CPUs %1 (%2 process(es)) — the rest of the system runs on the other CCD.")
+                       .arg(isolation_.value("cpus").toString()).arg(isolation_.value("procs").toInt());
+        else if (games > 0 && isolation_.value("unsupported").isString())
+            part = QStringLiteral("\nNo game CPU partition: ") + isolation_.value("unsupported").toString();
+        bannerDetail_->setText(QStringLiteral("%1%2 setting(s), %3 file(s) with saved originals. Restoring writes them back.%4")
             .arg(preset.isEmpty() ? QString() : "Preset \"" + preset + "\" · ")
-            .arg(state_.value("keys").toArray().size()).arg(state_.value("saved_files").toInt()));
+            .arg(state_.value("keys").toArray().size()).arg(state_.value("saved_files").toInt()).arg(part));
     } else {
         banner_->setText("System at its original values");
         bannerDetail_->setText("Nothing changed by Legion Power Manager is in effect. Every change you apply is recorded and reversible.");
@@ -1075,7 +1089,8 @@ int OptimizeTab::loadPresetObject(const QJsonObject &p, QStringList *skipped) {
     }
     for (auto it = values.begin(); it != values.end(); ++it) {
         Row *r = row(it.key());
-        const QString v = canonicalCcd(it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong()));
+        const QString raw = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
+        const QString v = isCcdRoleKey(it.key()) ? canonicalCcd(raw) : raw;
         if (!r || !validFor(*r, v) || !setEditorValue(*r, v)) { if (skipped) *skipped << it.key(); continue; }
         r->touched = true;
         const QSignalBlocker b(r->include);
@@ -1241,7 +1256,8 @@ bool OptimizeTab::applyNamedPreset(const QString &name) {
     for (auto it = all.begin(); it != all.end(); ++it) {
         const Row *r = nullptr;
         for (const Row &x : rows_) if (x.key == it.key()) r = &x;
-        const QString v = canonicalCcd(it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong()));
+        const QString raw = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
+        const QString v = isCcdRoleKey(it.key()) ? canonicalCcd(raw) : raw;
         if (r && validFor(*r, v)) values[it.key()] = v;
     }
     if (values.isEmpty()) return false;

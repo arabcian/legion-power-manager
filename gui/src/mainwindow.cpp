@@ -13,6 +13,7 @@
 #include "scenestab.h"
 #include "sysinfo.h"
 #include "tray.h"
+#include "healthtab.h"
 #include <QCloseEvent>
 #include <QLabel>
 #include <QTabBar>
@@ -96,6 +97,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         lighting_ = new LightingTab;
         tabs_->addTab(lighting_, "Lighting");
     }
+    health_ = new HealthTab;
+    tabs_->addTab(health_, "Health");
 
     scenes_ = new SceneEngine(this);
     home_->setSceneEngine(scenes_);

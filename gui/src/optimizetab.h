@@ -101,7 +101,7 @@ private:
     void showStatus(const QString &msg, const char *color = nullptr, int ms = 6000);
 
     QList<Row> rows_;
-    QJsonObject topology_, state_, boot_;
+    QJsonObject topology_, state_, boot_, isolation_;
     bool active_ = false, busy_ = false, describing_ = false, helperMissing_ = false;
 
     QLabel *banner_ = nullptr, *bannerDetail_ = nullptr, *status_ = nullptr, *bootLabel_ = nullptr;

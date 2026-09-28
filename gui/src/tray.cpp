@@ -1,4 +1,5 @@
 #include "tray.h"
+#include "healthtab.h"
 #include "hometab.h"
 #include "inteltab.h"
 #include "lightingtab.h"
@@ -46,6 +47,9 @@ Tray::Tray(MainWindow *win) : QSystemTrayIcon(appIcon(), win), win_(win), menu_(
         if (r == Trigger || r == DoubleClick) toggleWindow();
     });
     rebuild();
+
+    // Hardware/driver faults found by the Health tab's background scan.
+    connect(win_->health(), &HealthTab::alert, this, [this](const QString &t, const QString &m) { notify(t, m); });
 
     // Scene results: a notification when nobody is looking at the Scenes tab
     // (tray pick, charger plugged/pulled); the tab shows its own status line.
