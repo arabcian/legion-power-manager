@@ -520,6 +520,18 @@ void SceneEngine::start(const Scene &s) {
     current_ = s.name;
     Q_EMIT started(s.name);
 
+    // 0. EC fan boost FIRST: turning it off before the profile change means the fans never
+    //    spin up for the new profile and then drop again.
+    if (s.fanFullSpeed >= 0) {
+        addStep("Fan boost", [this, on = s.fanFullSpeed == 1](Done done) {
+            privileged::run(privileged::helperPath("legion-profile-helper"),
+                            QJsonObject{{"device", "fan_fullspeed"}, {"value", on ? "1" : "0"}}, this,
+                            [done, on](const privileged::Result &r) {
+                                done(r.ok(), r.ok() ? QString(on ? "turbo (EC full speed)" : "auto") : r.message());
+                            });
+        });
+    }
+
     // 1. Platform profile — first: firmware limits depend on it being Custom.
     if (!s.platformProfile.isEmpty()) {
         addStep("Power profile", [this, p = s.platformProfile](Done done) {
@@ -532,6 +544,18 @@ void SceneEngine::start(const Scene &s) {
             }, [](const QJsonObject &j) {
                 const QString eff = j.value("effective").toString();
                 return eff.isEmpty() ? QString() : HomeTab::profileLabel(eff);
+            });
+        });
+    }
+
+    // The EC may reset the flag on a profile change: re-assert only if it no longer matches.
+    if (s.fanFullSpeed >= 0 && !s.platformProfile.isEmpty()) {
+        addStep("Fan boost check", [this, on = s.fanFullSpeed == 1](Done done) {
+            const QString h = privileged::helperPath("legion-profile-helper");
+            privileged::run(h, QJsonObject{{"fan_fullspeed", "get"}}, this, [this, h, on, done](const privileged::Result &r) {
+                if (!r.ok() || r.json.value("on").toBool() == on) { done(true, "unchanged"); return; }
+                privileged::run(h, QJsonObject{{"device", "fan_fullspeed"}, {"value", on ? "1" : "0"}}, this,
+                                [done](const privileged::Result &r2) { done(r2.ok(), r2.ok() ? QStringLiteral("re-applied after the profile change") : r2.message()); });
             });
         });
     }
@@ -666,17 +690,6 @@ void SceneEngine::start(const Scene &s) {
             for (int x : lv) a << x;
             helper("legion-profile-helper", QJsonObject{{"fan_table", "set"}, {"levels", a}}, done,
                    [](const QJsonObject &) { return QStringLiteral("table written and verified"); });
-        });
-    }
-
-    // 5b. EC fan boost (Full Speed flag) — after the platform profile, which the EC may reset it with.
-    if (s.fanFullSpeed >= 0) {
-        addStep("Fan boost", [this, on = s.fanFullSpeed == 1](Done done) {
-            privileged::run(privileged::helperPath("legion-profile-helper"),
-                            QJsonObject{{"device", "fan_fullspeed"}, {"value", on ? "1" : "0"}}, this,
-                            [done, on](const privileged::Result &r) {
-                                done(r.ok(), r.ok() ? QString(on ? "turbo (EC full speed)" : "auto") : r.message());
-                            });
         });
     }
 
