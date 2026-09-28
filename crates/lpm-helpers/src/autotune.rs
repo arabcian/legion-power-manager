@@ -392,6 +392,36 @@ fn cpu_rules(r: &mut Rules) {
         }
     }
 
+    // EPP boost (patched amd-pstate): EPP reacts to load bursts faster -
+    // the ramp after a stall is exactly what frame time and short compile
+    // jobs pay for. Off only for power saving. The row is n/a (skipped) on
+    // kernels without the patch.
+    match r.g {
+        PowerSave => r.set("cpu.epp_boost", "0", "No EPP boost: no short clock spikes on light loads."),
+        Gaming => r.set("cpu.epp_boost", "1", "EPP boost: cores leave the efficient EPP point the moment a frame's work arrives - shorter ramp, steadier frame times."),
+        Throughput => r.set("cpu.epp_boost", "1", "EPP boost: every job start (compiler, encoder chunk) runs at full clock immediately instead of after the EPP ramp."),
+        Desktop => r.set("cpu.epp_boost", "1", "EPP boost: interactive bursts get full clock at once, idle stays at the efficient EPP."),
+    }
+    // X3D laptop gaming: the frequency die only runs IRQs / kernel work /
+    // background tasks; capping it hands its share of the package limit to
+    // the V-Cache die that runs the game.
+    if r.is(Gaming) && p.x3d() && p.battery {
+        if let Some(f) = p.freq_ccd.filter(|&f| f < 2) {
+            if let Some(c) = p.ccds.iter().find(|c| c.index == f).filter(|c| c.max_khz > 0) {
+                let cap = (c.max_khz * 7 / 10) as i64;
+                r.set(if f == 0 { "cpu.max_freq_ccd0" } else { "cpu.max_freq_ccd1" }, cap,
+                      format!("CCD{f} (frequency die) capped at {} MHz: it only serves IRQs and background work while the game runs on the V-Cache die, which gets the freed package power.", cap / 1000));
+            }
+        }
+    }
+    // schedutil only: how soon the clock follows a load change.
+    if p.schedutil() {
+        r.set("cpu.schedutil_rate_limit_us", match r.g { PowerSave => 10_000, Throughput => 2_000, _ => 500 },
+              match r.g { PowerSave => "Fewer frequency changes: the clock does not chase every short burst.",
+                          Throughput => "Moderate: sustained load, few changes needed.",
+                          _ => "Clock follows a wake-up burst within 0.5 ms." });
+    }
+
     // Turbo: the single biggest power lever; everything but power saving wants it.
     match r.g {
         PowerSave => r.set("cpu.boost", "0", "Turbo off removes the least efficient (highest-voltage) bins - the largest single power/heat saving; base clock remains."),
@@ -476,7 +506,35 @@ fn memory_rules(r: &mut Rules) {
               else { "Huge pages only on request: kernel < 6.12 (no THP shrinker) or < 16 GB RAM, where 'always' can bloat memory." });
         r.set("thp.defrag", "defer+madvise", "Never stall a page fault for compaction outside madvise regions.");
     }
+    r.set("thp.shmem_enabled", if r.is(PowerSave) { "never" } else { "advise" },
+          if r.is(PowerSave) { "No huge pages for tmpfs/shmem." } else { "shmem huge pages only where requested (madvise / huge=): /dev/shm and Wine shared sections are not inflated." });
+    // mTHP (6.8+): mid-size folios cut faults/TLB misses with far less waste
+    // than 2 MB. 'inherit' follows thp.enabled (always here).
+    if p.kernel_at_least(6, 8) {
+        let upto: u32 = match r.g { _ if !always => 0, Throughput => 256, _ => 64 };
+        for (k, kb) in [("thp.mthp_16k", 16), ("thp.mthp_32k", 32), ("thp.mthp_64k", 64), ("thp.mthp_128k", 128),
+                        ("thp.mthp_256k", 256), ("thp.mthp_512k", 512), ("thp.mthp_1m", 1024)] {
+            let on = kb <= upto;
+            r.set(k, if on { "inherit" } else { "never" }, if on {
+                format!("{kb} KB folios follow THP: fewer page faults and TLB misses for mid-size allocations (mTHP up to {upto} KB for this goal).")
+            } else { format!("{kb} KB folios off (kernel default): no memory bloat from large partially used folios.") });
+        }
+    }
+    match r.g {
+        Throughput => {
+            r.set("thp.khugepaged_defrag", 1, "khugepaged may compact to build huge pages for long-running jobs.");
+            r.set("thp.khp_pages_to_scan", 16_384, "4x the default scan budget: long-running processes get collapsed into huge pages sooner.");
+            r.set("thp.khp_scan_sleep_ms", 5_000, "khugepaged scans every 5 s: working sets are promoted early in a build/encode.");
+        }
+        Gaming | Desktop => {
+            r.set("thp.khp_pages_to_scan", 4_096, "Default scan budget: short scan bursts, no competing background CPU work.");
+            r.set("thp.khp_alloc_sleep_ms", 60_000, "Back off a minute after a failed huge-page allocation (default): no repeated compaction attempts.");
+        }
+        PowerSave => {}
+    }
     if r.is(PowerSave) {
+        r.set("thp.khp_pages_to_scan", 1_024, "Quarter of the default scan budget: less background work.");
+        r.set("thp.khp_alloc_sleep_ms", 300_000, "Back off 5 min after a failed allocation: no compaction retries on battery.");
         r.set("thp.khugepaged_defrag", 0, "khugepaged does not compact to build huge pages.");
         r.set("thp.khp_scan_sleep_ms", 60_000, "khugepaged wakes once a minute instead of every 10 s.");
     }
@@ -510,6 +568,9 @@ fn memory_rules(r: &mut Rules) {
             r.set("zswap.compressor", if r.is(Gaming) { "lz4" } else { "zstd" },
                   if r.is(Gaming) { "lz4: fastest decompression when a swapped page is touched again." } else { "zstd: best ratio, more pages stay in RAM." });
             r.set("zswap.shrinker_enabled", "1", "Cold pool pages move on to disk proactively.");
+            r.set("zswap.max_pool_percent", match r.g { PowerSave => 30, Gaming => 20, _ => 25 },
+                  match r.g { PowerSave => "Bigger compressed pool: fewer disk writes/wakes.", Gaming => "Stock pool size: RAM stays free for the game.",
+                              _ => "Slightly bigger pool: less swap I/O under build/tab pressure." });
         }
     }
 
@@ -518,6 +579,20 @@ fn memory_rules(r: &mut Rules) {
     if gb >= 16 && matches!(r.g, Gaming | Desktop | Throughput) {
         r.set("vm.watermark_scale_factor", 125, "kswapd wakes at ~1.25% free instead of 0.1%: allocations rarely hit direct reclaim (a stall on the allocating thread).");
     }
+    // Watermark boosting (default 15000) makes kswapd reclaim extra cache after
+    // every fragmentation event - a periodic reclaim storm with no benefit here.
+    r.set("vm.watermark_boost_factor", 0, "No watermark boost: kswapd does not drop extra page cache after fragmentation events (CachyOS value).");
+    if matches!(r.g, Gaming | Desktop) {
+        r.set("vm.compaction_proactiveness", 0, "No proactive compaction: kcompactd does not wake in the background mid-game (CachyOS); defer+madvise already compacts on demand.");
+    }
+    // Atomic reserve: ~0.4% of RAM (128 MB on 32 GB), only ever raised.
+    if gb >= 16 && !r.is(PowerSave) {
+        let want = (p.ram_kb / 256).min(262_144);
+        if p.cur("vm.min_free_kbytes").and_then(|v| v.parse::<u64>().ok()).map_or(true, |c| c < want) {
+            r.set("vm.min_free_kbytes", want as i64, "Larger atomic reserve (~0.4% of RAM): network/GPU interrupt-context allocations never fail under memory pressure.");
+        }
+    }
+    if p.numa_nodes > 1 { r.set("vm.zone_reclaim_mode", 0, "Multi-node: allocate from the other node instead of reclaiming the local one."); }
     if r.is(PowerSave) {
         r.set("vm.compaction_proactiveness", 0, "No proactive compaction: THP is madvise-only here, no background CPU work.");
         r.set("vm.stat_interval", 10, "vmstat refresh every 10 s: fewer periodic timer wakeups.");
@@ -540,7 +615,7 @@ fn memory_rules(r: &mut Rules) {
         Gaming | Desktop => r.set("vm.dirty_writeback_centisecs", 1500, "Flusher wakes every 15 s (CachyOS): fewer periodic writeback bursts; the byte limits above bound the backlog."),
         Throughput => {}
     }
-    if matches!(r.g, Gaming | Desktop) {
+    if matches!(r.g, Gaming | Desktop | Throughput) {
         r.set("vm.vfs_cache_pressure", 50, "Directory/inode cache kept longer (CachyOS): shader caches, library scans and file dialogs stay fast.");
     }
 }
@@ -557,6 +632,11 @@ fn sched_rules(r: &mut Rules) {
         _ => {}
     }
     if p.numa_nodes <= 1 { r.set("kernel.numa_balancing", 0, "Single NUMA node: balancing would only sample page faults for nothing."); }
+    if r.is(Gaming) && !p.battery {
+        r.set("kernel.timer_migration", 0, "Desktop (no battery): timers fire on the CPU that armed them - no cross-CPU timer jitter.");
+    } else {
+        r.set("kernel.timer_migration", 1, "Timers of idle CPUs move to awake ones: idle cores stay in deep C-states (their headroom feeds boost).");
+    }
     if matches!(r.g, Gaming | Desktop) { r.set("kernel.sched_autogroup", 1, "Per-session scheduling groups: a background build cannot starve the desktop/game."); }
     if p.cur("kernel.sched_schedstats") == Some("1") && r.g != Desktop {
         r.set("kernel.sched_schedstats", "0", "Schedstats were left on by some tool: per-switch accounting cost removed.");
@@ -631,7 +711,11 @@ fn io_rules(r: &mut Rules) {
     match r.g {
         Throughput => r.set("blk.read_ahead_kb", if p.rotational { 4096 } else { 1024 }, "Large read-ahead for sequential throughput (TuneD uses 4096 KiB)."),
         Gaming => r.set("blk.read_ahead_kb", 512, "Games stream assets sequentially from large packs: 512 KiB read-ahead."),
-        _ => {}
+        PowerSave => r.set("blk.read_ahead_kb", 1024, "Bigger read-ahead: fewer, larger reads let the drive idle longer."),
+        Desktop => {}
+    }
+    if r.is(Throughput) {
+        r.set("blk.wbt_lat_usec", 0, "No writeback throttling: build/encode output flushes at full device speed.");
     }
     // Network (latency under load): BBR + fq keeps queues short.
     if matches!(r.g, Gaming | Desktop | Throughput) {
@@ -654,6 +738,10 @@ fn device_rules(r: &mut Rules) {
         Gaming => r.set("pci.aspm", "performance", "PCIe links never drop to a power state between bursts: no wake-up jitter on GPU/NVMe/Wi-Fi."),
         PowerSave => r.set("pci.aspm", "powersave", "Links may enter L0s/L1 when idle (powersupersave is avoided: it breaks some devices)."),
         _ => {}
+    }
+    if r.is(PowerSave) {
+        r.set("pci.aspm_links", "l1ss", "L1.1/L1.2 substates on every link: an NVMe/Wi-Fi link stuck without L1.2 costs ~0.5-1 W at idle (restore if a device misbehaves).");
+        if p.battery { r.set("pm.mem_sleep", "deep", "S3 suspend where firmware offers it: lowest drain in the bag (skipped if only s2idle exists)."); }
     }
     match r.g {
         Gaming => { r.set("snd.hda_power_save", 0, "Codec always powered: no pop and no wake delay."); r.set("snd.hda_power_save_controller", "0", "Controller always powered."); }
@@ -791,6 +879,12 @@ mod tests {
         assert_eq!(get(&d, "thp.enabled"), Some(&json!("always")));
         assert_eq!(get(&d, "thp.khp_max_ptes_none"), Some(&json!(409)));
         assert_eq!(run_block(Goal::Gaming, &p).0["affinity"], "ccd0");
+        assert_eq!(get(&d, "cpu.epp_boost"), Some(&json!("1")));
+        assert_eq!(get(&d, "cpu.max_freq_ccd1"), Some(&json!(5_450_000 * 7 / 10)));
+        assert_eq!(get(&d, "thp.mthp_64k"), Some(&json!("inherit")));
+        assert_eq!(get(&d, "thp.mthp_128k"), Some(&json!("never")));
+        assert_eq!(get(&decide(Goal::Throughput, &p), "cpu.epp_boost"), Some(&json!("1")));
+        assert_eq!(get(&decide(Goal::PowerSave, &p), "cpu.epp_boost"), Some(&json!("0")));
     }
 
     #[test]
