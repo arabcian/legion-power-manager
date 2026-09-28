@@ -54,6 +54,7 @@ fn main() {
     } else {
         let mut o = std::io::stdout().lock();
         let _ = writeln!(o, "Goal:     {}\nMachine:  {}\n", goal.label(), out["profile_summary"].as_str().unwrap_or(""));
+        if let Some(e) = out["evidence_summary"].as_str().filter(|e| !e.is_empty()) { let _ = writeln!(o, "Observed: {e}\n"); }
         let values = out["preset"]["values"].as_object().cloned().unwrap_or_default();
         let why = out["rationale"].as_object().cloned().unwrap_or_default();
         let w = values.keys().map(String::len).max().unwrap_or(10);

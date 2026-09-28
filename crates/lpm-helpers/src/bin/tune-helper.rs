@@ -13,6 +13,7 @@
 //!   {"op":"prune"}                                     end sessions whose launcher died
 //!   {"op":"restore"}                                   write every saved original back now
 //!   {"op":"restore_keys","keys":[k,..]}                restore only these knobs
+//!   {"op":"snapshot"}                                  refresh the readable copy of debugfs values (also done after every root op)
 //!   {"op":"boost","nice":-5,"autogroup":true}          renice the process that ran pkexec
 //!   {"op":"set_boot","values":{..}|null,"preset":".."} store/clear the boot preset (root-owned file)
 //!   {"op":"boot"}                                      apply the boot preset (OpenRC service)
@@ -168,7 +169,7 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
     let mut results = Vec::new();
     let mut all_ok = true;
     for k in values.keys() {
-        if tune::find(k).is_none() {
+        if tune::find(k).is_none() && !tune::RETIRED_KEYS.contains(&k.as_str()) {
             results.push(json!({"key": k, "ok": false, "error": "unknown key"}));
             all_ok = false;
         }
@@ -559,6 +560,7 @@ fn op_set_boot(req: &Value) -> Value {
                         Ok(s) => { clean.insert(k.clone(), json!(s)); }
                         Err(e) => rejected.push(json!({"key": k, "error": e})),
                     },
+                    None if tune::RETIRED_KEYS.contains(&k.as_str()) => {}
                     None => rejected.push(json!({"key": k, "error": "unknown key"})),
                 }
             }
@@ -602,6 +604,7 @@ fn run() -> Value {
     // Read-only ops any user may run; health needs root only when the kernel log is restricted.
     match op {
         "health" => return lpm_helpers::health::scan(req["since"].as_u64().unwrap_or(0)),
+        "klog" => return lpm_helpers::health::klog(req["since"].as_u64().unwrap_or(0)),
         "nvreg_describe" => return lpm_helpers::nvreg::describe(),
         "autotune" => return match req["goal"].as_str().and_then(lpm_helpers::autotune::Goal::parse) {
             Some(g) => lpm_helpers::autotune::autotune(g),
@@ -614,7 +617,8 @@ fn run() -> Value {
         _ => {}
     }
     if !is_root() { return json!({"ok": false, "error": format!("'{op}' needs root (run through pkexec)")}); }
-    match op {
+    let out = match op {
+        "snapshot" => json!({"ok": true}),
         "apply" => op_apply(&req),
         "release" => op_release(&req),
         // Ends game sessions whose launcher died (pruning runs in every locked op).
@@ -637,7 +641,10 @@ fn run() -> Value {
             Err(e) => json!({"ok": false, "error": e}),
         },
         _ => json!({"ok": false, "error": "unknown op"}),
-    }
+    };
+    // Unprivileged describe reads the debugfs values from this copy (debugfs stays root-only).
+    if matches!(op, "snapshot" | "apply" | "release" | "restore" | "restore_keys" | "boot" | "prune") { tune::write_debugfs_snapshot(); }
+    out
 }
 
 fn main() {

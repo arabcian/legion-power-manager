@@ -10,6 +10,7 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 
 const MAX_EVENTS: usize = 300;
+const MAX_KLOG: usize = 4000;
 
 /// (code, level, meaning). level: critical = the GPU needs a reset/reboot.
 const XIDS: &[(u32, &str, &str)] = &[
@@ -120,6 +121,52 @@ fn kmsg_events(since: u64) -> Result<(Vec<Value>, u64), String> {
     }
     if out.len() > MAX_EVENTS { out.drain(..out.len() - MAX_EVENTS); }
     Ok((out, last))
+}
+
+/// Every kernel log record of level warning or worse (pri & 7 <= 4) with seq > since,
+/// continuation lines (leading space) folded into their record. Returns the newest
+/// MAX_KLOG records. Err("EPERM") when the kernel log is restricted.
+fn klog_records(since: u64) -> Result<(Vec<Value>, u64), String> {
+    let mut f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open("/dev/kmsg").map_err(|e| if e.raw_os_error() == Some(libc::EPERM) || e.raw_os_error() == Some(libc::EACCES) { "EPERM".to_string() } else { format!("/dev/kmsg: {e}") })?;
+    let (mut out, mut last) = (Vec::new(), since);
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let rec = String::from_utf8_lossy(&buf[..n]);
+                let Some((head, body)) = rec.split_once(';') else { continue };
+                let mut h = head.split(',');
+                let Some(pri) = h.next().and_then(|s| s.parse::<u32>().ok()) else { continue };
+                let Some(seq) = h.next().and_then(|s| s.parse::<u64>().ok()) else { continue };
+                let ts: u64 = h.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                last = last.max(seq);
+                if seq <= since || pri & 7 > 4 { continue; }
+                // Body: the message (may span several lines), then " KEY=value" dictionary
+                // lines (leading space) that dmesg does not print either.
+                let msg: String = body.lines().take_while(|l| !l.starts_with(' ')).collect::<Vec<_>>().join(" ⏎ ")
+                    .chars().take(1000).collect();
+                out.push(json!({"seq": seq, "ts_us": ts, "level": pri & 7, "msg": msg}));
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("/dev/kmsg: {e}")),
+        }
+    }
+    if out.len() > MAX_KLOG { out.drain(..out.len() - MAX_KLOG); }
+    Ok((out, last))
+}
+
+/// {"ok", "records", "last_seq", "boot_id"} or {"ok": false, "needs_root": true}.
+pub fn klog(since: u64) -> Value {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().to_owned();
+    match klog_records(since) {
+        Ok((records, last)) => json!({"ok": true, "records": records, "last_seq": last, "boot_id": boot_id}),
+        Err(e) if e == "EPERM" => json!({"ok": false, "needs_root": true, "error": "the kernel log is restricted (kernel.dmesg_restrict=1)"}),
+        Err(e) => json!({"ok": false, "error": e}),
+    }
 }
 
 /// PCIe devices with a non-zero AER total (sysfs, readable by anyone).

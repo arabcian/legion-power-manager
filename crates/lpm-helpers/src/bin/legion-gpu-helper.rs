@@ -3,6 +3,7 @@
 //!   {"op": "apply", "values": {"ctgp": 140, "boost_up": 25, ...}}
 //!   {"op": "panel_extras"}   Over Drive + iGPU-mode state (only what the firmware supports)
 //!   {"op": "set_panel_od", "on": bool}   {"op": "set_igpu_mode", "mode": 0|1|2}  (guarded; force → legion-firmware-helper)
+//!   {"op": "dgpu_status"} / {"op": "dgpu_release"} / {"op": "dgpu_restore"}   NVIDIA driver hand-over (see dgpu.rs)
 //!   {"op": "gpu_mode"}                     MUX state: active now / next boot
 //!   {"op": "fw_oc"}                        firmware CPU OC values (read-only)
 //! Writes that persist in firmware (set_gpu_mode, set_fw_oc, forced set_igpu_mode)
@@ -21,6 +22,9 @@ fn run() -> Value {
             None => json!({"ok": false, "error": "apply needs a 'values' object"}),
         },
         Some("gpu_mode") => legion_wmi::gpu_mode_status(),
+        Some("dgpu_status") => lpm_helpers::dgpu::status(),
+        Some("dgpu_release") => match lpm_helpers::dgpu::release() { Ok(v) => { let mut v = v; v["ok"] = json!(true); v } Err(v) => v },
+        Some("dgpu_restore") => lpm_helpers::dgpu::restore(),
         Some("fw_oc") => legion_wmi::fw_oc_status(),
         Some("panel_extras") => legion_wmi::panel_extras(),
         Some("set_panel_od") => match o.get("on").and_then(Value::as_bool) {

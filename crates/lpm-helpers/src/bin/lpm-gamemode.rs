@@ -462,6 +462,17 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
         }
     }
 
+    // 5a. Custom-mode fan curve: only while the Custom profile is active (the EC follows the table there only).
+    if let Some(lv) = s["fan_table"].as_array().filter(|a| a.len() == 10 && a.iter().all(|x| x.as_u64().map_or(false, |n| (1..=10).contains(&n)))) {
+        if current_platform_profile().as_deref() != Some("custom") {
+            line("Fan curve", Ok("skipped (not the Custom power profile)".into()));
+        } else {
+            let v = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"), &json!({"fan_table": "set", "levels": lv}))
+                .unwrap_or_else(|e| json!({"ok": false, "error": e}));
+            line("Fan curve", if v["ok"] == true { Ok("table written".into()) } else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
+        }
+    }
+
     // 5b. EC fan boost (Full Speed flag), after the platform profile
     if let Some(on) = s["fan_fullspeed"].as_bool() {
         let v = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"),

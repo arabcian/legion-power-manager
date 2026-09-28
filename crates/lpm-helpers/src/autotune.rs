@@ -63,6 +63,89 @@ impl SwapKind {
 #[derive(Clone, Debug)]
 pub struct CState { pub name: String, pub latency_us: u64 }
 
+/// What the running system has actually been through: cumulative reclaim /
+/// compaction / swap counters since boot plus the current pressure-stall
+/// averages. Rules use it only to *raise* a safety margin or to withhold an
+/// aggressive setting - never to switch a goal's character. Counters from a
+/// machine that has just booted (or scanned almost nothing) carry no weight.
+#[derive(Clone, Debug, Default)]
+pub struct Evidence {
+    pub uptime_s: u64,
+    pub pgscan_direct: u64,
+    pub pgscan_kswapd: u64,
+    pub allocstall: u64,
+    pub compact_stall: u64,
+    pub thp_fault_alloc: u64,
+    pub thp_fault_fallback: u64,
+    pub pswpout: u64,
+    /// PSI 5-minute averages in percent.
+    pub psi_mem_some: Option<f64>,
+    pub psi_mem_full: Option<f64>,
+    pub psi_cpu_some: Option<f64>,
+}
+
+impl Evidence {
+    pub fn gather() -> Evidence {
+        let mut e = Evidence::default();
+        e.uptime_s = rd("/proc/uptime").and_then(|s| s.split('.').next().and_then(|n| n.parse().ok())).unwrap_or(0);
+        e.parse_vmstat(&std::fs::read_to_string("/proc/vmstat").unwrap_or_default());
+        e.psi_mem_some = psi_avg300(&rd("/proc/pressure/memory").unwrap_or_default(), "some");
+        e.psi_mem_full = psi_avg300(&rd("/proc/pressure/memory").unwrap_or_default(), "full");
+        e.psi_cpu_some = psi_avg300(&rd("/proc/pressure/cpu").unwrap_or_default(), "some");
+        e
+    }
+
+    pub fn parse_vmstat(&mut self, text: &str) {
+        for l in text.lines() {
+            let Some((k, v)) = l.split_once(' ') else { continue };
+            let Ok(n) = v.trim().parse::<u64>() else { continue };
+            match k {
+                "pgscan_direct" => self.pgscan_direct = n,
+                "pgscan_kswapd" => self.pgscan_kswapd = n,
+                "compact_stall" => self.compact_stall = n,
+                "thp_fault_alloc" => self.thp_fault_alloc = n,
+                "thp_fault_fallback" => self.thp_fault_fallback = n,
+                "pswpout" => self.pswpout = n,
+                _ if k.starts_with("allocstall_") => self.allocstall += n,
+                _ => {}
+            }
+        }
+    }
+
+    /// Share of scanned pages that the allocating thread itself had to reclaim
+    /// (direct reclaim = a stall on that thread). None without enough history.
+    pub fn direct_reclaim_share(&self) -> Option<f64> {
+        let total = self.pgscan_direct + self.pgscan_kswapd;
+        (self.uptime_s >= 3600 && total >= 200_000).then(|| self.pgscan_direct as f64 / total as f64)
+    }
+    /// Direct reclaim is a regular event, not a one-off.
+    pub fn reclaim_stalls(&self) -> bool {
+        self.direct_reclaim_share().map_or(false, |s| s >= 0.10) && self.allocstall >= 1000
+    }
+    /// Memory is short right now (tasks are stalling on it).
+    pub fn mem_pressure_now(&self) -> bool {
+        self.psi_mem_full.map_or(false, |v| v >= 1.0) || self.psi_mem_some.map_or(false, |v| v >= 10.0)
+    }
+    /// One line for the report header; empty without any signal.
+    pub fn summary(&self) -> String {
+        let mut p = Vec::new();
+        if let Some(s) = self.direct_reclaim_share() {
+            p.push(format!("direct reclaim {:.0}% of scanned pages ({} stalls)", s * 100.0, self.allocstall));
+        }
+        if let (Some(a), Some(f)) = (self.psi_mem_some, self.psi_mem_full) { p.push(format!("memory pressure {a:.1}% some / {f:.1}% full (5 min)")); }
+        if let Some(c) = self.psi_cpu_some { p.push(format!("CPU pressure {c:.1}% (5 min)")); }
+        let faults = self.thp_fault_alloc + self.thp_fault_fallback;
+        if faults >= 1000 { p.push(format!("THP fault success {:.0}%", self.thp_fault_alloc as f64 * 100.0 / faults as f64)); }
+        p.join(" · ")
+    }
+}
+
+/// avg300 (percent) of the `some` / `full` line of a /proc/pressure file.
+pub fn psi_avg300(text: &str, kind: &str) -> Option<f64> {
+    text.lines().find(|l| l.starts_with(kind))?.split_whitespace()
+        .find_map(|w| w.strip_prefix("avg300=")).and_then(|v| v.parse().ok())
+}
+
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub vendor: tune::Vendor,
@@ -97,6 +180,7 @@ pub struct Profile {
     pub scx: Vec<String>,
     pub dynamic_epp: bool,
     pub uncore: Option<(u64, u64)>,
+    pub evidence: Evidence,
     /// Live values of the rows whose rule depends on the current state.
     pub current: BTreeMap<String, String>,
 }
@@ -234,6 +318,7 @@ impl Profile {
             scx,
             dynamic_epp: cpu.join("amd_pstate/dynamic_epp").is_file(),
             uncore,
+            evidence: Evidence::gather(),
             current,
         }
     }
@@ -264,6 +349,10 @@ impl Profile {
             "gpu": {"nvidia": self.nvidia_dgpu, "amd": self.amd_igpu, "intel": self.intel_igpu},
             "wifi": self.wifi, "kernel": format!("{}.{}", self.kernel.0, self.kernel.1), "numa_nodes": self.numa_nodes,
             "sched_ext": self.scx, "dynamic_epp": self.dynamic_epp,
+            "evidence": {"uptime_s": self.evidence.uptime_s, "direct_reclaim_share": self.evidence.direct_reclaim_share(),
+                         "allocstall": self.evidence.allocstall, "compact_stall": self.evidence.compact_stall,
+                         "psi_mem_some": self.evidence.psi_mem_some, "psi_mem_full": self.evidence.psi_mem_full,
+                         "psi_cpu_some": self.evidence.psi_cpu_some},
         })
     }
 
@@ -434,6 +523,18 @@ fn cpu_rules(r: &mut Rules) {
                           _ => "Clock follows a wake-up burst within 0.5 ms." });
     }
 
+    // Floor frequency (kernel 7.1+, CPPC Performance Priority): what firmware
+    // throttles to first under a power/thermal limit. Absent on most CPUs (row
+    // is then filtered). Nominal is the kernel default and the right sustained
+    // floor for anything that wants performance; power saving lets it fall.
+    if p.amd() {
+        if r.is(PowerSave) {
+            r.set("cpu.floor_freq", "cpuinfo_min", "Under a power or thermal limit firmware may throttle all the way to the hardware minimum: lowest package power, and there is no sustained-performance goal to protect.");
+        } else {
+            r.set("cpu.floor_freq", "nominal", "Under a power or thermal limit firmware sheds boost first and holds the nominal clock (kernel default): sustained games and builds keep their base performance instead of collapsing to the idle floor.");
+        }
+    }
+
     // Turbo: the single biggest power lever; everything but power saving wants it.
     match r.g {
         PowerSave => r.set("cpu.boost", "0", "Turbo off removes the least efficient (highest-voltage) bins - the largest single power/heat saving; base clock remains."),
@@ -555,7 +656,19 @@ fn memory_rules(r: &mut Rules) {
     // (kernel docs' thrashing-prevention example is 1000 ms).
     if p.cur("mm.lru_gen").map_or(true, |v| v != "7") { r.set("mm.lru_gen", 7, "All MGLRU features (kernel default)."); }
     if matches!(r.g, Gaming | Desktop) {
-        r.set("mm.lru_gen_min_ttl", 1000, "Working set of the last second is never evicted: no thrashing stutter; under real pressure the OOM killer ends a process instead.");
+        // min_ttl trades thrashing for an OOM kill when the working set does not fit:
+        // right with headroom, wrong on a machine that is already short of RAM.
+        if gb < 12 || p.evidence.mem_pressure_now() {
+            r.set("mm.lru_gen_min_ttl", 0, if gb < 12 { "Under 12 GB of RAM the working set of a game plus browser can exceed memory: protecting it would trade stutter for OOM kills, so the protection stays off." }
+                  else { "Tasks are stalling on memory right now: protecting the last second's working set would turn that pressure into an OOM kill, so the protection stays off." });
+        } else {
+            r.set("mm.lru_gen_min_ttl", 1000, "Working set of the last second is never evicted: no thrashing stutter; under real pressure the OOM killer ends a process instead.");
+        }
+    }
+    // khugepaged collapsing a range reads its swapped-out pages back in (default: up to
+    // 64 of 512). Background work should never cause swap-in I/O or decompression.
+    if !matches!(p.swap, SwapKind::None) && !r.is(Throughput) {
+        r.set("thp.khp_max_ptes_swap", 0, "khugepaged only collapses ranges that are fully resident: background huge-page building never reads swap back in behind a running program.");
     }
     if !r.is(Desktop) && p.cur("mm.ksm_run").map_or(true, |v| v != "0") { r.set("mm.ksm_run", 0, "Stop the KSM scanner: pure background cost without VMs."); }
     if !r.is(PowerSave) {
@@ -587,9 +700,23 @@ fn memory_rules(r: &mut Rules) {
     }
 
     // Reclaim: watermark_scale_factor (default 10 = 0.1% of RAM) sets how early
-    // kswapd starts; a larger gap means fewer direct-reclaim stalls.
-    if gb >= 16 && matches!(r.g, Gaming | Desktop | Throughput) {
-        r.set("vm.watermark_scale_factor", 125, "kswapd wakes at ~1.25% free instead of 0.1%: allocations rarely hit direct reclaim (a stall on the allocating thread).");
+    // kswapd starts; a larger gap means fewer direct-reclaim stalls. The gap is
+    // sized in bytes (~400 MiB of headroom, the value CachyOS's 125 gives on a
+    // 32 GB machine) and converted to the per-10000 factor, so 64 GB does not
+    // hold 800 MiB idle and 16 GB does not get less than it needs. Evidence of
+    // regular direct reclaim (allocstall + share of pgscan_direct) raises it by
+    // half and also enables it on machines below 16 GB.
+    let ev = &p.evidence;
+    if matches!(r.g, Gaming | Desktop | Throughput) && (gb >= 16 || ev.reclaim_stalls()) {
+        let scaled = (((400u64 << 20) * 10_000) / (p.ram_kb * 1024).max(1)).clamp(10, 150) as i64;
+        if ev.reclaim_stalls() {
+            let share = ev.direct_reclaim_share().unwrap_or(0.0) * 100.0;
+            r.set("vm.watermark_scale_factor", (scaled * 3 / 2).min(300),
+                  format!("Direct reclaim is a regular event here ({share:.0}% of scanned pages, {} allocation stalls since boot): kswapd starts 1.5x earlier than the ~400 MiB headroom baseline so the allocating thread stops doing the reclaim itself.", ev.allocstall));
+        } else {
+            r.set("vm.watermark_scale_factor", scaled,
+                  format!("kswapd wakes with ~400 MiB of free headroom ({:.2}% of RAM) instead of 0.1%: allocations rarely hit direct reclaim (a stall on the allocating thread), without pinning gigabytes idle on big-RAM machines.", scaled as f64 / 100.0));
+        }
     }
     // Watermark boosting (default 15000) makes kswapd reclaim extra cache after
     // every fragmentation event - a periodic reclaim storm with no benefit here.
@@ -653,6 +780,15 @@ fn sched_rules(r: &mut Rules) {
     if p.cur("kernel.sched_schedstats") == Some("1") && r.g != Desktop {
         r.set("kernel.sched_schedstats", "0", "Schedstats were left on by some tool: per-switch accounting cost removed.");
     }
+    // Scheduler feature bits (debugfs). NEXT_BUDDY: the kernel's stated rationale is that
+    // waker and wakee share cache-hot data, so the wakee runs next (game main <-> render /
+    // audio thread hand-offs); it became the default in the scheduler tree in Nov 2025, so
+    // on newer kernels this only pins the value. RUN_TO_PARITY (default on) is kept for
+    // goals that value fewer preemptions.
+    match r.g {
+        Gaming | Desktop => r.set("sched.feat_next_buddy", "1", "Producer/consumer thread hand-offs (game <-> render/audio, compositor <-> client) run back-to-back on warm caches; the kernel commit enabling it gives exactly this reason. Not measured on X3D by this tool."),
+        Throughput | PowerSave => r.set("sched.feat_run_to_parity", "1", "A running task is not preempted by wakeups before its slice or lag point: fewer context switches, more work per slice (kernel default, pinned in case a tool turned it off)."),
+    }
     r.set("sched.itmt", "1", "Preferred cores first: light loads run on the best-binned cores.");
 
     // Preemption and EEVDF slice. lazy (6.13+) = full's latency, voluntary's throughput.
@@ -668,10 +804,6 @@ fn sched_rules(r: &mut Rules) {
     // a fixed shorter/longer global slice for these goals.
     if r.is(Throughput) {
         r.set("sched.migration_cost_ns", 5_000_000, "Tasks count as cache-hot for 5 ms (TuneD throughput value): fewer cache-destroying migrations.");
-    }
-    match r.g {
-        PowerSave | Desktop => r.set("wq.power_efficient", "1", "Power-efficient workqueues may run on already-awake CPUs."),
-        Gaming | Throughput => r.set("wq.power_efficient", "0", "Kernel work stays on the queuing CPU (latency/locality)."),
     }
     if p.cur("wq.affinity_scope").map_or(false, |v| v != "cache") {
         r.set("wq.affinity_scope", "cache", "Unbound kernel work stays inside the L3 domain that queued it (kernel default).");
@@ -782,6 +914,36 @@ fn device_rules(r: &mut Rules) {
         PowerSave => r.set("pm.usb_runtime", "auto", "Idle webcam/Bluetooth/readers suspend."),
         _ => {}
     }
+    match r.g {
+        PowerSave => {
+            r.set("net.wol", "0", "Wake-on-LAN off (TLP default): the wired NIC can power down fully in suspend.");
+            r.set("gpu.amdgpu_abm", 3, "Panel power savings level 3 (TLP's battery level): lower backlight, compensated pixels.");
+        }
+        Desktop => r.set("net.wol", "0", "Wake-on-LAN off: the wired NIC can power down fully in suspend."),
+        Gaming | Throughput => r.set("gpu.amdgpu_abm", 0, "Panel power savings off: no backlight/contrast modulation, accurate colour."),
+        #[allow(unreachable_patterns)] _ => {}
+    }
+
+    if p.sata_hosts {
+        match r.g {
+            PowerSave => {
+                for k in ["disk.apm_0", "disk.apm_1", "disk.apm_2", "disk.apm_3"] {
+                    r.set(k, 128, "APM 128 (TLP battery level): saving without spin-down on every start-stop cycle.");
+                }
+                r.set("pm.ahci_runtime_timeout", 15_000, "Idle ATA disks suspend after 15 s (TLP default).");
+                r.set("pm.ahci_disk_runtime", "auto", "Idle ATA disks may suspend.");
+                r.set("pm.ahci_port_runtime", "auto", "Idle AHCI ports may power down.");
+            }
+            Gaming | Throughput => {
+                for k in ["disk.apm_0", "disk.apm_1", "disk.apm_2", "disk.apm_3"] {
+                    r.set(k, 254, "APM 254 (TLP AC level): maximum performance, no power-saving stalls.");
+                }
+                r.set("pm.ahci_disk_runtime", "on", "ATA disks never suspend: no spin-up delay mid-session.");
+                r.set("pm.ahci_port_runtime", "on", "AHCI ports stay powered.");
+            }
+            Desktop => {}
+        }
+    }
     if p.sata_hosts {
         r.set("pm.sata_alpm", match r.g { Gaming | Throughput => "max_performance", PowerSave | Desktop => "med_power_with_dipm" },
               match r.g { Gaming | Throughput => "SATA link always active.", _ => "Modern default: partial/slumber with device-initiated PM." });
@@ -843,7 +1005,7 @@ pub fn autotune_with(goal: Goal, p: &Profile) -> Value {
     let summary = format!("Autotuned for {} on {}.", goal.label().to_lowercase(), p.summary());
     json!({
         "ok": true, "goal": goal.key(), "goal_label": goal.label(), "name": goal.preset_name(),
-        "profile": p.to_json(), "profile_summary": p.summary(),
+        "profile": p.to_json(), "profile_summary": p.summary(), "evidence_summary": p.evidence.summary(),
         "preset": {"values": values, "run": run, "summary": summary,
                    "autotune": {"goal": goal.key(), "kernel": format!("{}.{}", p.kernel.0, p.kernel.1)}},
         "rationale": why, "skipped": skipped,
@@ -869,6 +1031,7 @@ mod tests {
             ram_kb: 32 * 1024 * 1024, swap: SwapKind::Zram, nvme: true, rotational: false, sata_hosts: false,
             battery: true, on_ac: Some(true), nvidia_dgpu: true, amd_igpu: true, intel_igpu: false, wifi: true,
             kernel: (7, 0), numa_nodes: 1, scx: vec!["lavd".into(), "bpfland".into()], dynamic_epp: true, uncore: None,
+            evidence: Evidence::default(),
             current: BTreeMap::from([("vm.min_free_kbytes".into(), "67584".into()), ("cpu.ccd_park".into(), "none".into())]),
         }
     }
@@ -956,6 +1119,63 @@ mod tests {
         assert_eq!(parse_release("7.0.1-gentoo"), (7, 0));
         assert_eq!(Goal::parse("Optimal desktop"), Some(Goal::Desktop));
         assert_eq!(Goal::parse("bare-throughput"), Some(Goal::Throughput));
+    }
+
+
+    #[test]
+    fn evidence_scales_and_gates() {
+        // ~400 MiB headroom: 32 GB -> 122, 64 GB -> 61, 16 GB -> capped at 150.
+        let wsf = |kb: u64, ev: Evidence, g: Goal| { let mut p = legion(); p.ram_kb = kb; p.evidence = ev; get(&decide(g, &p), "vm.watermark_scale_factor").cloned() };
+        assert_eq!(wsf(32 << 20, Evidence::default(), Goal::Gaming), Some(json!(122)));
+        assert_eq!(wsf(64 << 20, Evidence::default(), Goal::Gaming), Some(json!(61)));
+        assert_eq!(wsf(16 << 20, Evidence::default(), Goal::Desktop), Some(json!(150)));
+        assert_eq!(wsf(8 << 20, Evidence::default(), Goal::Gaming), None);
+        assert_eq!(wsf(32 << 20, Evidence::default(), Goal::PowerSave), None);
+        // Regular direct reclaim: 1.5x, and it also applies below 16 GB.
+        let mut ev = Evidence { uptime_s: 86_400, pgscan_direct: 300_000, pgscan_kswapd: 1_000_000, allocstall: 5_000, ..Default::default() };
+        assert!(ev.reclaim_stalls());
+        assert_eq!(wsf(32 << 20, ev.clone(), Goal::Gaming), Some(json!(183)));
+        assert_eq!(wsf(8 << 20, ev.clone(), Goal::Gaming), Some(json!(225)));
+        // A freshly booted machine (or few scans) carries no weight.
+        ev.uptime_s = 600;
+        assert!(!ev.reclaim_stalls());
+        // min_ttl: off on small RAM or under pressure now, on otherwise.
+        let ttl = |kb: u64, ev: Evidence| { let mut p = legion(); p.ram_kb = kb; p.evidence = ev; get(&decide(Goal::Gaming, &p), "mm.lru_gen_min_ttl").cloned() };
+        assert_eq!(ttl(32 << 20, Evidence::default()), Some(json!(1000)));
+        assert_eq!(ttl(8 << 20, Evidence::default()), Some(json!(0)));
+        assert_eq!(ttl(32 << 20, Evidence { psi_mem_full: Some(2.5), ..Default::default() }), Some(json!(0)));
+    }
+
+    #[test]
+    fn parses_vmstat_and_psi() {
+        let mut e = Evidence::default();
+        e.parse_vmstat("allocstall_normal 10\nallocstall_movable 5\npgscan_direct 7\npgscan_kswapd 93\nthp_fault_alloc 3\nfoo bar\n");
+        assert_eq!((e.allocstall, e.pgscan_direct, e.pgscan_kswapd, e.thp_fault_alloc), (15, 7, 93, 3));
+        let psi = "some avg10=0.00 avg60=1.50 avg300=3.25 total=99\nfull avg10=0.00 avg60=0.10 avg300=0.40 total=9\n";
+        assert_eq!(psi_avg300(psi, "some"), Some(3.25));
+        assert_eq!(psi_avg300(psi, "full"), Some(0.40));
+        assert_eq!(psi_avg300("", "some"), None);
+    }
+
+    #[test]
+    fn new_knobs_follow_goal() {
+        let p = legion();
+        let (g, d, t, ps) = (decide(Goal::Gaming, &p), decide(Goal::Desktop, &p), decide(Goal::Throughput, &p), decide(Goal::PowerSave, &p));
+        assert_eq!(get(&g, "sched.feat_next_buddy"), Some(&json!("1")));
+        assert_eq!(get(&d, "sched.feat_next_buddy"), Some(&json!("1")));
+        assert!(get(&t, "sched.feat_next_buddy").is_none());
+        assert_eq!(get(&t, "sched.feat_run_to_parity"), Some(&json!("1")));
+        assert_eq!(get(&g, "thp.khp_max_ptes_swap"), Some(&json!(0)));
+        assert!(get(&t, "thp.khp_max_ptes_swap").is_none());
+        assert_eq!(get(&ps, "cpu.floor_freq"), Some(&json!("cpuinfo_min")));
+        assert_eq!(get(&g, "cpu.floor_freq"), Some(&json!("nominal")));
+    }
+
+    #[test]
+    fn scheduler_feature_text() {
+        assert_eq!(tune::sched_feature_state_for_test("PLACE_LAG NO_NEXT_BUDDY RUN_TO_PARITY", "NEXT_BUDDY"), Some("0"));
+        assert_eq!(tune::sched_feature_state_for_test("PLACE_LAG NEXT_BUDDY", "NEXT_BUDDY"), Some("1"));
+        assert_eq!(tune::sched_feature_state_for_test("PLACE_LAG", "NEXT_BUDDY"), None);
     }
 
     #[test]

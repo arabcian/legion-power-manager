@@ -604,6 +604,11 @@ pub fn set_igpu_mode(mode: u64, force: bool) -> Value {
                 "error": format!("this kernel has no {} driver: with the dGPU cut off nothing could drive the display.", igpu_driver_name(kind))});
         }
     }
+    // Both iGPU-only and Auto (on battery) make the EC eject the dGPU's slot. The
+    // NVIDIA driver must be gone by then, or its remove hangs holding the PCI lock.
+    if mode != 0 && igpu_present().is_some() {
+        if let Err(v) = crate::dgpu::release() { return v; }
+    }
     if !acpi_available() { modprobe_acpi_call(); }
     match wmaa(0x3F, 0) {
         Ok(3) => {}

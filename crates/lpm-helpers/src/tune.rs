@@ -107,6 +107,12 @@ pub enum Target {
     X3d,
     /// Per-policy scaling_min_freq from a sibling frequency file.
     MinFreq,
+    /// Per-policy amd_pstate_floor_freq (kernel 7.1+, CPPC Performance Priority): the
+    /// frequency firmware throttles to first when power/thermal limits bite. Same
+    /// values as MinFreq (lowest_nonlinear / cpuinfo_min).
+    FloorFreq,
+    /// One scheduler feature bit in debugfs sched/features: written as NAME or NO_NAME.
+    SchedFeature(&'static str),
     /// cpu*/cpuidle/state*/disable: keep states <= N enabled.
     CState,
     /// Same queue attribute on every whole disk (nvme, sd, mmcblk, vd).
@@ -142,6 +148,22 @@ pub enum Target {
     ScsiHost(&'static str),
     /// power/pm_qos_latency_tolerance_us of every NVMe controller (APST ceiling).
     NvmeLatency,
+    /// amdgpu panel power savings (ABM) level of every eDP connector.
+    AmdgpuAbm,
+    /// Wake-on-LAN of every physical Ethernet port, through `ethtool` (no sysfs knob).
+    EthWol,
+    /// `soft` block switch of every rfkill device of one type (bluetooth / wlan / wwan).
+    /// Inverted for the user: 1 = radio enabled.
+    Rfkill(&'static str),
+    /// power/autosuspend_delay_ms of the USB devices `UsbRuntimePm` may touch.
+    UsbAutosuspendMs,
+    /// power/control of every AHCI port (`<pci device>/ata*`), TLP's AHCI_RUNTIME_PM for ports.
+    AhciPortRuntime,
+    /// `device/power/<attr>` of every ATA disk that supports runtime PM (control / autosuspend_delay_ms).
+    AhciDisk(&'static str),
+    /// ATA APM level (hdparm -B) of the Nth APM-capable ATA disk (sorted by serial, so
+    /// the slot follows the drive, not sdX). One slot per disk = per-disk levels.
+    DiskApm(usize),
     /// vm.dirty_bytes / dirty_background_bytes. Writing bytes zeroes the ratio
     /// twin, and 0 is not a valid bytes value, so while the system is in ratio
     /// mode the baseline records "ratio:<n>" and restore writes the ratio file.
@@ -211,6 +233,9 @@ pub const TUNABLES: &[Tunable] = &[
     t("cpu.min_freq", "CPU", "Minimum frequency",
       "(Only 'cpuinfo_min' is offered on Intel: intel_pstate has no lowest-nonlinear file and HWP already avoids the inefficient range on its own.) lowest_nonlinear raises the CPU's idle floor to amd_pstate_lowest_nonlinear_freq (typically 400-600 MHz above the hardware minimum): frequencies below that point are inefficient on Zen, disproportionate wake-up latency for negligible power savings. Safe to enable for every scenario, including battery; the lowest-risk, no-downside row on this whole tab.",
       Kind::Choice, Options::Special, Target::MinFreq),
+    amd(t("cpu.floor_freq", "CPU", "Floor frequency (power-limit throttle target)",
+      "Kernel 7.1+ on CPUs with AMD 'CPPC Performance Priority' (row shows n/a everywhere else, including Zen 5 mobile as of now). When a package power or thermal limit forces the platform to throttle, firmware first drops the core to this floor before going lower still. The kernel default is the nominal frequency, which is what you want while gaming or compiling on a power-limited laptop (sustained clocks stay high, only the boost above them is shed). cpuinfo_min lets a power-saving profile throttle all the way down; lowest_nonlinear keeps the efficient region. Threads of one core should share one value (SMT siblings are written together).",
+      Kind::Choice, Options::Special, Target::FloorFreq)),
     // Per-CCD overrides: applied after the global rows above, so a preset can
     // set everything and then split the dies (e.g. V-Cache die performance,
     // frequency die balance_power while it only hosts IRQs and background work).
@@ -337,6 +362,9 @@ pub const TUNABLES: &[Tunable] = &[
     t("thp.khp_scan_sleep_ms", "Memory", "khugepaged scan_sleep_millisecs",
       "Pause between khugepaged scan passes. Default 10000 (10 s). Longer = fewer background scan bursts (useful while gaming or on battery); shorter = huge pages form sooner.",
       int(0, 600_000), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs")),
+    t("thp.khp_max_ptes_swap", "Memory", "khugepaged max_ptes_swap",
+      "How many of a 2 MB range's 4 KB pages may still sit in swap when khugepaged collapses the range into a huge page (default 64): the collapse then reads them back in, synchronously, from zram/zswap or disk. 0 = only collapse ranges that are fully resident, so background collapsing never causes swap-in I/O or decompression work behind a running program's back. Only matters with THP enabled and swap in use.",
+      int(0, 511), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_swap")),
     t("thp.khp_alloc_sleep_ms", "Memory", "khugepaged alloc_sleep_millisecs",
       "How long khugepaged backs off after failing to allocate a huge page (memory fragmented). Default 60000. Longer = less futile compaction work under memory pressure.",
       int(0, 600_000), NO, Target::File("/sys/kernel/mm/transparent_hugepage/khugepaged/alloc_sleep_millisecs")),
@@ -461,9 +489,12 @@ pub const TUNABLES: &[Tunable] = &[
     dbg(t("sched.nr_migrate", "Scheduler", "nr_migrate (debugfs)",
       "Maximum tasks moved in one load-balancing pass (default 32). Lower reduces burstiness per pass at the cost of correcting large imbalances more slowly; higher corrects faster but does more work per pass. Leave at default unless profiling scheduler balancing specifically.",
       int(1, 1024), NO, Target::File("/sys/kernel/debug/sched/nr_migrate"))),
-    t("wq.power_efficient", "Scheduler", "workqueue power_efficient",
-      "When enabled (Y/1, the kernel's power-saving default), some per-CPU kernel workqueues are allowed to migrate to an unbound worker to save power. Disabling it (N/0, what the gaming presets set) keeps that work pinned to the CPU that queued it - marginally lower latency for whatever depends on that work completing promptly, at a small power-efficiency cost. Combine with the 'Unbound workqueue CPUs' row below to also steer the workqueues that are unbound by design onto a specific CCD.",
-      Kind::Bool, NO, Target::File("/sys/module/workqueue/parameters/power_efficient")),
+    dbg(t("sched.feat_next_buddy", "Scheduler", "NEXT_BUDDY (debugfs)",
+      "Wakeup-preemption buddy: after a task wakes another, prefer running the woken task next, on the assumption that waker and wakee share cache-hot data (a game's main thread handing work to a render or audio thread, a pipe or futex hand-off). Kernel source describes it as improving cache locality; it was off by default for years and was switched on in the scheduler tree in Nov 2025 (kernels after that have it on already - the row shows the live value). On for interactive and game loads; leave at kernel default for pure throughput.",
+      Kind::Bool, NO, Target::SchedFeature("NEXT_BUDDY"))),
+    dbg(t("sched.feat_run_to_parity", "Scheduler", "RUN_TO_PARITY (debugfs)",
+      "Wakeup preemption is inhibited until the running task has reached its zero-lag point or used up its slice (default on); tasks with a shorter slice may still cancel it (PREEMPT_SHORT). On = fewer preemptions and context switches, better throughput; off = every eligible wakeup may preempt at once, lower worst-case wake-up latency, more switches. Leave on unless you are chasing a specific latency spike.",
+      Kind::Bool, NO, Target::SchedFeature("RUN_TO_PARITY"))),
     t("wq.affinity_scope", "Scheduler", "Unbound workqueue affinity scope",
       "Kernel 6.6+: how widely an unbound work item may travel from the CPU that queued it. cache (stock) = within the same L3 - on a two-CCD Ryzen the work stays on the die that asked for it, no cross-CCD cache traffic; smt / cpu = even closer (better locality, less work-conservation); numa / system = anywhere (best for spreading heavy work, worst locality). Use together with 'Unbound workqueue CPUs', which is a hard CPU mask; this row is only the locality preference inside that mask.",
       Kind::Choice, Options::Fixed(&["cpu", "smt", "cache", "numa", "system"]), Target::File("/sys/module/workqueue/parameters/default_affinity_scope")),
@@ -515,6 +546,45 @@ pub const TUNABLES: &[Tunable] = &[
     t("usb.autosuspend", "Devices", "USB autosuspend delay (s)",
       "Default autosuspend delay (seconds) applied to USB devices as they are plugged in or the driver binds. -1 disables autosuspend entirely for newly-bound devices: no risk of a mouse/controller/USB DAC needing a moment to wake up right when you move it - the recommended value for gaming peripherals. This only affects devices that bind after the change; anything already plugged in keeps whatever delay it already had (replug it, or reboot with this in the boot preset, to apply retroactively). A positive number is the idle seconds before autosuspend for devices without their own override.",
       int(-1, 3600), NO, Target::File("/sys/module/usbcore/parameters/autosuspend")),
+    t("usb.autosuspend_ms", "Devices", "USB autosuspend delay · connected (ms)",
+      "Idle time in milliseconds before a USB device that is plugged in RIGHT NOW may autosuspend (power/autosuspend_delay_ms). The 'USB autosuspend delay' row above only reaches devices that bind later; this one reaches the ones already connected, so together they cover both. Only matters where runtime PM is 'auto' (see 'USB runtime PM'): 2000 is the kernel default, -1 = never suspend, small values save more power but wake the device more often. HID (mouse, keyboard, controller) and USB audio devices are skipped, like in the runtime PM row.",
+      int(-1, 3_600_000), NO, Target::UsbAutosuspendMs),
+    t("net.wol", "Devices", "Wake-on-LAN (Ethernet)",
+      "Wake-on-LAN keeps the Ethernet PHY/MAC partly powered so a magic packet can wake the machine. 0 = off (TLP's WOL_DISABLE default): the NIC can power down fully in suspend and the laptop cannot be woken by network chatter in a bag; 1 = magic-packet wake (ethtool wol g), only offered when the port supports it. Set through ethtool; restoring a port that had another wake mode (e.g. 'pg') writes magic-packet wake back. n/a without ethtool or without a wired port that supports WoL.",
+      Kind::Bool, NO, Target::EthWol),
+    t("rf.bluetooth", "Devices", "Bluetooth radio",
+      "Soft-blocks / unblocks every Bluetooth adapter through rfkill (1 = radio on, 0 = off). An idle but enabled adapter keeps its USB/PCIe link and firmware awake (a few hundred mW); TLP switches it off on battery when you list it in DEVICES_TO_DISABLE. Turning it off disconnects every Bluetooth device, so leave it on if a BT mouse or headset is in use.",
+      Kind::Bool, NO, Target::Rfkill("bluetooth")),
+    warn(t("rf.wlan", "Devices", "Wi-Fi radio",
+      "Soft-blocks / unblocks every Wi-Fi adapter through rfkill (1 = radio on, 0 = off). Off drops the connection completely - only for a wired-only or offline profile. Do not put it in a boot preset unless you are sure a wired link is available.",
+      Kind::Bool, NO, Target::Rfkill("wlan"))),
+    t("rf.wwan", "Devices", "WWAN (mobile broadband) radio",
+      "Soft-blocks / unblocks every WWAN modem through rfkill (1 = radio on, 0 = off). Only present on laptops with a cellular modem; a powered modem searching for a network is a large idle drain.",
+      Kind::Bool, NO, Target::Rfkill("wwan")),
+    t("gpu.amdgpu_abm", "Devices", "Panel power savings (amdgpu ABM)",
+      "Adaptive backlight modulation of the internal display (amdgpu 'panel_power_savings', kernel 6.8+): the driver lowers the backlight and boosts pixel values to compensate. 0 = off (accurate colour and contrast), 1-4 = increasingly aggressive; TLP's AMDGPU_ABM_LEVEL_ON_SAV is 3 on battery and 0 otherwise. Saves a few hundred mW to over a watt on bright content but visibly changes contrast in dark scenes - keep 0 for gaming and colour work. power-profiles-daemon may override the level when it changes profile. n/a without an amdgpu-driven eDP panel or on older kernels.",
+      int(0, 4), NO, Target::AmdgpuAbm),
+    t("disk.apm_0", "Devices", "Disk APM level · disk 1",
+      "ATA Advanced Power Management level of this disk (hdparm -B), TLP's DISK_APM_LEVEL. 1-127 = aggressive saving and the drive may spin down, 128-253 = saving without spin-down (128 is TLP's battery default), 254 = maximum performance (TLP's AC default), 255 = APM off. Only drives that report APM support are listed (mostly spinning disks; most SATA SSDs ignore it); USB and NVMe disks are never touched. Each disk has its own row, tied to the drive's serial number, so a value follows the drive even if sdX names change. Reading the live value needs root or membership of the 'disk' group; the row then shows the value LPM last applied.",
+      int(1, 255), NO, Target::DiskApm(0)),
+    t("disk.apm_1", "Devices", "Disk APM level · disk 2",
+      "Same as 'Disk APM level · disk 1', for the second APM-capable ATA disk.",
+      int(1, 255), NO, Target::DiskApm(1)),
+    t("disk.apm_2", "Devices", "Disk APM level · disk 3",
+      "Same as 'Disk APM level · disk 1', for the third APM-capable ATA disk.",
+      int(1, 255), NO, Target::DiskApm(2)),
+    t("disk.apm_3", "Devices", "Disk APM level · disk 4",
+      "Same as 'Disk APM level · disk 1', for the fourth APM-capable ATA disk.",
+      int(1, 255), NO, Target::DiskApm(3)),
+    t("pm.ahci_runtime_timeout", "Devices", "AHCI disk runtime PM timeout (ms)",
+      "Idle time in milliseconds before an ATA/SATA disk whose runtime PM is 'auto' is suspended (device/power/autosuspend_delay_ms of the disk; TLP's AHCI_RUNTIME_PM_TIMEOUT, default 15 s = 15000). Applied before the runtime PM rows below, like TLP, so the disk never runs with a stale short timeout. Only useful together with 'AHCI disk runtime PM' = auto.",
+      int(0, 3_600_000), NO, Target::AhciDisk("power/autosuspend_delay_ms")),
+    t("pm.ahci_disk_runtime", "Devices", "AHCI disk runtime PM",
+      "Runtime power management of every ATA/SATA disk (device/power/control; TLP's AHCI_RUNTIME_PM_ON_* for disks): auto = an idle disk is suspended after the timeout above and woken on the next access, on = never suspended (TLP's AC setting). A suspended spinning disk pays a spin-up delay on the next read. NVMe and USB disks are not affected.",
+      Kind::Choice, Options::Fixed(&["auto", "on"]), Target::AhciDisk("power/control")),
+    t("pm.ahci_port_runtime", "Devices", "AHCI port runtime PM",
+      "Runtime power management of every AHCI port (ata* under the SATA controller; TLP's AHCI_RUNTIME_PM_ON_* for ports): auto lets an idle port (nothing attached, or its disk suspended) power down, on keeps it powered. Complements 'SATA link power (ALPM)' in the Power group, which controls the link state itself. n/a on machines without an AHCI controller.",
+      Kind::Choice, Options::Fixed(&["auto", "on"]), Target::AhciPortRuntime),
     // ── Power (runtime PM of devices) ─────────────────────────────────────
     t("pm.pci_runtime", "Power", "PCI runtime PM",
       "Runtime power management of every PCI function (power/control): auto = an idle device (Wi-Fi, card reader, USB/Thunderbolt controller, audio, SATA) may drop to D3 and is woken on demand - TLP's battery setting, often worth 1-3 W idle on a laptop; on = always powered (no resume delay, TLP's AC setting). GPUs are left alone, together with their audio/USB-C sibling functions and every bridge above them: the NVIDIA dGPU reaches D3cold through its own driver and its root port, and forcing 'on' there would keep it awake. Drivers that manage this themselves (nvidia, nouveau, amdgpu, radeon, i915, xe, mei_me) are skipped too.",
@@ -552,6 +622,9 @@ pub const TUNABLES: &[Tunable] = &[
       "On a hybrid Intel CPU this parks the E-cores instead (the P-cores hold cpu0 and can never be parked): the game then only ever shares the ring with P-cores - a test tool for titles with bad hybrid scheduling, not a daily setting. Takes an entire CCD fully offline (every CPU in it): no scheduling, no IRQs, no cross-CCD cache-coherency traffic can reach it at all. The most deterministic possible setup for an X3D chip - the game gets sole, uncontested use of one die's cache and cores with zero interference from the other die under any circumstance - at the obvious cost of losing that die's cores entirely until restored. The Competitive preset parks the frequency CCD as its most aggressive step; only reach for this if affinity plus workqueue/IRQ steering (which achieve most of the isolation benefit without losing any cores) is not enough for what you are chasing. cpu0's CCD can never be parked (the kernel needs cpu0 online), so on a 2-CCD chip you can only ever park 'the other one'. While any CPU is offline (park or SMT off) nvidia-powerd is stopped and restarted afterwards: it cannot handle hot-unplugged CPUs and on Blackwell laptops that ends in a GSP hang (Xid 79/119 -> 154, reboot needed). Dynamic Boost (+25 W GPU) is therefore off while parked. Game mode (lpm-gamemode PRE/RUN/WRAP) never takes the CCD offline: Wine/Proton count only online CPUs and map them 1:1 to CPU numbers, so the hole a parked CCD leaves (0-7,16-23) breaks thread pinning and some games do not start. There the CCD is emptied instead - the game gets the other CCD as a cgroup v2 cpuset partition (everything else is moved off it; needs the unified cgroup hierarchy, OpenRC rc_cgroup_mode=\"unified\", otherwise the game is only pinned), IRQs and unbound kernel work are moved onto the parked CCD, and WINE_CPU_TOPOLOGY maps the game's CPUs - which isolates the game just as well.",
       Kind::Choice, Options::Special, Target::CcdPark)),
 ];
+
+/// Rows that were removed from the table; saved presets may still carry them and must not error.
+pub const RETIRED_KEYS: &[&str] = &["wq.power_efficient"];
 
 pub fn find(key: &str) -> Option<&'static Tunable> {
     TUNABLES.iter().find(|t| t.key == key)
@@ -668,6 +741,41 @@ pub fn debugfs_mounted() -> bool {
     std::fs::read_to_string("/proc/self/mounts")
         .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(DEBUGFS)))
         .unwrap_or(false)
+}
+
+/// World-readable copy of the live debugfs tunable values, written by root
+/// (tune-helper) after every privileged operation. debugfs itself stays 0700:
+/// unprivileged callers read this file instead, so nothing is opened up.
+pub const DEBUGFS_SNAPSHOT: &str = "/run/legion-power-manager/debugfs.json";
+
+/// Root only. Atomic (temp + rename), mode 0644, in a root-owned 0755 directory.
+pub fn write_debugfs_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } != 0 || !ensure_debugfs() { return; }
+    let mut m = Map::new();
+    for t in TUNABLES.iter().filter(|t| t.debugfs && vendor_ok(t)) {
+        if let Some(v) = current(t) { m.insert(t.key.to_owned(), Value::String(v)); }
+    }
+    let path = Path::new(DEBUGFS_SNAPSHOT);
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() { return; }
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    let tmp = dir.join(".debugfs.json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let body = Value::Object(m).to_string();
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Snapshot value of a debugfs tunable; ignored unless the file is root-owned and not group/world-writable.
+fn debugfs_snapshot_value(key: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(DEBUGFS_SNAPSHOT).ok()?;
+    if md.uid() != 0 || md.mode() & 0o022 != 0 { return None; }
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(DEBUGFS_SNAPSHOT).ok()?).ok()?;
+    v.get(key)?.as_str().map(str::to_owned)
 }
 
 /// Mounts debugfs if needed (root only). Never fails the request.
@@ -941,6 +1049,19 @@ fn powerd_service(action: &str) -> bool {
     bin.and_then(|b| run_tool(&b, &args, std::time::Duration::from_secs(15))).map_or(false, |(ok, _)| ok)
 }
 
+/// `systemctl <action> <name>.service` / `rc-service <name> <action>` (name must be a plain daemon name).
+pub fn service_ctl(name: &str, action: &str) -> bool {
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') || !matches!(action, "start" | "stop") { return false; }
+    let bin = |c: &[&str]| c.iter().map(PathBuf::from).find(|p| crate::trusted_path(p));
+    let unit = format!("{name}.service");
+    let t = std::time::Duration::from_secs(15);
+    if Path::new("/run/systemd/system").is_dir() {
+        bin(&["/usr/bin/systemctl", "/bin/systemctl"]).and_then(|b| run_tool(&b, &[action, &unit], t)).map_or(false, |(ok, _)| ok)
+    } else if Path::new("/run/openrc").is_dir() {
+        bin(&["/sbin/rc-service", "/usr/sbin/rc-service", "/bin/rc-service", "/usr/bin/rc-service"]).and_then(|b| run_tool(&b, &[name, action], t)).map_or(false, |(ok, _)| ok)
+    } else { false }
+}
+
 /// True for a hot-plug write that takes CPUs offline (park "0", SMT "off").
 pub fn offlines_cpus(key: &str, data: &str) -> bool {
     is_hotplug(key) && matches!(data, "0" | "off" | "forceoff")
@@ -1031,6 +1152,34 @@ fn role_matching(groups: &[Ccx], set: &[usize]) -> Option<String> {
 const PCI_DEVICES: &str = "/sys/bus/pci/devices";
 const PCI_LATENCY_OFFSET: u64 = 0x0D;
 
+/// PCI devices whose config space / ASPM / power state must not be written by a
+/// tuning knob: every display controller, the other functions of its slot (HDA,
+/// USB-C) and every bridge above them. On a laptop whose dGPU is cut off (iGPU
+/// only, firmware-disabled) or runtime-suspended, a config write resumes the
+/// device through ACPI and the writing process can sit in D state for good.
+fn gpu_tree() -> Vec<PathBuf> {
+    let devs: Vec<PathBuf> = std::fs::read_dir(PCI_DEVICES).into_iter().flatten().flatten()
+        .filter_map(|e| std::fs::canonicalize(e.path()).ok())
+        .filter(|p| p.starts_with("/sys/devices"))
+        .collect();
+    let display: Vec<&PathBuf> = devs.iter().filter(|d| read(&d.join("class")).map_or(false, |c| c.starts_with("0x03"))).collect();
+    let slot = |d: &Path| d.file_name().map(|n| n.to_string_lossy().rsplit_once('.').map_or(String::new(), |x| x.0.to_owned()));
+    let slots: Vec<Option<String>> = display.iter().map(|d| slot(d)).collect();
+    devs.iter()
+        .filter(|d| slots.contains(&slot(d)) || display.iter().any(|g| g.starts_with(d.as_path())))
+        .cloned().collect()
+}
+
+/// True if a write to a file inside `dev` may wake a sleeping device: the device
+/// (or, for a bridge attribute, the device itself) is not fully active.
+fn pci_unsafe_to_touch(file: &Path, tree: &[PathBuf], need_active: bool) -> bool {
+    let Some(mut dev) = file.parent() else { return true };
+    // <dev>/link/l1_aspm and <dev>/power/control belong to <dev>; <dev>/config is <dev>'s own.
+    if dev.file_name().map_or(false, |n| n == "link" || n == "power") { dev = dev.parent().unwrap_or(dev); }
+    if tree.iter().any(|t| t == dev) { return true; }
+    need_active && !matches!(read(&dev.join("power/runtime_status")).as_deref(), None | Some("active"))
+}
+
 fn pci_config_files() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(PCI_DEVICES).into_iter().flatten().flatten()
         .filter_map(|e| canonical_in_sysfs(&e.path().join("config")))
@@ -1038,6 +1187,12 @@ fn pci_config_files() -> Vec<PathBuf> {
         .collect();
     v.sort();
     v
+}
+
+/// Config files a *write* may touch (see gpu_tree).
+fn pci_config_files_writable() -> Vec<PathBuf> {
+    let tree = gpu_tree();
+    pci_config_files().into_iter().filter(|p| !pci_unsafe_to_touch(p, &tree, true)).collect()
 }
 
 fn is_pci_config(p: &Path) -> bool {
@@ -1178,7 +1333,8 @@ pub fn kmod_available(module: &str, subdir: &str) -> bool {
 }
 
 /// intel_pstate/no_turbo is the inverse of "boost".
-fn inverted(f: &Path) -> bool { f.file_name().map_or(false, |n| n == "no_turbo") }
+/// no_turbo speaks the opposite of "boost", rfkill `soft` the opposite of "radio on".
+fn inverted(f: &Path) -> bool { f.file_name().map_or(false, |n| n == "no_turbo" || n == "soft") }
 
 fn irq_files() -> Vec<PathBuf> {
     numbered(Path::new("/proc/irq"), "").into_iter()
@@ -1202,7 +1358,7 @@ pub fn firmware_owned(t: &Tunable, err: &str) -> bool {
 }
 
 pub fn best_effort(t: &Tunable) -> bool {
-    matches!(t.target, Target::Irq | Target::PciLatency | Target::PciAspm | Target::PciRuntimePm | Target::UsbRuntimePm)
+    matches!(t.target, Target::Irq | Target::PciLatency | Target::PciAspm | Target::PciRuntimePm | Target::UsbRuntimePm | Target::UsbAutosuspendMs | Target::AhciPortRuntime | Target::AhciDisk(_))
 }
 
 // ── command-backed targets (Wi-Fi power save, sched_ext) ─────────────────
@@ -1282,6 +1438,184 @@ fn wifi_set(f: &Path, data: &str) -> Result<(), String> {
     }
 }
 
+fn ethtool() -> Option<PathBuf> {
+    ["/usr/sbin/ethtool", "/sbin/ethtool", "/usr/bin/ethtool", "/bin/ethtool"].iter().map(PathBuf::from)
+        .find(|p| crate::trusted_path(p))
+}
+
+/// Physical wired interfaces (a `device` link, ARPHRD_ETHER, not wireless, not virtual).
+fn eth_ifaces() -> Vec<PathBuf> {
+    if ethtool().is_none() { return vec![]; }
+    let mut v: Vec<PathBuf> = std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("device").exists() && !p.join("wireless").is_dir() && !p.join("phy80211").exists())
+        .filter(|p| read(&p.join("type")).as_deref() == Some("1"))
+        .filter(|p| wifi_ifname(p).is_some())
+        .filter(|p| std::fs::canonicalize(p).map_or(false, |c| !c.starts_with("/sys/devices/virtual")))
+        .collect();
+    v.sort();
+    v
+}
+
+/// ("Supports Wake-on" letters, current "Wake-on" letters) as ethtool reports them.
+fn eth_wol(f: &Path) -> Option<(String, String)> {
+    let dev = wifi_ifname(f)?;
+    let (ok, out) = run_tool(&ethtool()?, &[&dev], std::time::Duration::from_secs(3))?;
+    if !ok { return None; }
+    let (mut sup, mut cur) = (None, None);
+    for l in out.lines() {
+        let l = l.trim();
+        if let Some(v) = l.strip_prefix("Supports Wake-on:") { sup = Some(v.trim().to_owned()); }
+        else if let Some(v) = l.strip_prefix("Wake-on:") { cur = Some(v.trim().to_owned()); }
+    }
+    Some((sup?, cur?))
+}
+
+/// "1" = any wake mode enabled, "0" = off; None when the port has no WoL at all.
+fn wol_get(f: &Path) -> Option<String> {
+    let (sup, cur) = eth_wol(f)?;
+    if sup.chars().all(|c| c == 'd') { return None; }
+    Some(if cur == "d" { "0".into() } else { "1".into() })
+}
+
+fn wol_set(f: &Path, data: &str) -> Result<(), String> {
+    let dev = wifi_ifname(f).ok_or_else(|| format!("{}: not a network interface path", f.display()))?;
+    let bin = ethtool().ok_or("ethtool not found (install sys-apps/ethtool)")?;
+    let (sup, _) = eth_wol(f).ok_or_else(|| format!("{dev}: ethtool could not read the port"))?;
+    let mode = match data {
+        "0" => "d",
+        "1" if sup.contains('g') => "g",
+        "1" => return Err(format!("{dev}: port has no magic-packet wake")),
+        _ => return Err(format!("wake-on-lan takes 0/1, got '{data}'")),
+    };
+    match run_tool(&bin, &["-s", &dev, "wol", mode], std::time::Duration::from_secs(3)) {
+        Some((true, _)) => Ok(()),
+        Some((false, _)) => Err(format!("{dev}: ethtool refused wol {mode}")),
+        None => Err(format!("{dev}: ethtool timed out")),
+    }
+}
+
+// ── ATA disk discovery, APM (hdparm), AHCI runtime PM ───────────────────
+
+fn hdparm() -> Option<PathBuf> {
+    ["/usr/sbin/hdparm", "/sbin/hdparm", "/usr/bin/hdparm", "/bin/hdparm"].iter().map(PathBuf::from)
+        .find(|p| crate::trusted_path(p))
+}
+
+/// "sda".."sdzz": the only disk names any ATA target accepts.
+fn ata_disk_name_ok(n: &str) -> bool {
+    n.strip_prefix("sd").map_or(false, |r| (1..=3).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
+/// The udev database entry of a block device (`E:KEY=value` lines), if readable.
+fn udev_props(disk: &Path) -> Option<String> {
+    let devno = read(&disk.join("dev"))?;
+    std::fs::read_to_string(format!("/run/udev/data/b{devno}")).ok()
+}
+
+/// Whole ATA disks (sdX behind an ata* port; never USB, NVMe or virtio), as (name, sysfs disk dir).
+fn ata_disks() -> Vec<(String, PathBuf)> {
+    let mut v: Vec<(String, PathBuf)> = std::fs::read_dir("/sys/block").into_iter().flatten().flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if !ata_disk_name_ok(&n) { return None; }
+            let real = canonical_in_sysfs(&e.path())?;
+            let behind_ata = real.components().any(|c| {
+                let c = c.as_os_str().to_string_lossy();
+                c.strip_prefix("ata").map_or(false, |d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            });
+            behind_ata.then(|| (n, real))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn ata_disk_serial(name: &str, dir: &Path) -> String {
+    udev_props(dir).and_then(|p| p.lines().find_map(|l| l.strip_prefix("E:ID_SERIAL=").map(str::to_owned)))
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// APM-capable ATA disks in stable order (serial, then name).
+fn apm_disks() -> Vec<(String, PathBuf)> {
+    let mut v: Vec<(String, String, PathBuf)> = ata_disks().into_iter()
+        .filter(|(_, d)| udev_props(d).map_or(true, |p| p.lines().any(|l| l == "E:ID_ATA_FEATURE_SET_APM=1")))
+        .map(|(n, d)| (ata_disk_serial(&n, &d), n, d)).collect();
+    v.sort();
+    v.into_iter().map(|(_, n, d)| (n, d)).collect()
+}
+
+fn disk_apm_files(slot: usize) -> Vec<PathBuf> {
+    if hdparm().is_none() { return vec![]; }
+    apm_disks().into_iter().nth(slot).map(|(_, d)| d.join("dev")).filter(|p| p.is_file()).into_iter().collect()
+}
+
+/// Disk name behind a ".../block/sdX/dev" path (validated; nothing else reaches hdparm).
+fn apm_dev(f: &Path) -> Option<String> {
+    if f.file_name()? != "dev" || !f.starts_with("/sys/devices") { return None; }
+    let n = f.parent()?.file_name()?.to_str()?;
+    (ata_disk_name_ok(n) && f.parent()?.parent()?.file_name()? == "block").then(|| n.to_owned())
+}
+
+/// Live APM level (255 = off); None if unreadable (not root/disk group) or unsupported.
+fn apm_get(f: &Path) -> Option<String> {
+    let dev = apm_dev(f)?;
+    let (ok, out) = run_tool(&hdparm()?, &["-B", &format!("/dev/{dev}")], std::time::Duration::from_secs(3))?;
+    if !ok { return None; }
+    let v = out.split('=').nth(1)?.trim().to_ascii_lowercase();
+    if v.starts_with("off") { return Some("255".into()); }
+    v.split_whitespace().next()?.parse::<u16>().ok().filter(|n| (1..=255).contains(n)).map(|n| n.to_string())
+}
+
+fn apm_set(f: &Path, data: &str) -> Result<(), String> {
+    let dev = apm_dev(f).ok_or_else(|| format!("{}: not an ATA disk path", f.display()))?;
+    let n: u16 = data.parse().ok().filter(|n| (1..=255).contains(n)).ok_or_else(|| format!("APM level takes 1-255, got '{data}'"))?;
+    let bin = hdparm().ok_or("hdparm not found (install sys-apps/hdparm)")?;
+    match run_tool(&bin, &["-B", &n.to_string(), &format!("/dev/{dev}")], std::time::Duration::from_secs(5)) {
+        Some((true, _)) => Ok(()),
+        Some((false, _)) => Err(format!("{dev}: hdparm refused APM level {n}")),
+        None => Err(format!("{dev}: hdparm timed out")),
+    }
+}
+
+fn ahci_port_files() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(PCI_DEVICES).into_iter().flatten().flatten() {
+        let Ok(dev) = std::fs::canonicalize(e.path()) else { continue };
+        if !dev.starts_with("/sys/devices") { continue; }
+        for p in std::fs::read_dir(&dev).into_iter().flatten().flatten() {
+            let n = p.file_name().to_string_lossy().into_owned();
+            if !n.strip_prefix("ata").map_or(false, |d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) { continue; }
+            if let Some(c) = canonical_in_sysfs(&p.path().join("power/control")) { if c.is_file() { v.push(c); } }
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// device/power/<attr> of every ATA disk that exposes an autosuspend delay (TLP's runpm==0 rule).
+fn ahci_disk_files(attr: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = ata_disks().into_iter()
+        .filter(|(_, d)| d.join("device/power/autosuspend_delay_ms").is_file())
+        .filter_map(|(_, d)| canonical_in_sysfs(&d.join("device").join(attr)))
+        .filter(|p| p.is_file())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Row label for the GUI: the per-disk APM rows name their drive.
+pub fn row_label(t: &Tunable) -> String {
+    if let Target::DiskApm(i) = t.target {
+        if let Some((n, d)) = apm_disks().into_iter().nth(i) {
+            let model = read(&d.join("device/model")).unwrap_or_default();
+            return format!("Disk APM level · {n}{}", if model.is_empty() { String::new() } else { format!(" ({model})") });
+        }
+    }
+    t.label.to_owned()
+}
+
 // sched_ext: only these scheduler binaries are ever started, and only from
 // root-owned system directories (checked on the whole path).
 const SCX_NAMES: &[&str] = &["lavd", "bpfland", "rusty", "flash", "cosmos", "p2dq", "tickless", "layered"];
@@ -1356,7 +1690,10 @@ const ASPM_FILES: &[&str] = &["l1_aspm", "l1_1_aspm", "l1_2_aspm"];
 
 fn pci_aspm_files() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
+    let tree = gpu_tree();
     for e in std::fs::read_dir(PCI_DEVICES).into_iter().flatten().flatten() {
+        let Ok(dev) = std::fs::canonicalize(e.path()) else { continue };
+        if pci_unsafe_to_touch(&dev.join("link").join("l1_aspm"), &tree, true) { continue; }
         for f in ASPM_FILES {
             if let Some(c) = canonical_in_sysfs(&e.path().join("link").join(f)) {
                 if c.starts_with("/sys/devices") && c.is_file() { v.push(c); }
@@ -1403,7 +1740,9 @@ fn pci_runtime_files() -> Vec<PathBuf> {
 }
 
 /// USB devices (not interfaces) without a HID (03) or audio (01) interface.
-fn usb_runtime_files() -> Vec<PathBuf> {
+fn usb_runtime_files() -> Vec<PathBuf> { usb_pm_files("power/control") }
+
+fn usb_pm_files(rel: &str) -> Vec<PathBuf> {
     let base = Path::new("/sys/bus/usb/devices");
     let mut v = Vec::new();
     for e in std::fs::read_dir(base).into_iter().flatten().flatten() {
@@ -1413,10 +1752,35 @@ fn usb_runtime_files() -> Vec<PathBuf> {
         let skip = std::fs::read_dir(&dev).into_iter().flatten().flatten()
             .filter(|i| i.file_name().to_string_lossy().starts_with(&format!("{name}:")))
             .any(|i| matches!(read(&i.path().join("bInterfaceClass")).as_deref(), Some("03") | Some("01")));
-        let f = dev.join("power/control");
+        let f = dev.join(rel);
         if !skip && f.is_file() { v.push(f); }
     }
     v.sort();
+    v
+}
+
+fn amdgpu_abm_files() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten()
+        .filter(|e| { let n = e.file_name().to_string_lossy().into_owned(); n.starts_with("card") && n.contains("-eDP-") })
+        .map(|e| e.path().join("amdgpu/panel_power_savings"))
+        .filter(|p| p.is_file())
+        .filter_map(|p| canonical_in_sysfs(&p))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+fn rfkill_files(kind: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir("/sys/class/rfkill").into_iter().flatten().flatten()
+        .map(|e| e.path())
+        .filter(|p| read(&p.join("type")).as_deref() == Some(kind))
+        .map(|p| p.join("soft"))
+        .filter(|p| p.is_file())
+        .filter_map(|p| canonical_in_sysfs(&p))
+        .collect();
+    v.sort();
+    v.dedup();
     v
 }
 
@@ -1476,12 +1840,33 @@ fn file_usable(p: &str) -> bool {
     }
 }
 
+/// Nominal (base) frequency in kHz of the CPU a cpufreq policy belongs to, from acpi_cppc (MHz).
+fn cppc_nominal_khz(policy: &Path) -> Option<String> {
+    let n = num_suffix(&policy.file_name()?.to_string_lossy(), "policy")?;
+    let mhz: u64 = read(&Path::new(CPU_DIR).join(format!("cpu{n}/acpi_cppc/nominal_freq")))?.parse().ok().filter(|m| *m > 0)?;
+    Some((mhz * 1000).to_string())
+}
+
+/// "1"/"0" for feature `name` in the text of debugfs sched/features (NAME or NO_NAME).
+fn sched_feature_state(raw: &str, name: &str) -> Option<&'static str> {
+    raw.split_whitespace().find_map(|w| if w == name { Some("1") } else if w.strip_prefix("NO_") == Some(name) { Some("0") } else { None })
+}
+
+#[cfg(test)]
+pub fn sched_feature_state_for_test(raw: &str, name: &str) -> Option<&'static str> { sched_feature_state(raw, name) }
+
 /// Writes one tunable value to one concrete target, dispatching the targets
 /// that are not plain files. Everything else goes through write_checked.
 pub fn write_value(t: &Tunable, f: &Path, data: &str) -> Result<(), String> {
     match t.target {
         Target::WifiPowerSave => wifi_set(f, data),
+        Target::EthWol => wol_set(f, data),
+        Target::DiskApm(_) => apm_set(f, data),
         Target::SchedExt => scx_set(data),
+        Target::SchedFeature(n) => {
+            if data != n && data.strip_prefix("NO_") != Some(n) { return Err(format!("{data}: not a state of {n}")); }
+            write_checked(f, data)
+        }
         Target::DirtyBytes { ratio, .. } if data.starts_with("ratio:") => write_checked(Path::new(ratio), &data[6..]),
         _ => write_checked(f, data),
     }
@@ -1502,6 +1887,12 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
         Target::AnyFile(list) => list.iter().map(PathBuf::from).find(|p| p.is_file()).into_iter().collect(),
         Target::PciRuntimePm => pci_runtime_files(),
         Target::UsbRuntimePm => usb_runtime_files(),
+        Target::UsbAutosuspendMs => usb_pm_files("power/autosuspend_delay_ms"),
+        Target::AhciPortRuntime => ahci_port_files(),
+        Target::AhciDisk(a) => ahci_disk_files(a),
+        Target::DiskApm(i) => disk_apm_files(i),
+        Target::AmdgpuAbm => amdgpu_abm_files(),
+        Target::Rfkill(k) => rfkill_files(k),
         Target::ScsiHost(a) => scsi_host_files(a),
         Target::NvmeLatency => nvme_latency_files(),
         Target::DirtyBytes { bytes, .. } => existing(PathBuf::from(bytes)),
@@ -1514,6 +1905,15 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
         Target::PerPolicy(f) if ccx_groups().len() > 1 => { let _ = f; vec![] }
         Target::PerPolicy(f) => policies().into_iter().map(|p| p.join(f)).filter(|p| p.is_file()).collect(),
         Target::MinFreq => policies().into_iter().map(|p| p.join("scaling_min_freq")).filter(|p| p.is_file()).collect(),
+        Target::FloorFreq => policies().into_iter().map(|p| p.join("amd_pstate_floor_freq")).filter(|p| p.is_file()).collect(),
+        Target::SchedFeature(name) => {
+            let f = PathBuf::from("/sys/kernel/debug/sched/features");
+            // Unreadable (unprivileged) = cannot tell; root re-checks at write time.
+            match read(&f) {
+                Some(raw) if !sched_feature_state(&raw, name).is_some() => vec![],
+                _ => existing(f),
+            }
+        }
         Target::PerCcdPolicy(f, ccd) => ccd_policies(ccd).into_iter().map(|p| p.join(f)).filter(|p| p.is_file()).collect(),
         Target::Boost => {
             let per: Vec<_> = policies().into_iter().map(|p| p.join("boost")).filter(|p| p.is_file()).collect();
@@ -1538,12 +1938,13 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
         Target::Mce => numbered(Path::new("/sys/devices/system/machinecheck"), "machinecheck").into_iter()
             .map(|(_, p)| p.join("check_interval")).filter(|p| p.is_file()).collect(),
         Target::AmdgpuDpm => amdgpu_dpm_files(),
-        Target::PciLatency => pci_config_files(),
+        Target::PciLatency => pci_config_files_writable(),
         Target::WqCpumask => if has_domains() {
             existing(PathBuf::from("/sys/devices/virtual/workqueue/cpumask"))
         } else { vec![] },
         Target::Irq => if has_domains() { irq_files() } else { vec![] },
         Target::WifiPowerSave => wifi_ifaces(),
+        Target::EthWol => eth_ifaces(),
         Target::PciAspm => pci_aspm_files(),
         Target::SchedExt => if scx_available().is_empty() { vec![] } else { vec![PathBuf::from(SCX_STATE)] },
         Target::CcdPark => {
@@ -1606,13 +2007,16 @@ pub fn options(t: &Tunable) -> Vec<(String, String)> {
             }
             same(common.unwrap_or_default())
         }
-        (Options::Special, Target::MinFreq) => {
+        (Options::Special, Target::MinFreq) | (Options::Special, Target::FloorFreq) => {
             let mut v = Vec::new();
             // amd-pstate only; intel_pstate has no such file.
             if policies().first().map_or(false, |p| p.join("amd_pstate_lowest_nonlinear_freq").is_file()) {
                 v.push(("lowest_nonlinear".into(), "lowest_nonlinear (efficient floor)".into()));
             }
             v.push(("cpuinfo_min".into(), "cpuinfo_min (hardware minimum)".into()));
+            if matches!(t.target, Target::FloorFreq) && policies().first().and_then(|p| cppc_nominal_khz(p)).is_some() {
+                v.insert(0, ("nominal".into(), "nominal (kernel default)".into()));
+            }
             v
         }
         (Options::Special, Target::CState) => {
@@ -1680,9 +2084,11 @@ fn current_with(t: &Tunable, fs: Vec<PathBuf>) -> Option<String> {
                 Some(first) => (first - 1).to_string(),
             });
         }
-        Target::MinFreq => {
+        Target::SchedFeature(n) => return sched_feature_state(&read(fs.first()?)?, n).map(str::to_owned),
+        Target::MinFreq | Target::FloorFreq => {
             let pol = policies().into_iter().next()?;
-            let cur = read(&pol.join("scaling_min_freq"))?;
+            let cur = read(&pol.join(if matches!(t.target, Target::FloorFreq) { "amd_pstate_floor_freq" } else { "scaling_min_freq" }))?;
+            if matches!(t.target, Target::FloorFreq) && cppc_nominal_khz(&pol).as_deref() == Some(cur.as_str()) { return Some("nominal".into()); }
             if read(&pol.join("amd_pstate_lowest_nonlinear_freq")).as_deref() == Some(cur.as_str()) { return Some("lowest_nonlinear".into()); }
             if read(&pol.join("cpuinfo_min_freq")).as_deref() == Some(cur.as_str()) { return Some("cpuinfo_min".into()); }
             return Some(format!("{cur} kHz"));
@@ -1724,8 +2130,10 @@ fn current_with(t: &Tunable, fs: Vec<PathBuf>) -> Option<String> {
             return Some(if off.is_empty() { "none".into() } else { format!("offline {}", fmt_cpu_list(&off)) });
         }
         Target::SchedExt => return scx_current(),
-        Target::WifiPowerSave => {
-            let mut vals = fs.iter().filter_map(|f| wifi_get(f));
+        Target::DiskApm(_) => return fs.first().and_then(|f| apm_get(f)),
+        Target::WifiPowerSave | Target::EthWol => {
+            let get = |f: &PathBuf| if matches!(t.target, Target::EthWol) { wol_get(f) } else { wifi_get(f) };
+            let mut vals = fs.iter().filter_map(get);
             let first = vals.next()?;
             return Some(if vals.all(|v| v == first) { first } else { "mixed".into() });
         }
@@ -1788,8 +2196,12 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
     if fs.is_empty() { return Err("not available on this kernel/hardware".into()); }
     let role = |v: &str| resolve_ccd(&ccx_groups(), v).ok_or_else(|| format!("'{v}' does not resolve to a CCD here"));
     let out = match t.target {
-        Target::MinFreq => fs.iter().map(|f| {
+        Target::SchedFeature(n) => vec![(fs[0].clone(), if value == "1" { n.to_owned() } else { format!("NO_{n}") })],
+        Target::MinFreq | Target::FloorFreq => fs.iter().map(|f| {
             let dir = f.parent().unwrap();
+            if value == "nominal" {
+                return cppc_nominal_khz(dir).map(|v| (f.clone(), v)).ok_or_else(|| format!("{}: nominal frequency unreadable", dir.display()));
+            }
             let src = if value == "lowest_nonlinear" { "amd_pstate_lowest_nonlinear_freq" } else { "cpuinfo_min_freq" };
             read(&dir.join(src)).filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
                 .map(|v| (f.clone(), v)).ok_or_else(|| format!("{} unreadable", dir.join(src).display()))
@@ -1837,7 +2249,7 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
                 .map(|f| (f, "1".to_owned())).collect()
         }
         Target::SchedExt => vec![(fs[0].clone(), value.to_owned())],
-        Target::WifiPowerSave => fs.into_iter().map(|f| (f, value.to_owned())).collect(),
+        Target::WifiPowerSave | Target::EthWol => fs.into_iter().map(|f| (f, value.to_owned())).collect(),
         Target::RaplWatts(_) => {
             let w: i64 = value.parse().map_err(|_| format!("'{value}' is not a wattage"))?;
             fs.into_iter().map(|f| (f, (w * 1_000_000).to_string())).collect()
@@ -1860,7 +2272,10 @@ pub fn baseline_value(t: &Tunable, f: &Path) -> Option<String> {
     match t.target {
         Target::PciLatency => return pci_latency_read(f).map(|b| format!("{b:02x}")),
         Target::WifiPowerSave => return wifi_get(f),
+        Target::EthWol => return wol_get(f),
+        Target::DiskApm(_) => return apm_get(f),
         Target::SchedExt => return scx_current(),
+        Target::SchedFeature(n) => return read(f).and_then(|raw| sched_feature_state(&raw, n)).map(|v| if v == "1" { n.to_owned() } else { format!("NO_{n}") }),
         Target::DirtyBytes { ratio, .. } if read(f).as_deref() == Some("0") => return read(Path::new(ratio)).map(|r| format!("ratio:{r}")),
         _ => {}
     }
@@ -1912,12 +2327,52 @@ fn write_checked_inner(f: &Path, data: &str) -> Result<(), String> {
     let Some(real) = canonical_in_sysfs(f) else { return Err(format!("{s}: refused (outside the allowlist)")) };
     if real.file_name().map_or(false, |n| n == "config") {
         if !is_pci_config(&real) { return Err(format!("{s}: refused (not a PCI config file)")); }
-        return pci_latency_write(&real, data).map_err(|e| format!("{s}: {e}"));
+        // Never write config space of a GPU, its slot siblings or the bridges above it,
+        // nor of a sleeping device: the write would wake it through ACPI (D state on a
+        // firmware-disabled dGPU).
+        let tree = gpu_tree();
+        if pci_unsafe_to_touch(&real, &tree, true) { return Err(format!("{s}: skipped (GPU tree or suspended device)")); }
+        return pci_latency_write_timeout(&real, data).map_err(|e| format!("{s}: {e}"));
+    }
+    if is_pci_link_or_power(&real) {
+        // power/control 'on' is meant to wake a device: only the GPU tree is off limits there.
+        let is_link = real.parent().and_then(|p| p.file_name()).map_or(false, |n| n == "link");
+        if pci_unsafe_to_touch(&real, &gpu_tree(), is_link) { return Err(format!("{s}: skipped (GPU tree or suspended device)")); }
+        return write_with_timeout(real, data.to_owned()).map_err(|e| format!("{s}: {e}"));
     }
     if real.file_name().map_or(false, |n| n == "amd_x3d_mode") {
         return write_with_timeout(real, data.to_owned()).map_err(|e| format!("{s}: {e}"));
     }
     sysfs_write(&real, data.as_bytes()).map_err(|e| format!("{s}: {e}"))
+}
+
+/// `.../link/l1*_aspm` and PCI `power/control` files: writes that can resume a device.
+fn is_pci_link_or_power(real: &Path) -> bool {
+    let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let parent = real.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+    let in_pci = real.starts_with("/sys/devices") && real.to_string_lossy().contains("/0000:");
+    in_pci && ((parent == "link" && ASPM_FILES.contains(&name)) || (parent == "power" && name == "control" && !real.to_string_lossy().contains("/usb")))
+}
+
+/// Latency-byte write in a child with a deadline, like amd_x3d_mode: a device that
+/// hangs in ACPI takes only the child with it, never this helper or its lock.
+fn pci_latency_write_timeout(cfg: &Path, hex: &str) -> std::io::Result<()> {
+    let v = u8::from_str_radix(hex.trim(), 16).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad latency byte"))?;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 { return Err(std::io::Error::last_os_error()); }
+    if pid == 0 {
+        let ok = pci_latency_write(cfg, &format!("{v:02x}")).is_ok();
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let mut st = 0;
+        let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+        if r == pid { return if libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0 { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::Other, "config write failed")) }; }
+        if r < 0 { return Err(std::io::Error::last_os_error()); }
+        if std::time::Instant::now() >= end { unsafe { libc::kill(pid, libc::SIGKILL) }; return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "config write timed out (device not responding)")); }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// amd_x3d_mode goes through a synchronous ACPI _DSM that stalls forever on
@@ -1993,14 +2448,14 @@ pub fn describe() -> Value {
         let (min, max) = match t.kind { Kind::Int { min, max } => (json!(min), json!(max)), _ => (Value::Null, Value::Null) };
         let opts: Vec<Value> = options(t).into_iter().map(|(v, l)| json!({"value": v, "label": l})).collect();
         json!({
-            "key": t.key, "group": t.group, "label": t.label, "help": t.help,
+            "key": t.key, "group": t.group, "label": row_label(t), "help": t.help,
             "kind": match t.kind { Kind::Choice => "choice", Kind::Int { .. } => "int", Kind::Bool => "bool" },
             "options": opts, "min": min, "max": max,
             // debugfs is root-only (0700): unprivileged callers cannot tell; root checks at write time.
             "available": !fs.is_empty() || t.debugfs,
             "debugfs": t.debugfs, "caution": t.caution, "hotplug": is_hotplug(t.key),
             "files": fs.len(),
-            "current": current_with(t, fs),
+            "current": current_with(t, fs).or_else(|| if t.debugfs { debugfs_snapshot_value(t.key) } else { None }),
         })
     }).collect();
     let mut m = Map::new();
@@ -2043,8 +2498,14 @@ mod tests {
         assert!(scx_bin("sh").is_none());           // not an allowlisted scheduler
         assert!(scx_bin("../../bin/sh").is_none());
         assert!(wifi_set(Path::new("/sys/class/net/wlan0"), "2").is_err());
+        assert!(ata_disk_name_ok("sda") && ata_disk_name_ok("sdaa") && !ata_disk_name_ok("sda1") && !ata_disk_name_ok("nvme0n1"));
+        assert_eq!(apm_dev(Path::new("/sys/devices/pci0000:00/0000:00:17.0/ata1/host0/target0:0:0/0:0:0:0/block/sda/dev")).as_deref(), Some("sda"));
+        assert!(apm_dev(Path::new("/etc/passwd")).is_none());
+        assert!(apm_set(Path::new("/sys/devices/x/block/sda/dev"), "0").is_err());
         for k in ["cpu.idle_governor", "thp.mthp_64k", "thp.khp_max_ptes_none", "net.tcp_congestion",
-                  "net.default_qdisc", "net.wifi_power_save", "pci.aspm_links", "sched.ext"] {
+                  "net.default_qdisc", "net.wifi_power_save", "pci.aspm_links", "sched.ext",
+                  "disk.apm_0", "pm.ahci_runtime_timeout", "pm.ahci_disk_runtime", "pm.ahci_port_runtime",
+                  "net.wol", "rf.bluetooth", "rf.wlan", "rf.wwan", "gpu.amdgpu_abm", "usb.autosuspend_ms"] {
             assert!(find(k).is_some(), "{k}");
         }
         assert!(best_effort(find("pci.aspm_links").unwrap()));
@@ -2098,7 +2559,7 @@ mod tests {
         assert!(validate(sw, &json!(999)).is_err());
         assert!(validate(sw, &json!("1; rm")).is_err());
         assert!(validate(sw, &json!("../x")).is_err());
-        let b = find("wq.power_efficient").unwrap();
+        let b = find("kernel.sched_schedstats").unwrap();
         assert_eq!(validate(b, &json!("Y")).unwrap(), "1");
         assert_eq!(parse_int("0x0007"), Some(7));
         assert_eq!(validate(find("usb.autosuspend").unwrap(), &json!(-1)).unwrap(), "-1");
@@ -2157,7 +2618,7 @@ mod tests {
         assert!(same_value(wq, "0000ff00", "ff00"));
         let irq = find("irq.affinity").unwrap();
         assert!(same_value(irq, "0-3", "0,1,2,3"));
-        let b = find("wq.power_efficient").unwrap();
+        let b = find("kernel.sched_schedstats").unwrap();
         assert!(same_value(b, "Y", "1") && !same_value(b, "Y", "N"));
     }
     #[test]

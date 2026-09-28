@@ -14,6 +14,7 @@ use std::path::Path;
 pub mod amdgpu;
 pub mod autotune;
 pub mod bootguard;
+pub mod dgpu;
 pub mod fan_table;
 pub mod health;
 pub mod memory_spd;
