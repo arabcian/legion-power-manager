@@ -80,7 +80,9 @@ endif()
 # Smaller binary / fewer relocations: drop unreferenced sections, link only
 # libraries actually used, no PLT indirection for Qt calls.
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(legion-power-manager PRIVATE -ffunction-sections -fdata-sections -fno-plt)
+    # -O3 explicitly: the value must not depend on CMAKE_CXX_FLAGS_RELEASE, which distro
+    # toolchain files and CXXFLAGS in the environment are free to change.
+    target_compile_options(legion-power-manager PRIVATE -O3 -ffunction-sections -fdata-sections -fno-plt)
     target_link_options(legion-power-manager PRIVATE -Wl,--gc-sections -Wl,--as-needed -Wl,-O1)
 endif()
 if(LPM_NATIVE)
@@ -94,6 +96,14 @@ if(LPM_HARDEN)
         -fstack-protector-strong -fstack-clash-protection
         $<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3>)
     include(CheckCXXCompilerFlag)
+    # libstdc++ bounds checks (vector/string/array operator[], front/back on empty containers):
+    # an out-of-range index aborts instead of corrupting memory. Ignored by other C++ libraries.
+    target_compile_definitions(legion-power-manager PRIVATE _GLIBCXX_ASSERTIONS)
+    # Zero-initialise automatic variables (GCC 12+, clang 16+); skipped where unsupported.
+    check_cxx_compiler_flag(-ftrivial-auto-var-init=zero _autoinit)
+    if(_autoinit)
+        target_compile_options(legion-power-manager PRIVATE -ftrivial-auto-var-init=zero)
+    endif()
     check_cxx_compiler_flag(-fcf-protection=full _cet)
     if(_cet)
         target_compile_options(legion-power-manager PRIVATE -fcf-protection=full)
