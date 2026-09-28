@@ -1,10 +1,12 @@
 #include "healthtab.h"
 
 #include "privileged.h"
+#include "systools.h"
 #include "theme.h"
 
 #include <QFileInfo>
 #include <QSocketNotifier>
+#include <QTabWidget>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -40,7 +42,15 @@ static QString uptime(quint64 us) {
 }
 
 HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
-    auto *root = new QVBoxLayout(this);
+    // Sub-tabs: the fault monitor, then one page per system tool (lazy).
+    auto *outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
+    auto *sub = new QTabWidget;
+    outer->addWidget(sub);
+    auto *monitor = new QWidget;
+    sub->addTab(monitor, QStringLiteral("Monitor"));
+    systools::addPages(sub);
+    auto *root = new QVBoxLayout(monitor);
     root->setContentsMargins(10, 8, 10, 8);
     root->setSpacing(6);
 

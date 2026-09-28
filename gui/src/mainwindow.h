@@ -36,9 +36,12 @@ protected:
     void closeEvent(QCloseEvent *e) override;
     void showEvent(QShowEvent *e) override;
     void hideEvent(QHideEvent *e) override;
+    void resizeEvent(QResizeEvent *e) override;
 
 private:
+    void fitTabs();
     QTabWidget *tabs_;
+    int tabW_ = -1;
     QLabel *mark_;
     HomeTab *home_;
     RyzenTab *ryzen_ = nullptr;

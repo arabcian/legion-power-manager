@@ -38,6 +38,7 @@ add_executable(legion-power-manager
     src/amdgputab.cpp    src/amdgputab.h
     src/healthtab.cpp    src/healthtab.h
     src/nvregdialog.cpp  src/nvregdialog.h
+    src/systools.cpp     src/systools.h
 )
 # Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
 # with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the

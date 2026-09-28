@@ -137,7 +137,10 @@ QTabWidget#mainTabs { background: @BG1; }
 QTabWidget#mainTabs::pane { border: none; border-top: 1px solid @BORDER_SOFT; background: @BG0; top: -1px; }
 QTabWidget#mainTabs::tab-bar { left: 36px; }
 QTabWidget#mainTabs > QTabBar { background: transparent; }
-QTabWidget#mainTabs > QTabBar::tab { padding: 10px 11px 8px 11px; margin: 0 1px; }
+QTabWidget#mainTabs > QTabBar::tab { background: @BG2; color: @MUTED; border: 1px solid @BORDER_SOFT; border-radius: 7px;
+  padding: 6px 8px; margin: 6px 2px; }
+QTabWidget#mainTabs > QTabBar::tab:hover:!selected { background: @BG3; color: @FG_DIM; border-color: @BORDER; }
+QTabWidget#mainTabs > QTabBar::tab:selected { background: @BG3; color: @FG; border-color: @ACCENT; }
 QLabel#appMark { background: transparent; }
 
 /* ── sub-tabs (inside a page): quieter, same grammar ── */
