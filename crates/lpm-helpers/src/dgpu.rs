@@ -158,14 +158,26 @@ pub fn release() -> Result<Value, Value> {
         let _ = crate::secure_dir("/run/legion-power-manager");
         let _ = crate::write_root_file(MARK, json!({"services": stopped}).to_string().as_bytes());
     }
+    // A refused release must not leave the daemons we stopped (nvidia-powerd = Dynamic Boost)
+    // down: nothing was unloaded yet, so put them back and drop the marker.
+    let resume = |stopped: &[&str]| {
+        for s in stopped { let _ = crate::tune::service_ctl(s, "start"); }
+        if !stopped.is_empty() { let _ = std::fs::remove_file(MARK); }
+    };
     // Daemons can take a moment to close their handles.
     for _ in 0..20 { if holders().is_empty() { break; } std::thread::sleep(Duration::from_millis(100)); }
     let h = holders();
     if !h.is_empty() {
+        resume(&stopped);
         return Err(fail(format!("{} hold the NVIDIA GPU open, so its driver cannot be unloaded. Close them first.{}", holders_text(&h), compositor_hint(&h)), h));
     }
+    let mut removed = false;  // once a module is gone the state is partial: restore() finishes the job
     for m in MODULES {
-        if let Err(e) = unload(m) {
+        let was_loaded = module_loaded(m);
+        let res = unload(m);
+        if res.is_ok() { removed |= was_loaded; }
+        if let Err(e) = res {
+            if !removed { resume(&stopped); }
             let h = holders();
             let msg = if h.is_empty() { e } else { format!("{e}: {} still hold the GPU", holders_text(&h)) };
             return Err(fail(msg, h));

@@ -667,10 +667,18 @@ fn numbered(dir: &Path, prefix: &str) -> Vec<(u32, PathBuf)> {
 
 /// Active policies only: a policy whose CPUs are all offline (parked CCD)
 /// keeps its files, but every read and write on them returns EBUSY.
+///
+/// Cached like [`ccx_groups`] (same TTL, dropped by the same hot-plug writes): one
+/// `describe` asks a dozen times, each a directory walk plus one read per policy.
 pub fn policies() -> Vec<PathBuf> {
-    numbered(&Path::new(CPU_DIR).join("cpufreq"), "policy").into_iter().map(|x| x.1)
+    if let Some(v) = POLICIES.with(|t| t.borrow().as_ref().filter(|(at, _)| at.elapsed() < TOPO_TTL).map(|(_, v)| v.clone())) {
+        return v;
+    }
+    let v: Vec<PathBuf> = numbered(&Path::new(CPU_DIR).join("cpufreq"), "policy").into_iter().map(|x| x.1)
         .filter(|p| read(&p.join("affected_cpus")).map_or(false, |s| !s.trim().is_empty()))
-        .collect()
+        .collect();
+    POLICIES.with(|t| *t.borrow_mut() = Some((std::time::Instant::now(), v.clone())));
+    v
 }
 
 pub fn cpus() -> Vec<(u32, PathBuf)> { numbered(Path::new(CPU_DIR), "cpu") }
@@ -855,10 +863,14 @@ pub struct Ccx { pub index: usize, pub cpus: Vec<usize>, pub l3_kib: u64, pub ma
 const TOPO_TTL: std::time::Duration = std::time::Duration::from_millis(250);
 thread_local! {
     static TOPO: std::cell::RefCell<Option<(std::time::Instant, Vec<Ccx>)>> = const { std::cell::RefCell::new(None) };
+    static POLICIES: std::cell::RefCell<Option<(std::time::Instant, Vec<PathBuf>)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Forget the cached topology (after writing cpu*/online or smt/control).
-pub fn invalidate_topology() { TOPO.with(|t| *t.borrow_mut() = None); }
+pub fn invalidate_topology() {
+    TOPO.with(|t| *t.borrow_mut() = None);
+    POLICIES.with(|t| *t.borrow_mut() = None);
+}
 
 /// L3 domains of the online CPUs, sorted by first CPU. A parked CCD has no
 /// online CPU and does not appear.
