@@ -23,6 +23,15 @@
 //! /run/legion-power-manager/tune/state.json (tmpfs: a reboot is a full
 //! restore). Game mode is reference counted like lutris-game-tune: the first
 //! PRE applies, the last POST restores.
+//!
+//! Locking: every mutating op runs under an exclusive flock on
+//! /run/legion-power-manager/tune/lock. The lock is held for the whole
+//! operation (state read -> sysfs writes -> state save) so concurrent callers
+//! can never interleave their baseline bookkeeping. But a single helper can
+//! spend a while inside the kernel (CPU hotplug settle, nvidia-powerd pause,
+//! a sysfs write stuck in D-state), so acquisition uses LOCK_NB with a short
+//! retry loop and a hard deadline: a stuck helper must not freeze the GUI or
+//! the game launcher forever.
 
 use lpm_helpers::tune::{self, TUNABLES};
 use lpm_helpers::*;
@@ -31,6 +40,7 @@ use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const MAX_STDIN_BYTES: usize = 64 * 1024;
 const RUN_DIR: &str = "/run/legion-power-manager";
@@ -41,20 +51,49 @@ const ETC_DIR: &str = "/etc/legion-power-manager";
 const BOOT_FILE: &str = "/etc/legion-power-manager/tune-boot.json";
 const MAX_BASELINE: usize = 16_384;
 const MAX_REFCOUNT: u32 = 64;
+/// How long a caller is willing to wait for a busy lock before giving up.
+/// Tune ops serialise on this lock; a hung helper (D-state sysfs write,
+/// nvidia-powerd pause) must not block every other caller for good.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(8);
+/// Poll interval while waiting for the lock.
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 fn is_root() -> bool { unsafe { libc::geteuid() == 0 } }
 
 struct Lock(#[allow(dead_code)] fs::File);
+
+/// Acquires the tune lock with a bounded wait. `flock(LOCK_EX)` without
+/// `LOCK_NB` blocks indefinitely; a helper stuck in an uninterruptible
+/// sysfs write would then freeze every later caller (GUI, game launcher)
+/// along with it. Poll `LOCK_NB` until `LOCK_TIMEOUT`, then fail with a
+/// clear "busy" error so the caller can surface it instead of hanging.
 fn lock() -> Result<Lock, String> {
     secure_dir(RUN_DIR)?;
     secure_dir(STATE_DIR)?;
     let f = fs::OpenOptions::new().create(true).read(true).write(true).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(LOCK_FILE)
-        .map_err(|e| format!("lock: {e}"))?;
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err("lock: flock failed".into());
+    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(LOCK_FILE)
+    .map_err(|e| format!("lock: {e}"))?;
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Lock(f));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Held by another helper: retry until the deadline.
+            Some(libc::EWOULDBLOCK) => {}
+            // Interrupted by a signal: retry immediately.
+            Some(libc::EINTR) => continue,
+            _ => return Err(format!("lock: flock failed: {err}")),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "lock: another tune operation is still running (waited {}s)",
+                               LOCK_TIMEOUT.as_secs()
+            ));
+        }
+        std::thread::sleep(LOCK_RETRY);
     }
-    Ok(Lock(f))
 }
 
 #[derive(Default)]
@@ -98,8 +137,8 @@ impl State {
     fn save(&self) -> Result<(), String> {
         let v = json!({
             "baseline": self.baseline.iter().map(|(k, p, v)| json!([k, p, v])).collect::<Vec<_>>(),
-            "refcount": self.refcount(), "preset": self.preset, "source": self.source,
-            "sessions": self.sessions.iter().map(|(p, t)| json!({"pid": p, "start": t})).collect::<Vec<_>>(),
+                      "refcount": self.refcount(), "preset": self.preset, "source": self.source,
+                      "sessions": self.sessions.iter().map(|(p, t)| json!({"pid": p, "start": t})).collect::<Vec<_>>(),
         });
         write_root_file(STATE_FILE, &serde_json::to_vec_pretty(&v).unwrap())
     }
@@ -121,7 +160,7 @@ fn summary(st: &State) -> Value {
     let mut keys: Vec<&str> = Vec::new();
     for (k, _, _) in &st.baseline { if !keys.contains(&k.as_str()) { keys.push(k); } }
     json!({"active": !st.baseline.is_empty(), "refcount": st.refcount(), "preset": st.preset,
-           "source": st.source, "saved_files": st.baseline.len(), "keys": keys})
+        "source": st.source, "saved_files": st.baseline.len(), "keys": keys})
 }
 
 /// Applies `values` in table order. Returns per-key results and all-ok.
@@ -154,13 +193,13 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
         };
         // Label of the CCD being parked, taken while it is still resolvable.
         let park_label = (t.key == "cpu.ccd_park")
-            .then(|| tune::options(t).into_iter().find(|(k, _)| *k == v).map(|(_, l)| l)).flatten();
+        .then(|| tune::options(t).into_iter().find(|(k, _)| *k == v).map(|(_, l)| l)).flatten();
         let plan = match tune::plan(t, &v) {
             Ok(p) => p,
             Err(e) => { results.push(json!({"key": t.key, "ok": false, "error": e})); all_ok = false; continue; }
         };
         let park_cpus: Vec<usize> = plan.iter().filter(|(_, d)| d == "0")
-            .filter_map(|(f, _)| f.parent()?.file_name()?.to_str()?.strip_prefix("cpu")?.parse().ok()).collect();
+        .filter_map(|(f, _)| f.parent()?.file_name()?.to_str()?.strip_prefix("cpu")?.parse().ok()).collect();
         let (mut written, mut refused, mut errs) = (0, 0, Vec::new());
         // Pass 1: read every original, record the fresh ones. They are
         // persisted in ONE state save *before* any write, so a crash or kill
@@ -340,7 +379,7 @@ fn op_apply(req: &Value) -> Value {
             // A scene switch (e.g. AC → battery) must not yank a running game's tuning.
             if st.refcount() > 0 {
                 return json!({"ok": false, "applied": false, "game_active": true,
-                              "error": format!("game mode is active ({} session(s)); tuning left unchanged", st.refcount())});
+                    "error": format!("game mode is active ({} session(s)); tuning left unchanged", st.refcount())});
             }
             let mut stale: Vec<String> = Vec::new();
             for (k, _, _) in &st.baseline {
@@ -354,7 +393,7 @@ fn op_apply(req: &Value) -> Value {
             st.sessions.push(owner);
             if st.refcount() > 1 {
                 return json!({"ok": true, "applied": false,
-                              "message": format!("game mode already active ({} games running)", st.refcount())});
+                    "message": format!("game mode already active ({} games running)", st.refcount())});
             }
         }
         if !replace { st.preset = preset.clone().or(st.preset.take()); }
@@ -363,7 +402,7 @@ fn op_apply(req: &Value) -> Value {
         if restored["errors"].as_array().map_or(false, |a| !a.is_empty()) { ok = false; }
         if values.is_empty() && st.baseline.is_empty() { st.source = None; }
         json!({"ok": ok, "applied": true, "results": results, "restored": restored,
-               "error": (!ok).then_some("some settings could not be applied")})
+            "error": (!ok).then_some("some settings could not be applied")})
     })
 }
 
@@ -376,12 +415,22 @@ fn op_release(req: &Value) -> Value {
             return json!({"ok": true, "restored": false, "message": "no game session active"});
         }
         if st.refcount() > 1 {
-            // The caller's own session; else an untracked one; never another live game's.
-            let i = st.sessions.iter().position(|s| owner.0.is_some() && *s == owner)
-                .or_else(|| st.sessions.iter().position(|s| s.0.is_none()))
-                .unwrap_or(0);
-            st.sessions.remove(i);
-            return json!({"ok": true, "restored": false, "message": format!("{} game(s) still running", st.refcount())});
+            // Drop the caller's own session if we can identify it, else the
+            // first untracked one. The previous `unwrap_or(0)` fallback
+            // silently removed the *first live session* whenever the owner
+            // PID was stale/recycled (session_owner returns (None, None) in
+            // that case), leaving a real game's tuning active with no
+            // session left to release it.
+            let idx = st.sessions.iter().position(|s| owner.0.is_some() && *s == owner)
+            .or_else(|| st.sessions.iter().position(|s| s.0.is_none()));
+            return match idx {
+                Some(i) => {
+                    st.sessions.remove(i);
+                    json!({"ok": true, "restored": false,
+                        "message": format!("{} game(s) still running", st.refcount())})
+                }
+                None => json!({"ok": false, "error": "no matching game session to release"}),
+            };
         }
         let r = restore_entries(st, None);
         let ok = r["errors"].as_array().map_or(true, |a| a.is_empty());
@@ -393,7 +442,7 @@ fn op_restore(req: &Value) -> Value {
     let keys: Option<Vec<String>> = match &req["keys"] {
         Value::Null => None,
         Value::Array(a) if a.len() <= TUNABLES.len() => Some(a.iter().filter_map(|k| k.as_str())
-            .filter(|k| tune::find(k).is_some()).map(str::to_owned).collect()),
+        .filter(|k| tune::find(k).is_some()).map(str::to_owned).collect()),
         _ => return json!({"ok": false, "error": "keys must be an array of known keys"}),
     };
     locked(|st| {
@@ -449,8 +498,8 @@ fn op_boost(req: &Value) -> Value {
     }
     let ag = req["autogroup"].as_bool().unwrap_or(false).then(|| {
         still_parent() && fs::OpenOptions::new().write(true).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(format!("/proc/{ppid}/autogroup"))
-            .and_then(|mut f| std::io::Write::write_all(&mut f, nice.to_string().as_bytes())).is_ok()
+        .open(format!("/proc/{ppid}/autogroup"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, nice.to_string().as_bytes())).is_ok()
     });
     json!({"ok": true, "pid": ppid, "nice": nice, "autogroup": ag})
 }
@@ -485,7 +534,7 @@ fn op_isolate_join(req: &Value) -> Value {
         if unsafe { libc::getppid() } != ppid { return json!({"ok": false, "error": "caller exited"}); }
         match lpm_helpers::isolate::join(ppid) {
             Ok(()) => json!({"ok": true, "pid": ppid, "cpus": tune::fmt_cpu_list(&cpus)}),
-            Err(e) => json!({"ok": false, "error": e}),
+           Err(e) => json!({"ok": false, "error": e}),
         }
     })
 }
