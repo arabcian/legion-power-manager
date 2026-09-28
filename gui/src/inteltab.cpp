@@ -999,7 +999,7 @@ void IntelTab::saveProfile() {
     const QString name = QInputDialog::getText(this, "Save Profile", "Profile name:", QLineEdit::Normal,
                                                profileCombo_->currentText(), &ok).trimmed();
     if (!ok) return;
-    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$"));
+    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}\\z"));
     if (!re.match(name).hasMatch()) {
         QMessageBox::warning(this, "Invalid Name", "Use 1-64 characters: letters, digits, space, underscore or hyphen.");
         return;

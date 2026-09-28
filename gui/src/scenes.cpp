@@ -45,7 +45,7 @@ static QString sceneFile(const QString &n) { return dir() + '/' + n + QStringLit
 
 bool validName(const QString &n) {
     // Same rule as the Ryzen/Intel profile names: it becomes a file name.
-    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$"));
+    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}\\z"));
     return re.match(n).hasMatch();
 }
 

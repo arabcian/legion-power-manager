@@ -206,7 +206,7 @@ static QJsonObject builtinObject(const Builtin &b) {
 
 /// Same rule as lpm-gamemode's valid_name().
 static bool validPresetName(const QString &n) {
-    static const QRegularExpression re(QStringLiteral(R"(^[\p{L}\p{N}][\p{L}\p{N} _.\-]{0,63}$)"));
+    static const QRegularExpression re(QStringLiteral(R"(^[\p{L}\p{N}][\p{L}\p{N} _.\-]{0,63}\z)"));
     return re.match(n).hasMatch() && !n.contains(QStringLiteral("..")) && n.toUtf8().size() <= 64;
 }
 
