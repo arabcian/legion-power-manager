@@ -352,9 +352,12 @@ pub struct CpuId { pub vendor: String, pub family: u32, pub model: u32, pub step
 
 /// Parsed once per process (apply, monitor samples and the daemon's
 /// re-apply loop all ask; the answer cannot change while we run).
-pub fn cpu_id() -> Option<CpuId> {
+pub fn cpu_id() -> Option<CpuId> { cpu_id_ref().cloned() }
+
+/// Same answer without cloning its Strings (hot paths: one monitor sample per tick).
+pub fn cpu_id_ref() -> Option<&'static CpuId> {
     static ID: std::sync::OnceLock<Option<CpuId>> = std::sync::OnceLock::new();
-    ID.get_or_init(parse_cpu_id).clone()
+    ID.get_or_init(parse_cpu_id).as_ref()
 }
 
 fn parse_cpu_id() -> Option<CpuId> {
@@ -682,7 +685,8 @@ pub fn read_status() -> Value {
     }
     out["iccmax"] = Value::Object(icc);
 
-    let prog = msr.read(MSR_PLATFORM_INFO).ok().map(|v| (v >> 30) & 1 == 1);
+    let plat = msr.read(MSR_PLATFORM_INFO);  // read once: temp and ctdp both decode it
+    let prog = plat.as_ref().ok().map(|v| (v >> 30) & 1 == 1);
     out["temp"] = match msr.read(MSR_TEMPERATURE_TARGET) {
         Ok(v) => {
             let tjmax = (v >> 16) & 0xFF;
@@ -696,14 +700,15 @@ pub fn read_status() -> Value {
         Ok(v) => json!({"enabled": v & 1 == 1}),
         Err(e) => json!({"error": err_str(&e)}),
     };
-    out["ctdp"] = match msr.read(MSR_PLATFORM_INFO) {
+    out["ctdp"] = match &plat {
         Ok(pi) => {
+            let pi = *pi;
             let prog = (pi >> 29) & 1 == 1;
             let levels = (pi >> 33) & 3;
             let cur = msr.read(MSR_CONFIG_TDP_CONTROL).ok();
             json!({"programmable": prog, "levels": levels, "current": cur.map(|c| c & 3), "locked": cur.map(|c| (c >> 31) & 1 == 1)})
         }
-        Err(e) => json!({"error": err_str(&e)}),
+        Err(e) => json!({"error": err_str(e)}),
     };
     out["power"] = match (msr.read(MSR_RAPL_POWER_UNIT), msr.read(MSR_PKG_POWER_LIMIT)) {
         (Ok(u), Ok(raw)) => {
@@ -919,7 +924,7 @@ pub fn monitor_sample(msr: &Msr, clear_logs: bool) -> Value {
             if let Ok(r) = msr.read(addr) { e.insert(name.into(), json!(r & 0xFFFF_FFFF)); }
         }
         // throttled: fixed DRAM unit on some server models (Haswell/Broadwell/Skylake-SP, KNL).
-        let dram_unit = cpu_id().filter(|c| c.family == 6 && [63, 79, 85, 86, 87].contains(&c.model)).map(|_| 15.3e-6);
+        let dram_unit = cpu_id_ref().filter(|c| c.family == 6 && [63, 79, 85, 86, 87].contains(&c.model)).map(|_| 15.3e-6);
         out["energy"] = json!({"unit_j": eu, "dram_unit_j": dram_unit.unwrap_or(eu), "raw": e, "wrap": 1u64 << 32});
     }
     out

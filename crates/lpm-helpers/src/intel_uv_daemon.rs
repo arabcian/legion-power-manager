@@ -105,9 +105,14 @@ impl CpuStat {
             let Some(name) = it.next() else { continue };
             if !name.starts_with("cpu") || name.len() == 3 { continue; }
             let Ok(idx) = name[3..].parse::<usize>() else { continue };
-            let vals: Vec<u64> = it.filter_map(|x| x.parse().ok()).collect();
-            if vals.len() < 4 { continue; }
-            let (total, idle) = (vals.iter().sum::<u64>(), vals[3]);
+            // Streamed: no per-line Vec (one line per CPU, every interval).
+            let (mut total, mut idle, mut cnt) = (0u64, 0u64, 0usize);
+            for x in it.filter_map(|x| x.parse::<u64>().ok()) {
+                if cnt == 3 { idle = x; }
+                total += x;
+                cnt += 1;
+            }
+            if cnt < 4 { continue; }
             if let Some(&(pt, pi)) = self.prev.get(&idx) {
                 if total > pt {
                     let load = (total - pt).saturating_sub(idle.saturating_sub(pi)) as f64 / (total - pt) as f64;
