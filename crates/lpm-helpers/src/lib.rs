@@ -14,12 +14,15 @@ use std::path::Path;
 pub mod amdgpu;
 pub mod bootguard;
 pub mod fan_table;
+pub mod health;
 pub mod memory_spd;
 pub mod intel_uv;
 pub mod intel_uv_daemon;
+pub mod isolate;
 pub mod legion_wmi;
 pub mod lighting;
 pub mod machine;
+pub mod nvreg;
 pub mod tune;
 
 /// The first processor block of /proc/cpuinfo (vendor, family, model, name are

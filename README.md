@@ -15,15 +15,13 @@ required, no telemetry, works on OpenRC and systemd.
 
 | Tab | What you get |
 |---|---|
-| **Home** | Power profile (Power Saver → Extreme → Custom), live sensors (CPU per-CCD, dGPU, iGPU, fans, NVMe, power, battery), battery charge mode, GPU / iGPU mode, Fn-lock, camera, USB charging, firmware toggles (boot on AC / USB-PD, Custom in Fn+Q), memory timings viewer and BIOS timing editor. Banners for a paused boot preset, login scene or paused Scenes, each with a one-click resume |
-| **Fans** *(on Home)* | Per-fan Auto / Max / target RPM, *Max all fans*, custom fan curve editor, EC Full Speed (Turbo fan). Full Speed only drives the fans in **Custom**, so in other profiles it neither shows a notice nor locks the fan controls; while Max or Full Speed is active the status and a *Disable* button sit in the fan button row, with no layout shift |
-| **Scenes** | One name for the whole machine: power profile, firmware limits, CPU/GPU curves, tuning preset, keyboard lighting, a custom command. Automatic AC / battery switching, game-start scene, pause / resume, export / import |
-| **Firmware Attributes** | CPU PL1/PL2/PL3, temperature targets, GPU cTGP and Dynamic Boost, including the values the kernel refuses to write (written over Lenovo WMI). BIOS CPU overclocking (PBO scalar, boost override, all-core CO) with a single *Apply* that writes every changed value in one password prompt |
-| **NVIDIA Curve Optimizer** | Drag-and-edit V/F curve, per-point and global offsets, *Flatten after index*, memory offset, VRAM clock lock, PowerMizer, named profiles, apply at boot |
-| **AMD GPU** | Overclock / undervolt / efficiency for any amdgpu card (Radeon dGPU or the iGPU): the form follows what the driver exposes per generation (state table, V/F curve, min/max clocks + voltage offset, RDNA4 clock offset), plus performance level, power profile, power limit, PMFW fan curve and profiles. Every Apply is a trial that reverts unless you press *Keep* |
+| **Home** | Power profile (Quiet → Performance → Custom), live sensors (CPU per-CCD, dGPU, iGPU, fans, NVMe, power, battery), fan control and custom fan curve, battery charge mode, GPU mode (Hybrid / dGPU only), Fn-lock, camera, USB charging, memory timings viewer |
+| **Scenes** | One name for the whole machine — power profile, firmware limits, CPU/GPU curves, tuning preset, keyboard lighting, a custom command. Automatic AC / battery switching, game-start scene, export / import |
+| **Firmware Attributes** | CPU PL1/PL2/PL3, temperature targets, GPU cTGP and Dynamic Boost — including the values the kernel refuses to write |
+| **NVIDIA Curve Optimizer** | Drag-and-edit V/F curve, core/memory offsets, named profiles, apply at boot |
 | **Ryzen Curve Optimizer** *(AMD)* | Per-core and all-core Curve Optimizer, CPPC-ranked cores, profiles |
 | **Intel Undervolt** *(Intel)* | Voltage offsets, IccMax, TCC offset, PL1/PL2, AC/battery profiles, ThrottleStop.ini import, live throttle monitor |
-| **Optimizations** | ~60 documented kernel/scheduler/memory/storage knobs in striped rows, built-in presets, game launch hooks for Lutris and Steam (nice, autogroup, CCD affinity), boot-parameter advisor, one-click *Restore originals* |
+| **Optimizations** | ~60 documented kernel/scheduler/memory/storage knobs, built-in presets, game launch hooks for Lutris and Steam, boot-parameter advisor, one-click *Restore originals* |
 | **Lighting** *(Gen10 Spectrum keyboards)* | Per-key RGB editor on a drawing of your own keyboard, firmware effects, 6 hardware profiles, brightness, lid logo, accent lights |
 
 Everything important is also in the **tray menu**. Every setting has a tooltip
@@ -33,27 +31,6 @@ Built to be safe to experiment with: root helpers validate every value,
 a **boot guard** pauses boot-time presets after a crash, the login scene has
 the same protection, and firmware-persistent changes (BIOS memory timings,
 BIOS CPU OC, GPU MUX) always ask for the administrator password.
-
-### Behaviour worth knowing
-
-- **cTGP range follows the GPU.** 5 W up to the vBIOS max power limit minus the
-  25 W Dynamic Boost headroom (RTX 5080 Laptop: 175 − 25 = 150 W). It is read
-  from `nvidia-smi` while the dGPU is awake and cached in
-  `/var/cache/legion-power-manager/ctgp_max`, so the range stays right while the
-  dGPU sleeps. Before the first reading the ceiling is 150 W.
-- **V/F curve writes are complete.** Every apply writes every GPU-domain point
-  (points not in the profile are written as 0), so an earlier flatten can never
-  leave stale offsets behind. There is no NVML core-clock cap: a flattened curve
-  holds its top by itself, and any lock left by older versions is released on apply.
-- **Flatten on a power-limited laptop** only matters above the voltage the GPU
-  actually reaches. Check the *current* marker in `nvcurve read` under load; to
-  save power, flatten at or below that point.
-- **CCDs are selected by index.** Affinity, workqueue / IRQ steering and CCD
-  parking list each CCD once, labelled with its role
-  (`CCD0 V-Cache`, `CCD1 frequency`). Older presets using `cache` / `frequency`
-  are mapped to the matching CCD automatically.
-- **Live memory timings** wait up to 3 s for `ryzen_smu`'s SMN node after the
-  module loads, and say so if the module is loaded but not bound yet.
 
 ## Supported hardware
 
@@ -86,31 +63,12 @@ sudo ./install.sh
 ```
 
 `install.sh` builds everything tuned for this machine (native CPU, LTO, PGO,
-hardening) and installs to `/usr`. Remove with `sudo ./uninstall.sh`.
+hardening) and installs to `/usr`. Options: `--no-native` for portable
+binaries, `--no-lto`, `--no-pgo`, `--no-harden`, `--remove-legacy` to remove
+the old Python version. Remove with `sudo ./uninstall.sh`.
 
-| Option | Effect |
-|---|---|
-| `--no-native` | portable binaries (no `-march=native` / `target-cpu=native`) |
-| `--no-lto` | no link-time optimization for the GUI (Rust always uses fat LTO) |
-| `--no-pgo` | skip the profile-guided GUI build (default: instrumented build, offscreen training run over every tab, final build with the profile) |
-| `--no-harden` | drop stack protector / FORTIFY=3 / CET / full RELRO / PIE on the GUI |
-| `--clang` | build with clang/LLVM (same as `./install-clang.sh`) |
-| `--remove-legacy` | also remove the old Python version |
-| `--no-build` | install already-built files (with `DESTDIR=` for staging) |
-
-#### clang / LLVM
-
-```sh
-sudo ./install-clang.sh            # accepts every install.sh option
-```
-
-The GUI is built with `clang++`, linked with `lld` when installed, and PGO
-profiles are merged with `llvm-profdata`. The Rust helpers are linked with
-clang (and lld). Tools are looked up in `PATH`, then `/usr/lib/llvm/<N>/bin`
-(newest first, as on Gentoo, where `sudo` drops that directory from `PATH`),
-then as `tool-<N>`. Build directories configured with the other compiler are
-removed automatically, so switching between GCC and clang needs no cleanup.
-Without `llvm-profdata` the build continues without PGO.
+To build with clang/LLVM instead of GCC: `sudo ./install-clang.sh` (same options;
+uses lld when installed and `llvm-profdata` for PGO).
 
 ### Gentoo
 
@@ -146,9 +104,8 @@ Copy the tarball into your `DISTDIR` and emerge the ebuild from
 ## Quick start
 
 - **Change the power profile:** Home → pick a card, or tray → *Power Profile*.
-- **Undervolt / overclock the GPU:** NVIDIA tab → *Read Curve* → set an offset or drag
-  points (optionally *Flatten after index*) → *Apply Offsets* → *Save As…* →
-  ★ *Default* to apply it at boot.
+- **Undervolt the GPU:** NVIDIA tab → *Read Current Curve* → set an offset or drag
+  points → *Apply Offsets* → *Save As…* → ★ *Default* to apply it at boot.
 - **Undervolt the CPU:** Ryzen tab → all-core or per-core offset → *Apply* → save a profile.
 - **Tune for games:** Optimizations → choose a preset → *Load* → *Apply checked*;
   ★ *Use for games* and paste the shown hook into Lutris / Steam.
@@ -162,8 +119,8 @@ Nothing is applied permanently by accident: tuning can always be undone with
 
 ## Requirements
 
-**Build:** Rust ≥ 1.75 (cargo), a C++20 compiler (GCC or clang), CMake ≥ 3.19,
-Qt ≥ 6.4 (Widgets, Network). Optional for `--clang`: `lld`, `llvm-profdata`.
+**Build:** Rust ≥ 1.75 (cargo), a C++20 compiler, CMake ≥ 3.19, Qt ≥ 6.4
+(Widgets, Network).
 
 **Runtime:**
 

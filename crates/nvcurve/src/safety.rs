@@ -59,7 +59,7 @@ pub fn check_negative_freq_warnings(deltas: &BTreeMap<i64, i64>, vfp_freqs_khz: 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LimitField { PowerLimit, MemOffset, MemLocked }
+pub enum LimitField { PowerLimit, MemOffset, MemLocked, GpuCap }
 
 #[derive(Debug, Clone)]
 pub struct LimitError { pub field: LimitField, pub message: String }
@@ -70,6 +70,7 @@ pub struct Limits {
     pub mem_offset_mhz: Option<i64>,
     pub mem_locked_min_mhz: Option<i64>,
     pub mem_locked_max_mhz: Option<i64>,
+    pub gpu_clock_cap_mhz: Option<i64>,
 }
 
 /// Validate secondary settings against driver-reported ranges. A range the
@@ -103,6 +104,11 @@ pub fn validate_limits(gpu_index: u32, l: &Limits) -> Vec<LimitError> {
                 push(LimitField::MemLocked, format!(
                     "{label} {v} is outside the plausible range (1-{MAX_MEM_CLOCK_MHZ} MHz)"));
             }
+        }
+    }
+    if let Some(c) = l.gpu_clock_cap_mhz {
+        if !(210..=4000).contains(&c) {
+            push(LimitField::GpuCap, format!("gpu_clock_cap_mhz {c} is outside the plausible range (210-4000 MHz)"));
         }
     }
     if let (Some(lo), Some(hi)) = (l.mem_locked_min_mhz, l.mem_locked_max_mhz) {

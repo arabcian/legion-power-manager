@@ -190,6 +190,18 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
         // baseline entry is dropped again (saved with the rest at the end).
         let mut unchanged: Vec<PathBuf> = Vec::new();
         let mut fw_owned = false;
+        // nvidia-powerd must be gone before any CPU goes offline (see tune::powerd_pause).
+        let mut powerd_note = None;
+        if todo.iter().any(|(_, d, _)| tune::offlines_cpus(t.key, d)) {
+            match tune::powerd_pause() {
+                Ok(true) => powerd_note = Some("nvidia-powerd stopped while CPUs are offline"),
+                Ok(false) => {}
+                Err(e) => {
+                    errs.push(format!("{e}; CPUs left online"));
+                    unchanged.extend(todo.drain(..).filter(|x| x.2).map(|x| x.0));
+                }
+            }
+        }
         for (f, data, fresh) in todo {
             match tune::write_value(t, &f, &data) {
                 Ok(()) => written += 1,
@@ -206,6 +218,14 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
         if t.key == "cpu.ccd_park" && errs.is_empty() {
             if let Err(e) = tune::record_ccd_park(&v, park_label.as_deref(), &park_cpus) { errs.push(format!("park record: {e}")); }
         }
+        if tune::is_hotplug(t.key) {
+            // Unpark / SMT on, or an offline write that failed: bring powerd back.
+            match tune::powerd_resume() {
+                Ok(true) => powerd_note = Some("nvidia-powerd restarted"),
+                Ok(false) => {}
+                Err(e) => errs.push(e),
+            }
+        }
         if fw_owned && errs.is_empty() && written == 0 {
             // Not changeable on this machine: same as an absent feature, not a failure.
             results.push(json!({"key": t.key, "ok": true, "skipped": "firmware owns PCIe ASPM (FADT / _OSC); the policy cannot be changed from Linux"}));
@@ -213,6 +233,7 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
         }
         let mut r = json!({"key": t.key, "value": v, "written": written});
         if refused > 0 { r["refused"] = json!(refused); }
+        if let Some(n) = powerd_note { r["note"] = json!(n); }
         if errs.is_empty() {
             r["ok"] = json!(true);
         } else {
@@ -250,6 +271,10 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
                 tune::invalidate_topology();
             }
         }
+        // Restoring an "off"/"0" original takes CPUs offline too.
+        if tune::offlines_cpus(key, orig) {
+            if let Err(e) = tune::powerd_pause() { failed.insert(i); errs.push(json!({"key": key, "error": e})); continue; }
+        }
         let res = match tune::find(key) { Some(t) => tune::write_value(t, f, orig), None => tune::write_checked(f, orig) };
         match res {
             Ok(()) => n += 1,
@@ -258,6 +283,11 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
             Err(_) if tune::find(key).map_or(false, tune::best_effort) => {}
             Err(e) => { failed.insert(i); errs.push(json!({"key": key, "error": e})); }
         }
+    }
+    if let Err(e) = tune::powerd_resume() { errs.push(json!({"key": "nvidia-powerd", "error": e})); }
+    // Game mode is over: give the game's CPUs back to the whole system.
+    if only.is_none() {
+        if let Err(e) = lpm_helpers::isolate::teardown() { errs.push(json!({"key": "game partition", "error": e})); }
     }
     let drop: std::collections::HashSet<usize> = order.into_iter().filter(|i| !failed.contains(i)).collect();
     let mut i = 0;
@@ -422,6 +452,41 @@ fn op_boost(req: &Value) -> Value {
     json!({"ok": true, "pid": ppid, "nice": nice, "autogroup": ag})
 }
 
+/// Moves the process that ran pkexec (lpm-gamemode RUN/WRAP, which then
+/// starts the game) into the game CPU partition: every CPU except the
+/// soft-parked CCD `park`. Only while a game session holds game mode, so the
+/// release that ends it also removes the partition.
+fn op_isolate_join(req: &Value) -> Value {
+    let Some(park) = req["park"].as_str().filter(|s| !s.is_empty() && s.len() <= 16) else {
+        return json!({"ok": false, "error": "park must name a CCD"});
+    };
+    let ppid = unsafe { libc::getppid() };
+    let Some(caller) = std::env::var("PKEXEC_UID").ok().and_then(|v| v.parse::<u32>().ok()) else {
+        return json!({"ok": false, "error": "isolate_join is only available through pkexec"});
+    };
+    if ppid <= 1 || caller == 0 || proc_ruid(ppid) != Some(caller) {
+        return json!({"ok": false, "error": "caller process does not belong to the authenticated user"});
+    }
+    locked(|st| {
+        if st.source.as_deref() != Some("game") || st.refcount() == 0 {
+            return json!({"ok": false, "error": "game mode is not active"});
+        }
+        let groups = tune::ccx_groups();
+        let Some(pg) = tune::resolve_ccd(&groups, park) else {
+            return json!({"ok": false, "error": format!("'{park}' does not resolve to an online CCD")});
+        };
+        let mut cpus: Vec<usize> = groups.iter().flat_map(|g| g.cpus.iter().copied()).filter(|c| !pg.cpus.contains(c)).collect();
+        cpus.sort_unstable();
+        if let Err(e) = lpm_helpers::isolate::setup(&cpus) { return json!({"ok": false, "error": e}); }
+        // Same PID-reuse pin as boost: only while the caller is still our parent.
+        if unsafe { libc::getppid() } != ppid { return json!({"ok": false, "error": "caller exited"}); }
+        match lpm_helpers::isolate::join(ppid) {
+            Ok(()) => json!({"ok": true, "pid": ppid, "cpus": tune::fmt_cpu_list(&cpus)}),
+            Err(e) => json!({"ok": false, "error": e}),
+        }
+    })
+}
+
 fn op_set_boot(req: &Value) -> Value {
     if let Err(e) = secure_dir(ETC_DIR) { return json!({"ok": false, "error": e}); }
     match &req["values"] {
@@ -479,7 +544,14 @@ fn run() -> Value {
         d["state"] = summary(&State::load());
         d["boot"] = boot_preset().unwrap_or(Value::Null);
         d["root"] = json!(is_root());
+        d["isolation"] = lpm_helpers::isolate::status();
         return d;
+    }
+    // Read-only ops any user may run; health needs root only when the kernel log is restricted.
+    match op {
+        "health" => return lpm_helpers::health::scan(req["since"].as_u64().unwrap_or(0)),
+        "nvreg_describe" => return lpm_helpers::nvreg::describe(),
+        _ => {}
     }
     if !is_root() { return json!({"ok": false, "error": format!("'{op}' needs root (run through pkexec)")}); }
     match op {
@@ -489,6 +561,14 @@ fn run() -> Value {
         "prune" => locked(|_| json!({"ok": true})),
         "restore" | "restore_keys" => op_restore(&req),
         "boost" => op_boost(&req),
+        "isolate_join" => op_isolate_join(&req),
+        "nvreg_set" => match req["values"].as_object() {
+            Some(v) => match lpm_helpers::nvreg::set(v) {
+                Ok(n) => json!({"ok": true, "written": n, "file": lpm_helpers::nvreg::LPM_FILE}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+            None => json!({"ok": false, "error": "values must be an object"}),
+        },
         "set_boot" => op_set_boot(&req),
         "boot" => op_boot(),
         "guard_reset" => match lpm_helpers::bootguard::reset() {

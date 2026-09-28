@@ -465,7 +465,7 @@ pub const TUNABLES: &[Tunable] = &[
       "Turns SMT (the second logical thread per physical core) on or off system-wide. Most games are unaffected or slightly faster with SMT on (more threads available); a minority of titles - especially ones sensitive to cache contention between sibling threads, or with poor thread-count scaling - show better 1% lows with it off, since every physical core is then dedicated to one thread with no sibling contention. This is genuinely game-specific: test SMT on vs off on the specific title if chasing 1% lows. Hot-plugs half the CPUs off/online, which is why this row is always applied last and restored first - every other per-CPU setting needs the CPU online first to accept the write.",
       Kind::Choice, Options::Fixed(&["on", "off"]), Target::File("/sys/devices/system/cpu/smt/control"))),
     warn(t("cpu.ccd_park", "CPU", "Park a CCD / E-cores (offline)",
-      "On a hybrid Intel CPU this parks the E-cores instead (the P-cores hold cpu0 and can never be parked): the game then only ever shares the ring with P-cores - a test tool for titles with bad hybrid scheduling, not a daily setting. Takes an entire CCD fully offline (every CPU in it): no scheduling, no IRQs, no cross-CCD cache-coherency traffic can reach it at all. The most deterministic possible setup for an X3D chip - the game gets sole, uncontested use of one die's cache and cores with zero interference from the other die under any circumstance - at the obvious cost of losing that die's cores entirely until restored. The Competitive preset parks the frequency CCD as its most aggressive step; only reach for this if affinity plus workqueue/IRQ steering (which achieve most of the isolation benefit without losing any cores) is not enough for what you are chasing. cpu0's CCD can never be parked (the kernel needs cpu0 online), so on a 2-CCD chip you can only ever park 'the other one'.",
+      "On a hybrid Intel CPU this parks the E-cores instead (the P-cores hold cpu0 and can never be parked): the game then only ever shares the ring with P-cores - a test tool for titles with bad hybrid scheduling, not a daily setting. Takes an entire CCD fully offline (every CPU in it): no scheduling, no IRQs, no cross-CCD cache-coherency traffic can reach it at all. The most deterministic possible setup for an X3D chip - the game gets sole, uncontested use of one die's cache and cores with zero interference from the other die under any circumstance - at the obvious cost of losing that die's cores entirely until restored. The Competitive preset parks the frequency CCD as its most aggressive step; only reach for this if affinity plus workqueue/IRQ steering (which achieve most of the isolation benefit without losing any cores) is not enough for what you are chasing. cpu0's CCD can never be parked (the kernel needs cpu0 online), so on a 2-CCD chip you can only ever park 'the other one'. While any CPU is offline (park or SMT off) nvidia-powerd is stopped and restarted afterwards: it cannot handle hot-unplugged CPUs and on Blackwell laptops that ends in a GSP hang (Xid 79/119 -> 154, reboot needed). Dynamic Boost (+25 W GPU) is therefore off while parked. Game mode (lpm-gamemode PRE/RUN/WRAP) never takes the CCD offline: Wine/Proton count only online CPUs and map them 1:1 to CPU numbers, so the hole a parked CCD leaves (0-7,16-23) breaks thread pinning and some games do not start. There the CCD is emptied instead - the game gets the other CCD as a cgroup v2 cpuset partition (everything else is moved off it; needs the unified cgroup hierarchy, OpenRC rc_cgroup_mode=\"unified\", otherwise the game is only pinned), IRQs and unbound kernel work are moved onto the parked CCD, and WINE_CPU_TOPOLOGY maps the game's CPUs - which isolates the game just as well.",
       Kind::Choice, Options::Special, Target::CcdPark)),
 ];
 
@@ -819,6 +819,108 @@ pub fn record_ccd_park(role: &str, label: Option<&str>, cpus: &[usize]) -> Resul
 fn possible_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("possible")).map(|s| cpu_list(&s)).unwrap_or_default() }
 fn present_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("present")).map(|s| cpu_list(&s)).unwrap_or_default() }
 fn online_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("online")).map(|s| cpu_list(&s)).unwrap_or_default() }
+
+// ── nvidia-powerd guard ──────────────────────────────────────────────────
+// nvidia-powerd (Dynamic Boost) walks every CPU's cpuid/cpufreq data and does
+// not survive hot-unplugged CPUs ("malformed CPU data" / cpuid_error, NVIDIA
+// bug 4782702). Its PMGR control on Blackwell laptops then hangs the GSP as
+// soon as a game loads the GPU: Xid 79/119 -> Xid 154 "reboot required".
+// So it is stopped before any CPU goes offline and started again once the
+// offline set is back to what it was before (SMT/park both count).
+
+pub const POWERD_MARK: &str = "/run/legion-power-manager/tune/powerd-paused.json";
+
+fn powerd_pids() -> Vec<i32> {
+    std::fs::read_dir("/proc").into_iter().flatten().flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| read(Path::new(&format!("/proc/{pid}/comm"))).as_deref() == Some("nvidia-powerd"))
+        .collect()
+}
+
+fn powerd_wait(running: bool, ms: u64) -> bool {
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        if powerd_pids().is_empty() != running { return true; }
+        if std::time::Instant::now() >= end { return false; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// `systemctl <action> nvidia-powerd` / `rc-service nvidia-powerd <action>`.
+fn powerd_service(action: &str) -> bool {
+    let bin = |c: &[&str]| c.iter().map(PathBuf::from).find(|p| crate::trusted_path(p));
+    let (bin, args) = if Path::new("/run/systemd/system").is_dir() {
+        (bin(&["/usr/bin/systemctl", "/bin/systemctl"]), [action, "nvidia-powerd.service"])
+    } else if Path::new("/run/openrc").is_dir() {
+        (bin(&["/sbin/rc-service", "/usr/sbin/rc-service", "/bin/rc-service", "/usr/bin/rc-service"]), ["nvidia-powerd", action])
+    } else { return false };
+    bin.and_then(|b| run_tool(&b, &args, std::time::Duration::from_secs(15))).map_or(false, |(ok, _)| ok)
+}
+
+/// True for a hot-plug write that takes CPUs offline (park "0", SMT "off").
+pub fn offlines_cpus(key: &str, data: &str) -> bool {
+    is_hotplug(key) && matches!(data, "0" | "off" | "forceoff")
+}
+
+/// Shutdown/reboot in progress: never (re)start a daemon then.
+fn system_stopping() -> bool {
+    if let Some(l) = read(Path::new("/run/openrc/softlevel")) { return l == "shutdown" || l == "reboot"; }
+    if Path::new("/run/systemd/system").is_dir() {
+        let bin = ["/usr/bin/systemctl", "/bin/systemctl"].iter().map(PathBuf::from).find(|p| crate::trusted_path(p));
+        return bin.and_then(|b| run_tool(&b, &["is-system-running"], std::time::Duration::from_secs(5)))
+            .map_or(false, |(_, out)| out.trim() == "stopping");
+    }
+    false
+}
+
+fn powerd_mark(exe: &str, via: &str, offline: &[usize]) -> Result<(), String> {
+    crate::write_root_file(POWERD_MARK, json!({"exe": exe, "via": via, "offline": offline}).to_string().as_bytes())
+}
+
+/// Call before writes that take CPUs offline. Ok(true): it was running and is
+/// stopped now. Err: still running, the caller must not offline anything.
+pub fn powerd_pause() -> Result<bool, String> {
+    let pids = powerd_pids();
+    if pids.is_empty() { return Ok(false); }
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pids[0])).map(|p| p.display().to_string()).unwrap_or_default();
+    let offline = offline_cpus();
+    // Marked before it is touched: a powerd stopped without a mark would never come back.
+    powerd_mark(&exe, "exe", &offline)?;
+    // Service first, so a supervisor does not respawn it; plain signals otherwise.
+    if powerd_service("stop") && powerd_wait(false, 3000) {
+        powerd_mark(&exe, "service", &offline)?;
+        return Ok(true);
+    }
+    for pid in powerd_pids() { unsafe { libc::kill(pid, libc::SIGTERM); } }
+    if powerd_wait(false, 3000) { return Ok(true); }
+    for pid in powerd_pids() { unsafe { libc::kill(pid, libc::SIGKILL); } }
+    if powerd_wait(false, 2000) { return Ok(true); }
+    let _ = std::fs::remove_file(POWERD_MARK);
+    Err("nvidia-powerd could not be stopped".into())
+}
+
+/// Call after hot-plug writes. Restarts nvidia-powerd once no CPU beyond the
+/// ones already offline at pause time is offline. Ok(true) = restarted.
+pub fn powerd_resume() -> Result<bool, String> {
+    let Some(v) = crate::read_root_file(POWERD_MARK, 4096).and_then(|s| serde_json::from_str::<Value>(&s).ok()) else { return Ok(false) };
+    let before: Vec<usize> = v["offline"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect()).unwrap_or_default();
+    if !offline_cpus().iter().all(|c| before.contains(c)) || system_stopping() { return Ok(false); }
+    let _ = std::fs::remove_file(POWERD_MARK);
+    if !powerd_pids().is_empty() { return Ok(false); }
+    if v["via"] == "service" {
+        return if powerd_service("start") && powerd_wait(true, 3000) { Ok(true) } else { Err("nvidia-powerd service did not start again".into()) };
+    }
+    // Not started by a service manager we know: relaunch the same binary, detached.
+    let exe = PathBuf::from(v["exe"].as_str().unwrap_or(""));
+    if !exe.is_absolute() || !crate::trusted_path(&exe) { return Err("nvidia-powerd could not be restarted (untrusted or unknown binary)".into()); }
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").current_dir("/")
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    cmd.spawn().map_err(|e| format!("nvidia-powerd: {e}"))?;
+    Ok(true)
+}
 
 /// Legacy role names ("cache"/"frequency", older presets and park records)
 /// mapped onto the CCD index they resolve to here; anything else unchanged.
