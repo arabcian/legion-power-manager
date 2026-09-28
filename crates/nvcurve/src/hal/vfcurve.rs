@@ -289,6 +289,9 @@ pub fn readback_matches(expected: i64, got: i64) -> bool {
 /// Deltas below a point's floor are clamped first (reported in the description).
 pub fn write_offsets(gpu: Gpu, deltas: &PointDeltas, dry_run: bool, full_mask: bool,
                      current_raw: Option<&[u8]>) -> (i32, String) {
+    // Nothing to change (e.g. a domain-wide reset on a GPU that has no point of that domain):
+    // never send a ClockBoostTable with an empty mask to the driver.
+    if deltas.is_empty() { return (0, "no points to write".into()); }
     let mut deltas = deltas.clone();
     let mut notes = Vec::new();
     if deltas.values().any(|&d| d < 0) {
