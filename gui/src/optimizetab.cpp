@@ -78,7 +78,7 @@ static const Builtin BUILTINS[] = {
         "kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
         "kernel.sched_autogroup":1,"kernel.cfs_bandwidth_slice_us":3000,
         "sched.preempt":"full","sched.base_slice_ns":1000000,"sched.migration_cost_ns":500000,"sched.nr_migrate":32,
-        "wq.power_efficient":"0","wq.cpumask":"frequency","irq.affinity":"frequency",
+        "wq.cpumask":"frequency","irq.affinity":"frequency",
         "blk.scheduler":"none","pci.aspm":"performance","pci.latency_timer":"tuned",
         "snd.hda_power_save":0,"snd.hda_power_save_controller":"0","usb.autosuspend":-1,"gpu.amdgpu_dpm":"low"},
       "run":{"nice":-5,"autogroup":true,"affinity":"cache"}})"},
@@ -91,8 +91,7 @@ static const Builtin BUILTINS[] = {
         "thp.enabled":"madvise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,"mm.lru_gen_min_ttl":1000,
         "mm.ksm_run":0,"vm.max_map_count":2147483642,"vm.swappiness":10,"vm.stat_interval":10,"vm.page_cluster":0,
         "kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,"kernel.timer_migration":0,
-        "sched.preempt":"full","sched.base_slice_ns":1000000,"wq.power_efficient":"0",
-        "blk.scheduler":"none","pci.aspm":"performance","snd.hda_power_save":0,"usb.autosuspend":-1,
+        "sched.preempt":"full","sched.base_slice_ns":1000000,"blk.scheduler":"none","pci.aspm":"performance","snd.hda_power_save":0,"usb.autosuspend":-1,
         "gpu.amdgpu_dpm":"low","cpu.ccd_park":"frequency"},
       "run":{"nice":-10,"autogroup":true,"affinity":"cache"}})"},
     {"amd", "Low latency desktop",
@@ -101,7 +100,7 @@ static const Builtin BUILTINS[] = {
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance",
         "cpu.min_freq":"lowest_nonlinear","thp.enabled":"madvise","thp.defrag":"defer+madvise",
         "mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,"vm.max_map_count":2147483642,"vm.page_cluster":0,
-        "kernel.split_lock_mitigate":0,"sched.preempt":"full","wq.power_efficient":"0","snd.hda_power_save":0},
+        "kernel.split_lock_mitigate":0,"sched.preempt":"full","snd.hda_power_save":0},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
     {"amd", "Compile throughput",
      "Long parallel builds (emerge, kernel): frequency CCD preferred, throughput preemption, bigger slices.",
@@ -125,7 +124,9 @@ static const Builtin BUILTINS[] = {
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"power","cpu.boost":"0",
         "cpu.min_freq":"cpuinfo_min","cpu.cstate_max":"all","pci.aspm":"powersupersave",
         "snd.hda_power_save":1,"snd.hda_power_save_controller":"1","usb.autosuspend":2,
-        "wq.power_efficient":"1","kernel.watchdog":1,"gpu.amdgpu_dpm":"auto","vm.stat_interval":10},
+        "kernel.watchdog":1,"gpu.amdgpu_dpm":"auto","vm.stat_interval":10,
+        "net.wol":"0","gpu.amdgpu_abm":3,
+        "pm.ahci_runtime_timeout":15000,"pm.ahci_disk_runtime":"auto","pm.ahci_port_runtime":"auto","disk.apm_0":128,"disk.apm_1":128},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
     // ── Intel (hybrid P/E-core) ──────────────────────────────────────────────
     {"intel", "Intel gaming hybrid",
@@ -141,7 +142,7 @@ static const Builtin BUILTINS[] = {
         "kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
         "kernel.sched_autogroup":1,"kernel.cfs_bandwidth_slice_us":3000,
         "sched.preempt":"full","sched.base_slice_ns":1000000,"sched.migration_cost_ns":500000,"sched.nr_migrate":32,
-        "wq.power_efficient":"0","wq.cpumask":"ecore","irq.affinity":"ecore",
+        "wq.cpumask":"ecore","irq.affinity":"ecore",
         "blk.scheduler":"none","pci.aspm":"performance","pci.latency_timer":"tuned",
         "snd.hda_power_save":0,"snd.hda_power_save_controller":"0","usb.autosuspend":-1,
         "gpu.intel_slpc_profile":"power_saving"},
@@ -154,8 +155,7 @@ static const Builtin BUILTINS[] = {
         "cpu.cstate_max":"1","thp.enabled":"madvise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,
         "mm.lru_gen_min_ttl":1000,"mm.ksm_run":0,"vm.max_map_count":2147483642,"vm.swappiness":10,"vm.stat_interval":10,
         "vm.page_cluster":0,"kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
-        "kernel.timer_migration":0,"sched.preempt":"full","sched.base_slice_ns":1000000,"wq.power_efficient":"0",
-        "wq.cpumask":"ecore","irq.affinity":"ecore","blk.scheduler":"none","pci.aspm":"performance",
+        "kernel.timer_migration":0,"sched.preempt":"full","sched.base_slice_ns":1000000,"wq.cpumask":"ecore","irq.affinity":"ecore","blk.scheduler":"none","pci.aspm":"performance",
         "snd.hda_power_save":0,"usb.autosuspend":-1,"gpu.intel_slpc_profile":"power_saving"},
       "run":{"nice":-10,"autogroup":true,"affinity":"pcore"}})"},
     {"intel", "Intel low latency desktop",
@@ -164,7 +164,7 @@ static const Builtin BUILTINS[] = {
         "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance","cpu.hwp_dynamic_boost":"1",
         "thp.enabled":"madvise","thp.defrag":"defer+madvise","mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,
         "vm.max_map_count":2147483642,"vm.page_cluster":0,"kernel.split_lock_mitigate":0,"sched.preempt":"full",
-        "wq.power_efficient":"0","snd.hda_power_save":0},
+        "snd.hda_power_save":0},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
     {"intel", "Intel compile throughput",
      "Long parallel builds: every P- and E-core busy, balance_performance EPP, throughput preemption, bigger slices.",
@@ -181,8 +181,9 @@ static const Builtin BUILTINS[] = {
         "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"power","cpu.epp_pcore":"balance_power",
         "cpu.epp_ecore":"power","cpu.boost":"0","cpu.hwp_dynamic_boost":"0","cpu.min_freq":"cpuinfo_min",
         "cpu.cstate_max":"all","pci.aspm":"powersupersave","snd.hda_power_save":1,"snd.hda_power_save_controller":"1",
-        "usb.autosuspend":2,"wq.power_efficient":"1","kernel.watchdog":1,"gpu.intel_slpc_profile":"power_saving",
-        "vm.stat_interval":10},
+        "usb.autosuspend":2,"kernel.watchdog":1,"gpu.intel_slpc_profile":"power_saving",
+        "vm.stat_interval":10,"net.wol":"0",
+        "pm.ahci_runtime_timeout":15000,"pm.ahci_disk_runtime":"auto","pm.ahci_port_runtime":"auto","disk.apm_0":128,"disk.apm_1":128},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
 };
 
@@ -1299,6 +1300,13 @@ void OptimizeTab::showAutotuneReport(const QJsonObject &d, const QStringList &no
     head->setTextFormat(Qt::RichText);
     head->setTextInteractionFlags(Qt::TextSelectableByMouse);
     v->addWidget(head);
+    if (const QString ev = d.value(QStringLiteral("evidence_summary")).toString(); !ev.isEmpty()) {
+        auto *evl = new QLabel(QStringLiteral("<b>Observed</b>&nbsp; %1").arg(ev.toHtmlEscaped()));
+        evl->setWordWrap(true);
+        evl->setTextFormat(Qt::RichText);
+        evl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        v->addWidget(evl);
+    }
 
     auto *table = new QTableWidget(0, 4);
     table->setHorizontalHeaderLabels({QStringLiteral("Group"), QStringLiteral("Setting"), QStringLiteral("Value"), QStringLiteral("Why (for this machine)")});

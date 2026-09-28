@@ -10,6 +10,7 @@
 #include "optimizetab.h"
 #include "ryzentab.h"
 #include "theme.h"
+#include <QJsonArray>
 #include <QCheckBox>
 #include <QDate>
 #include <QDir>
@@ -152,6 +153,15 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     fan_->addItem("Unchanged", -1);
     fan_->addItem("Auto (EC fan curve)", 0);
     fan_->addItem("Turbo (EC full speed)", 1);
+    fanTableLabel_ = new QLabel;
+    fanTableLabel_->setWordWrap(true);
+    fanClear_ = new QPushButton("Clear");
+    fanClear_->setObjectName("btnMini");
+    fanTableLabel_->setToolTip("Custom-mode EC fan curve (10 temperature steps, level 1-10). Stored by Capture current above; "
+                               "applied only while the scene uses the Custom power profile.");
+    g->addWidget(muted("Fan curve"), row, 0);
+    g->addWidget(fanTableLabel_, row, 1, 1, 2);
+    g->addWidget(fanClear_, row++, 3);
     addRow("Fan boost", fan_, "EC Full Speed flag (the Turbo fan switch). Applied after the power profile; Capture current reads it too.");
 
     if (win_->ryzen() || win_->intel()) {
@@ -259,6 +269,7 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     connect(save_, &QPushButton::clicked, this, [this] { if (saveCurrent()) setStatus("Saved.", theme::OK); });
     connect(apply_, &QPushButton::clicked, this, &ScenesTab::applyCurrent);
     connect(fwCapture_, &QPushButton::clicked, this, &ScenesTab::captureFirmware);
+    connect(fanClear_, &QPushButton::clicked, this, [this] { fanTable_.clear(); updateFanTableLabel(); updateDirty(); });
     connect(fwClear_, &QPushButton::clicked, this, [this] { firmware_.clear(); updateFirmwareLabel(); updateDirty(); });
     for (QComboBox *c : {profile_, cpu_, gpu_, tuning_, lightProfile_, lightBright_, fan_})
         if (c) connect(c, &QComboBox::currentIndexChanged, this, [this] { if (!filling_) updateDirty(); });
@@ -332,6 +343,8 @@ void ScenesTab::setEditor(const Scene &s) {
     fan_->setCurrentIndex(std::max(0, fan_->findData(s.fanFullSpeed)));
     command_->setText(s.command);
     firmware_ = s.firmware;
+    fanTable_ = s.fanTable;
+    updateFanTableLabel();
     editor_->setTitle(s.name.isEmpty() ? QStringLiteral("Scene") : s.name);
     filling_ = false;
     loaded_ = s;
@@ -344,6 +357,7 @@ Scene ScenesTab::fromEditor() const {
     s.name = loaded_.name;
     s.platformProfile = profile_->currentData().toString();
     s.firmware = firmware_;
+    s.fanTable = fanTable_;
     if (cpu_) s.cpu = decode(cpu_->currentData().toString());
     s.gpu = decode(gpu_->currentData().toString());
     s.tuning = decode(tuning_->currentData().toString());
@@ -426,6 +440,12 @@ void ScenesTab::updateFirmwareLabel() {
     fwLabel_->setToolTip(all.join('\n'));
 }
 
+void ScenesTab::updateFanTableLabel() {
+    QStringList l;
+    for (int x : fanTable_) l << QString::number(x);
+    fanTableLabel_->setText(fanTable_.isEmpty() ? QStringLiteral("unchanged") : l.join(QStringLiteral(" · ")));
+}
+
 void ScenesTab::captureFirmware() {
     QMap<QString, int> fw;
     bool hasWmi = false;
@@ -435,7 +455,12 @@ void ScenesTab::captureFirmware() {
     }
     const QMap<QString, int> wmi = win_->fwattr() ? win_->fwattr()->wmiValues() : QMap<QString, int>();
     for (auto it = wmi.cbegin(); it != wmi.cend(); ++it) fw.insert(it.key(), it.value());
-    if (fw.isEmpty()) { setStatus("This machine exposes no writable firmware attributes.", theme::WARN); return; }
+    if (fw.isEmpty()) {
+        // No firmware attributes: the fan curve alone can still be captured.
+        captureFanTable(QString());
+        setStatus("This machine exposes no writable firmware attributes.", theme::WARN);
+        return;
+    }
     firmware_ = fw;
     QString note = QStringLiteral("Captured %1 firmware value(s).").arg(fw.size());
     if (hasWmi && wmi.isEmpty()) note += " The GPU cTGP/boost values were not read yet — open Firmware Attributes once and capture again to include them.";
@@ -453,6 +478,23 @@ void ScenesTab::captureFirmware() {
                         fan_->setCurrentIndex(std::max(0, fan_->findData(r.json.value("on").toBool() ? 1 : 0)));
                         updateDirty();
                         setStatus(note + QStringLiteral(" Fan boost: %1.").arg(r.json.value("on").toBool() ? "turbo" : "auto"), theme::OK);
+                    });
+    captureFanTable(note);
+}
+
+// The active Custom-mode fan curve (EC table) belongs to the same snapshot; machines without
+// the fan-table interface answer "unsupported" and simply keep it "unchanged".
+void ScenesTab::captureFanTable(const QString &note) {
+    privileged::run(privileged::helperPath("legion-profile-helper"), QJsonObject{{"fan_table", "get"}}, this,
+                    [this, note](const privileged::Result &r) {
+                        if (!r.ok()) return;
+                        const QJsonArray a = r.json.value("levels").toArray();
+                        if (a.size() != 10) return;
+                        fanTable_.clear();
+                        for (const QJsonValue &v : a) fanTable_ << v.toInt();
+                        updateFanTableLabel();
+                        updateDirty();
+                        setStatus((note.isEmpty() ? QString() : note + ' ') + QStringLiteral("Fan curve captured."), theme::OK);
                     });
 }
 

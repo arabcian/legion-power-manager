@@ -37,6 +37,7 @@ private:
     void newScene(bool duplicate);
     void deleteScene();
     void captureFirmware();
+    void captureFanTable(const QString &note);
     void setStatus(const QString &msg, const char *color = nullptr);
 
     MainWindow *win_;
@@ -47,7 +48,10 @@ private:
     QComboBox *fan_ = nullptr;
     QComboBox *lightProfile_ = nullptr, *lightBright_ = nullptr;  // only with a Spectrum keyboard
     QLabel *fwLabel_;
-    QPushButton *fwCapture_, *fwClear_;
+    QPushButton *fwCapture_, *fwClear_, *fanClear_ = nullptr;
+    QLabel *fanTableLabel_ = nullptr;
+    QVector<int> fanTable_;          // editor copy of the captured Custom-mode fan table
+    void updateFanTableLabel();
     QLineEdit *command_;
     QPushButton *save_, *apply_, *dup_, *del_;
     QCheckBox *auto_;

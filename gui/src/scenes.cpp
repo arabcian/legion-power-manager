@@ -10,8 +10,10 @@
 #include "platformprofile.h"
 #include "privileged.h"
 #include "ryzentab.h"
+#include <algorithm>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
@@ -104,6 +106,12 @@ std::optional<Scene> load(const QString &name) {
     if (const int p = light.value("profile").toInt(-1); p >= 0 && p <= 6) s.lightProfile = p;
     if (const int b = light.value("brightness").toInt(-1); b >= 0 && b <= 9) s.lightBrightness = b;
     if (const QJsonValue f = o.value("fan_fullspeed"); f.isBool()) s.fanFullSpeed = f.toBool() ? 1 : 0;
+    const QJsonArray ft = o.value("fan_table").toArray();
+    if (ft.size() == 10) {
+        QVector<int> lv;
+        for (const QJsonValue &v : ft) lv << v.toInt(0);
+        if (std::all_of(lv.begin(), lv.end(), [](int x) { return x >= 1 && x <= 10; })) s.fanTable = lv;
+    }
     s.command = o.value("command").toString().trimmed();
     return s;
 }
@@ -131,6 +139,7 @@ bool save(const Scene &s, QString *err, const QJsonObject &tuningValues) {
         o["lighting"] = light;
     }
     if (s.fanFullSpeed >= 0) o["fan_fullspeed"] = s.fanFullSpeed == 1;
+    if (s.fanTable.size() == 10) { QJsonArray a; for (int x : s.fanTable) a << x; o["fan_table"] = a; }
     if (!s.command.isEmpty()) o["command"] = s.command;
     return writeObject(sceneFile(s.name), o, err);
 }
@@ -476,6 +485,23 @@ void SceneEngine::apply(const QString &name) {
     start(*s);
 }
 
+/// The NVIDIA dGPU is on the bus, has a driver bound AND the driver actually
+/// initialised it (/proc/driver/nvidia/gpus lists it; "nvidia-smi: No devices were
+/// found" = empty). After iGPU-only / a firmware power cut the PCI function can stay
+/// listed with the module loaded while the GPU is dead: every NVIDIA / WMI-GPU call
+/// against it can then hang in the kernel (the helper sits in D state), so a scene
+/// skips those steps instead of trying them. Directory listing only: no GPU wake-up.
+static bool nvidiaUsable() {
+    const QDir d(QStringLiteral("/sys/bus/pci/devices"));
+    bool onBus = false;
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System)) {
+        auto rd = [&](const char *f) { QFile x(d.filePath(e) + '/' + QLatin1String(f)); return x.open(QIODevice::ReadOnly) ? x.readAll().trimmed() : QByteArray(); };
+        if (rd("vendor") == "0x10de" && rd("class").startsWith("0x03") && QFileInfo::exists(d.filePath(e) + QStringLiteral("/driver"))
+            && rd("power/runtime_status") != "error") { onBus = true; break; }
+    }
+    return onBus && !QDir(QStringLiteral("/proc/driver/nvidia/gpus")).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty();
+}
+
 void SceneEngine::addStep(const QString &what, Step step) { steps_.append({what, std::move(step)}); }
 
 void SceneEngine::helper(const QString &name, const QJsonObject &req, Done done,
@@ -533,6 +559,7 @@ void SceneEngine::start(const Scene &s) {
             auto afterSysfs = [this, wmi, note, done, n = batch.size()](bool ok, const QString &msg) {
                 if (!ok) { done(false, msg); return; }
                 if (wmi.isEmpty()) { done(true, QStringLiteral("%1 value(s)").arg(n) + note); return; }
+                if (!nvidiaUsable()) { done(true, QStringLiteral("%1 value(s); %2 GPU value(s) skipped (NVIDIA dGPU is off)").arg(n).arg(wmi.size()) + note); return; }
                 helper("legion-gpu-helper", {{"op", "apply"}, {"values", wmi}}, [done, n, note, w = wmi.size()](bool ok, const QString &m) {
                     done(ok, ok ? QStringLiteral("%1 value(s) + %2 GPU (WMI)").arg(n).arg(w) + note : "GPU (WMI): " + m);
                 });
@@ -595,6 +622,7 @@ void SceneEngine::start(const Scene &s) {
     if (s.gpu.kind != Choice::Unchanged && win_->nvidia()) {
         addStep("GPU curve", [this, c = s.gpu, cpuStep](Done done) {
             // Same 2 s gap after a CPU curve as lpm-gamemode (UNDERVOLT_GAP).
+            if (!nvidiaUsable()) { done(true, "skipped (NVIDIA dGPU is off)"); return; }
             QTimer::singleShot(cpuStep ? 2000 : 0, this, [this, c, done] {
                 // Two NvAPI sessions writing the ClockBoostTable at once is asking for trouble.
                 if (win_->nvidia()->busy()) { done(false, "the NVIDIA tab is busy; skipped"); return; }
@@ -623,6 +651,21 @@ void SceneEngine::start(const Scene &s) {
                 if (!r.ok()) { done(false, r.message()); return; }
                 done(true, c.kind == Choice::Reset ? QStringLiteral("originals restored") : "'" + c.name + "'");
             }, 120000);
+        });
+    }
+
+    // 5a. Custom-mode fan curve — only while the Custom power profile is active (the EC follows
+    //     the table there and nowhere else); skipped with a note otherwise, not an error.
+    if (s.fanTable.size() == 10) {
+        addStep("Fan curve", [this, lv = s.fanTable](Done done) {
+            if (pp::currentProfile(pp::primaryHandler()) != QStringLiteral("custom")) {
+                done(true, "skipped (the EC uses its own curve outside the Custom power profile)");
+                return;
+            }
+            QJsonArray a;
+            for (int x : lv) a << x;
+            helper("legion-profile-helper", QJsonObject{{"fan_table", "set"}, {"levels", a}}, done,
+                   [](const QJsonObject &) { return QStringLiteral("table written and verified"); });
         });
     }
 

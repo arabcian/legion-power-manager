@@ -1,4 +1,5 @@
 #include "healthtab.h"
+#include "klogpage.h"
 
 #include "privileged.h"
 #include "systools.h"
@@ -61,6 +62,7 @@ HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
     auto *monitor = new QWidget;
     sub->addTab(monitor, QStringLiteral("Monitor"));
     systools::addPages(sub);
+    sub->addTab(new KlogPage, QStringLiteral("Kernel log"));
     auto *root = new QVBoxLayout(monitor);
     root->setContentsMargins(10, 8, 10, 8);
     root->setSpacing(6);

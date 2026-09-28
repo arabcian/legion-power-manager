@@ -258,7 +258,6 @@ void addPages(QTabWidget *tabs) {
          {{"vulkaninfo", "--summary"}, {"glxinfo", "-B"}}},
         {"Kernel", "Kernel version, boot command line and loaded modules.",
          {{"uname", "-a"}, {"@file", "/proc/cmdline"}, {"lsmod"}}},
-        {"Kernel log", "dmesg errors and warnings since boot (root).", {}, "dmesg"},
         {"Battery", "Every power supply as the kernel reports it (capacity, cycles, charge limits).",
          {{"@glob", "/sys/class/power_supply/*/uevent"}}},
     };

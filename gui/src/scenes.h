@@ -16,6 +16,7 @@
 //   ~/.config/legion-power-manager/scenes.json      {"auto", "on_ac", "on_battery"}
 #include <QJsonObject>
 #include <QMap>
+#include <QVector>
 #include <QObject>
 #include <QStringList>
 #include <functional>
@@ -40,6 +41,7 @@ struct Scene {
     Choice cpu, gpu, tuning;       // tuning Reset = restore originals
     int lightProfile = -1;         // keyboard lighting profile 1-6; -1 = unchanged
     int lightBrightness = -1;      // keyboard brightness 0-9; -1 = unchanged
+    QVector<int> fanTable;         // Custom-mode EC fan table (10 levels, 1..10); empty = unchanged
     int fanFullSpeed = -1;         // EC fan boost (Full Speed): 1 on, 0 auto; -1 = unchanged
     QString command;               // optional; run as the user, no shell
     bool operator==(const Scene &) const = default;

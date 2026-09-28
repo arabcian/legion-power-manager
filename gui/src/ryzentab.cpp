@@ -51,6 +51,19 @@ static QList<int> expandCpuList(const QString &s) {
     return out;
 }
 
+// Stable identity of an L3 domain: cache/index3/id (derived from the APIC ID, i.e. the
+// physical die position). Independent of which CPUs happen to be online.
+static int l3Id(const QString &cpuDir) {
+    const QDir cache(cpuDir + "/cache");
+    for (const QString &idx : cache.entryList({"index*"}, QDir::Dirs, QDir::Name))
+        if (pp::readText(cache.filePath(idx) + "/level") == QStringLiteral("3")) {
+            bool ok = false;
+            const int v = pp::readText(cache.filePath(idx) + "/id").value_or(QString()).toInt(&ok);
+            return ok ? v : -1;
+        }
+    return -1;
+}
+
 static std::optional<QString> l3Shared(const QString &cpuDir) {
     const QDir cache(cpuDir + "/cache");
     for (const QString &idx : cache.entryList({"index*"}, QDir::Dirs, QDir::Name))
@@ -80,11 +93,13 @@ ryzen::Layout ryzen::detect() {
     const QList<int> online = expandCpuList(pp::readText(sys.filePath("online")).value_or(QString()));
     auto isOnline = [&](int c) { return online.isEmpty() || online.contains(c); };
     QList<QList<int>> groups;
+    QMap<int, int> idOfCpu;  // cpu -> L3 id
     for (const QString &c : sys.entryList({"cpu[0-9]*"}, QDir::Dirs)) {
         const int n = c.mid(3).toInt();
         if (!isOnline(n)) continue;
         const auto s = l3Shared(sys.filePath(c));
         if (!s) continue;
+        idOfCpu[n] = l3Id(sys.filePath(c));
         QList<int> g;
         for (int x : expandCpuList(*s)) if (isOnline(x) && !g.contains(x)) g << x;
         if (!g.contains(n)) g << n;
@@ -102,7 +117,15 @@ ryzen::Layout ryzen::detect() {
     if (!parked.isEmpty() && std::none_of(groups.begin(), groups.end(), [&](const QList<int> &g) {
             return std::any_of(parked.begin(), parked.end(), [&](int c) { return g.contains(c); }); }))
         groups << parked;
-    std::sort(groups.begin(), groups.end(), [](auto &a, auto &b) { return a.first() < b.first(); });
+    // Order by L3 id when every online group has one (a parked group has none: it sorts by
+    // its first CPU, which is what it always did), else by lowest CPU number.
+    auto keyOf = [&](const QList<int> &g) {
+        for (int c : g) if (idOfCpu.value(c, -1) >= 0) return idOfCpu.value(c);
+        return -1;
+    };
+    const bool haveIds = std::all_of(groups.begin(), groups.end(), [&](const QList<int> &g) { return keyOf(g) >= 0; });
+    std::sort(groups.begin(), groups.end(), [&](const QList<int> &a, const QList<int> &b) {
+        return haveIds ? keyOf(a) < keyOf(b) : a.first() < b.first(); });
     out.ccdCount = groups.size();
     for (int ccd = 0; ccd < groups.size(); ++ccd) {
         if (groups[ccd] != parked) continue;
@@ -417,6 +440,11 @@ RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) 
     if (!mismatch.isEmpty()) log("Partially-populated CCD detected — see the notice above about SMU slot IDs vs. OS core IDs.", "cmd");
     bool cppc = false;
     for (const auto &l : std::as_const(layout_.cores)) for (const auto &c : l) cppc |= c.highestPerf.has_value();
+    for (auto it = layout_.cores.cbegin(); it != layout_.cores.cend(); ++it) {
+        QStringList c;
+        for (const auto &pc : it.value()) c << QStringLiteral("%1").arg(pc.cpus.first());
+        log(QStringLiteral("CCD%1 = CPUs (first thread per core): %2").arg(it.key()).arg(c.join(' ')), "info");
+    }
     log(cppc ? "CPPC highest_perf read per core from sysfs — shown in the 'cppc' column."
              : "CPPC highest_perf not available from sysfs on this system — cppc column shows '–'.", cppc ? "info" : "cmd");
     if (!profilesReady_) log("Profile directory is not writable: " + ryzen::profilesDir(), "err");
@@ -683,6 +711,29 @@ void RyzenTab::showEvent(QShowEvent *e) {
 }
 
 void RyzenTab::updateParked() {
+    // The layout was read once at construction; hot-plug (park, SMT) or an early start can leave
+    // it stale, which shows one CCD's CPPC values under the other's name. Re-read it and refresh
+    // every CPPC cell when the CPU->CCD mapping is different now.
+    {
+        const ryzen::Layout fresh = ryzen::detect();
+        auto sig = [](const ryzen::Layout &l) {
+            QStringList out;
+            for (auto it = l.cores.cbegin(); it != l.cores.cend(); ++it) {
+                QStringList c;
+                for (const auto &pc : it.value()) c << QString::number(pc.cpus.first());
+                out << QStringLiteral("%1:%2").arg(it.key()).arg(c.join(','));
+            }
+            return out.join(';');
+        };
+        if (fresh.ccdCount == layout_.ccdCount && sig(fresh) != sig(layout_)) {
+            layout_ = fresh;
+            for (const Slot &s : std::as_const(slots_)) {
+                const auto cores = layout_.cores.value(s.ccd);
+                if (s.slot >= cores.size()) continue;
+                s.cppc->setText(cores[s.slot].highestPerf ? QString::number(*cores[s.slot].highestPerf) : QStringLiteral("–"));
+            }
+        }
+    }
     const QList<int> parked = ryzen::parkedCpus();
     parkedNow_.clear();
     for (int ccd = 0; ccd < ccdCount_; ++ccd) {

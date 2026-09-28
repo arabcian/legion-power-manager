@@ -567,17 +567,23 @@ QGroupBox *HomeTab::buildDeviceBox() {
         auto *od = new QCheckBox("Panel Over Drive");
         od->setToolTip("Faster pixel response on LCD panels (less ghosting, possible overshoot).\n"
                        "Only offered when the firmware reports the panel supports it — never on OLED.");
-        for (QWidget *w : {static_cast<QWidget *>(igLabel), static_cast<QWidget *>(ig), static_cast<QWidget *>(od)}) w->hide();
+        auto *nvBack = new QPushButton("Bring NVIDIA back");
+        nvBack->setToolTip("Rescans the PCI bus if the NVIDIA GPU is missing and loads its driver again.\n"
+                           "Use it after switching iGPU mode back to Default or after plugging in AC.\n"
+                           "iGPU only / Auto unload the NVIDIA driver first (the card is cut off by the firmware and a\n"
+                           "still-bound driver can hang the kernel's PCI bus); this button is the way back.");
+        for (QWidget *w : {static_cast<QWidget *>(igLabel), static_cast<QWidget *>(ig), static_cast<QWidget *>(od), static_cast<QWidget *>(nvBack)}) w->hide();
         g->addWidget(igLabel, row, 0);
-        g->addWidget(ig, row++, 1, 1, 4);
+        g->addWidget(ig, row, 1, 1, 3);
+        g->addWidget(nvBack, row++, 4);
         g->addWidget(od, row++, 1, 1, 4);
         const QString gh = privileged::helperPath("legion-gpu-helper");
-        privileged::run(gh, QJsonObject{{"op", "panel_extras"}}, this, [igLabel, ig, od](const privileged::Result &r) {
+        privileged::run(gh, QJsonObject{{"op", "panel_extras"}}, this, [igLabel, ig, od, nvBack](const privileged::Result &r) {
             if (!r.ok()) return;
             if (r.json.value("igpu_supported").toBool() && r.json.value("igpu_mode").isDouble()) {
                 ig->setCurrentIndex(ig->findData(r.json.value("igpu_mode").toInt()));
                 ig->setProperty("applied", ig->currentIndex());
-                igLabel->show(); ig->show();
+                igLabel->show(); ig->show(); nvBack->show();
             }
             if (r.json.value("od_supported").toBool()) {
                 od->setChecked(r.json.value("od").toBool());
@@ -592,7 +598,13 @@ QGroupBox *HomeTab::buildDeviceBox() {
             privileged::run(force ? privileged::helperPath(privileged::FIRMWARE_HELPER) : gh,
                             QJsonObject{{"op", "set_igpu_mode"}, {"mode", ig->itemData(i).toInt()}, {"force", force}}, this,
                             [this, ig, i, weak](const privileged::Result &r) {
-                if (r.ok()) { ig->setProperty("applied", i); return; }
+                if (r.ok()) {
+                    ig->setProperty("applied", i);
+                    // Back to Default: the firmware returns the card; rescan + load the driver.
+                    if (ig->itemData(i).toInt() == 0)
+                        privileged::run(privileged::helperPath("legion-gpu-helper"), QJsonObject{{"op", "dgpu_restore"}}, this, [](const privileged::Result &) {}, 60000);
+                    return;
+                }
                 ig->setCurrentIndex(ig->property("applied").toInt());
                 if (r.reached && r.json.value("needs_force").toBool()
                     && QMessageBox::warning(this, "iGPU mode", r.message() + "\n\nApply anyway? (asks for the administrator password)",
@@ -604,6 +616,15 @@ QGroupBox *HomeTab::buildDeviceBox() {
             }, force ? privileged::FIRMWARE_TIMEOUT_MS : 60000);
         };
         connect(ig, &QComboBox::activated, this, [setIgpu](int i) { (*setIgpu)(i, false); });
+        connect(nvBack, &QPushButton::clicked, this, [this, nvBack, gh] {
+            nvBack->setEnabled(false);
+            privileged::run(gh, QJsonObject{{"op", "dgpu_restore"}}, this, [this, nvBack](const privileged::Result &r) {
+                nvBack->setEnabled(true);
+                if (r.ok()) QMessageBox::information(this, "NVIDIA", r.json.value("note").toString().isEmpty()
+                                                     ? QStringLiteral("NVIDIA driver loaded.") : r.json.value("note").toString() + QStringLiteral("; driver loaded."));
+                else QMessageBox::warning(this, "NVIDIA", r.message());
+            }, 90000);
+        });
         connect(od, &QCheckBox::clicked, this, [this, od, gh](bool on) {
             privileged::run(gh, QJsonObject{{"op", "set_panel_od"}, {"on", on}}, this, [this, od, on](const privileged::Result &r) {
                 if (!r.ok()) { od->setChecked(!on); QMessageBox::warning(this, "Panel Over Drive", r.message()); } });
