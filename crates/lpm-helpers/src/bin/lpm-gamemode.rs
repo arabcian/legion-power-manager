@@ -365,6 +365,17 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
         Err(e) => { ok = false; log!("lpm-gamemode: scene {name}: ✗ {what}: {e}"); }
     };
 
+    // 0. EC fan boost (Full Speed flag) FIRST: switching it off before the profile change means
+    //    the fans never spin up for the new profile and then drop again.
+    let fan_want = s["fan_fullspeed"].as_bool();
+    if let Some(on) = fan_want {
+        let v = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"),
+                              &json!({"device": "fan_fullspeed", "value": if on { "1" } else { "0" }}))
+            .unwrap_or_else(|e| json!({"ok": false, "error": e}));
+        line("Fan boost", if v["ok"] == true { Ok(if on { "turbo".into() } else { "auto".into() }) }
+                          else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
+    }
+
     // 1. power profile (firmware limits below need Custom)
     if let Some(p) = s["platform_profile"].as_str().filter(|p| !p.is_empty() && p.len() <= 32) {
         let r = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"),
@@ -372,6 +383,18 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
             .and_then(|v| if v["ok"] == true { Ok(v["effective"].as_str().unwrap_or(p).to_owned()) }
                           else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
         line("power profile", r);
+    }
+
+    // The EC may reset the flag when the profile changes: re-assert only if it no longer matches.
+    if let (Some(on), Some(_)) = (fan_want, s["platform_profile"].as_str().filter(|p| !p.is_empty())) {
+        let h = format!("{HELPER_DIR}/legion-profile-helper");
+        if let Ok(v) = pkexec_helper(&h, &json!({"fan_fullspeed": "get"})) {
+            if v["ok"] == true && v["on"].as_bool() != Some(on) {
+                let r = pkexec_helper(&h, &json!({"device": "fan_fullspeed", "value": if on { "1" } else { "0" }}))
+                    .and_then(|v| if v["ok"] == true { Ok("re-applied after the profile change".to_owned()) } else { Err("failed".to_owned()) });
+                line("Fan boost", r);
+            }
+        }
     }
 
     // 2. firmware limits
@@ -471,15 +494,6 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
                 .unwrap_or_else(|e| json!({"ok": false, "error": e}));
             line("Fan curve", if v["ok"] == true { Ok("table written".into()) } else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
         }
-    }
-
-    // 5b. EC fan boost (Full Speed flag), after the platform profile
-    if let Some(on) = s["fan_fullspeed"].as_bool() {
-        let v = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"),
-                              &json!({"device": "fan_fullspeed", "value": if on { "1" } else { "0" }}))
-            .unwrap_or_else(|e| json!({"ok": false, "error": e}));
-        line("Fan boost", if v["ok"] == true { Ok(if on { "turbo".into() } else { "auto".into() }) }
-                          else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
     }
 
     // 6. keyboard lighting — in-process as the user (udev uaccess on the
