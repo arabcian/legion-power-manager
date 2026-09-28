@@ -7,6 +7,7 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QMessageBox>
@@ -29,6 +30,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -135,7 +137,17 @@ HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
     if (kmsgFd_ >= 0) {
         ::lseek(kmsgFd_, 0, SEEK_END);
         auto *n = new QSocketNotifier(kmsgFd_, QSocketNotifier::Read, this);
-        connect(n, &QSocketNotifier::activated, this, &HealthTab::drainKmsg);
+        auto rate = std::make_shared<std::pair<QElapsedTimer, int>>();
+        rate->first.start();
+        connect(n, &QSocketNotifier::activated, this, [this, n, rate] {
+            drainKmsg();
+            if (rate->first.elapsed() > 1000) { rate->first.restart(); rate->second = 0; }
+            if (++rate->second > 50) {      // fd stays readable: pause, scan once, resume later
+                n->setEnabled(false);
+                debounce_->start();
+                QTimer::singleShot(5000, n, [this, n, rate] { drainKmsg(); rate->first.restart(); rate->second = 0; n->setEnabled(true); });
+            }
+        });
     } else {
         needsRoot_ = true;
         timer_->start(POLL_ROOT_MS);
@@ -167,7 +179,7 @@ void HealthTab::drainKmsg() {
                                        "PCIe Bus Error", "lockup", "LOCKUP", "stall", "amdgpu"};
     char buf[8192];
     bool relevant = false;
-    for (;;) {
+    for (int i = 0; i < 512; ++i) {  // bounded: a flood must not pin the GUI thread
         const ssize_t n = ::read(kmsgFd_, buf, sizeof buf - 1);
         if (n < 0 && errno == EPIPE) continue;  // record overwritten meanwhile
         if (n <= 0) break;                      // EAGAIN: drained

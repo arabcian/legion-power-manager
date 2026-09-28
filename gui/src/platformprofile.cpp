@@ -1,6 +1,7 @@
 #include "platformprofile.h"
 #include <QDir>
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QSocketNotifier>
 #include <QTimer>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <memory>
 
 namespace pp {
 
@@ -132,10 +134,25 @@ void Watcher::watch(const QString &path) {
     if (::read(fd, buf, sizeof buf) < 0) { ::close(fd); return; }  // a sysfs attribute is armed by a read
     fds_ << fd;
     auto *n = new QSocketNotifier(fd, QSocketNotifier::Exception, this);  // POLLPRI = sysfs_notify
-    connect(n, &QSocketNotifier::activated, this, [this, fd] {
+    auto rate = std::make_shared<std::pair<QElapsedTimer, int>>();
+    rate->first.start();
+    connect(n, &QSocketNotifier::activated, this, [this, n, fd, rate] {
         char b[64];
         ::lseek(fd, 0, SEEK_SET);
-        [[maybe_unused]] const auto r = ::read(fd, b, sizeof b);  // re-arm
+        if (::read(fd, b, sizeof b) < 0) {  // re-arm impossible: kernfs would report POLLPRI forever
+            n->setEnabled(false);           // the safety poll keeps us in sync
+            check();
+            return;
+        }
+        if (rate->first.elapsed() > 1000) { rate->first.restart(); rate->second = 0; }
+        if (++rate->second > 10) {          // POLLPRI not clearing: pause, re-arm later
+            n->setEnabled(false);
+            QTimer::singleShot(10000, n, [n, fd, rate] {
+                char c[64];
+                ::lseek(fd, 0, SEEK_SET);
+                if (::read(fd, c, sizeof c) >= 0) { rate->first.restart(); rate->second = 0; n->setEnabled(true); }
+            });
+        }
         check();
     });
 }
