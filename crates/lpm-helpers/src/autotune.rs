@@ -414,6 +414,18 @@ fn cpu_rules(r: &mut Rules) {
             }
         }
     }
+    // X3D desktop: V-Cache die boosts (capped at 4.4 GHz - the cache, not
+    // the clock, makes it snappy), frequency die runs without boost: less
+    // heat and fan noise, lower power draw.
+    if r.is(Desktop) && p.x3d() {
+        if let (Some(c), Some(f)) = (p.cache_ccd.filter(|&c| c < 2), p.freq_ccd.filter(|&f| f < 2)) {
+            let k = |i: usize, a: &'static str, b: &'static str| if i == 0 { a } else { b };
+            r.set(k(c, "cpu.boost_ccd0", "cpu.boost_ccd1"), "1", format!("CCD{c} (V-Cache) keeps boost: interactive bursts stay snappy."));
+            r.set(k(c, "cpu.max_freq_ccd0", "cpu.max_freq_ccd1"), 4_400_000, format!("CCD{c} capped at 4.4 GHz: the 3D V-Cache carries desktop responsiveness; the top bins only add heat and fan noise."));
+            r.set(k(f, "cpu.boost_ccd0", "cpu.boost_ccd1"), "0", format!("CCD{f} (frequency die) without boost: background work at base clock, less heat and power."));
+        }
+        if p.x3d_driver { r.set("cpu.x3d_mode", "cache", "New threads prefer the boosted V-Cache die."); }
+    }
     // schedutil only: how soon the clock follows a load change.
     if p.schedutil() {
         r.set("cpu.schedutil_rate_limit_us", match r.g { PowerSave => 10_000, Throughput => 2_000, _ => 500 },
@@ -658,9 +670,8 @@ fn sched_rules(r: &mut Rules) {
         r.set("sched.migration_cost_ns", 5_000_000, "Tasks count as cache-hot for 5 ms (TuneD throughput value): fewer cache-destroying migrations.");
     }
     match r.g {
-        PowerSave => r.set("wq.power_efficient", "1", "Power-efficient workqueues may run on already-awake CPUs."),
+        PowerSave | Desktop => r.set("wq.power_efficient", "1", "Power-efficient workqueues may run on already-awake CPUs."),
         Gaming | Throughput => r.set("wq.power_efficient", "0", "Kernel work stays on the queuing CPU (latency/locality)."),
-        Desktop => {}
     }
     if p.cur("wq.affinity_scope").map_or(false, |v| v != "cache") {
         r.set("wq.affinity_scope", "cache", "Unbound kernel work stays inside the L3 domain that queued it (kernel default).");
@@ -725,7 +736,7 @@ fn io_rules(r: &mut Rules) {
     if p.wifi {
         match r.g {
             Gaming => r.set("net.wifi_power_save", "0", "Radio never dozes between beacons: no 802.11 power-save ping spikes."),
-            PowerSave => r.set("net.wifi_power_save", "1", "802.11 power save on."),
+            PowerSave | Desktop => r.set("net.wifi_power_save", "1", "802.11 power save on."),
             _ => {}
         }
     }
@@ -738,6 +749,14 @@ fn device_rules(r: &mut Rules) {
         Gaming => r.set("pci.aspm", "performance", "PCIe links never drop to a power state between bursts: no wake-up jitter on GPU/NVMe/Wi-Fi."),
         PowerSave => r.set("pci.aspm", "powersave", "Links may enter L0s/L1 when idle (powersupersave is avoided: it breaks some devices)."),
         _ => {}
+    }
+    if r.is(Desktop) {
+        r.set("pci.aspm", "powersave", "Idle PCIe links enter L0s/L1 (µs wake, invisible on the desktop): less idle power and heat.");
+        r.set("pm.pci_runtime", "auto", "Idle PCI devices drop to D3 (dGPU runtime PM untouched).");
+        r.set("pm.usb_runtime", "auto", "Idle webcam/Bluetooth/readers suspend (HID/audio are skipped).");
+        r.set("snd.hda_power_save", 10, "Codec powers down after 10 s idle: saves power without a pop on every notification.");
+        r.set("snd.hda_power_save_controller", "1", "Controller may power down with the codec.");
+        if p.nvme { r.set("pm.nvme_latency_us", 100_000, "Every APST state allowed: deepest NVMe idle; wake cost is hidden by the page cache."); }
     }
     if r.is(PowerSave) {
         r.set("pci.aspm_links", "l1ss", "L1.1/L1.2 substates on every link: an NVMe/Wi-Fi link stuck without L1.2 costs ~0.5-1 W at idle (restore if a device misbehaves).");
@@ -775,12 +794,9 @@ fn device_rules(r: &mut Rules) {
             _ => {}
         }
     }
-    // iGPU: when a dGPU renders, the iGPU only composites; pinning it low
-    // frees shared SoC power for the CPU.
+    // iGPU: always driver-managed - forcing 'low' is unstable on amdgpu.
     if p.amd() && p.amd_igpu {
-        let low = p.nvidia_dgpu && matches!(r.g, Gaming | Throughput);
-        r.set("gpu.amdgpu_dpm", if low { "low" } else { "auto" },
-              if low { "dGPU renders: iGPU pinned low, its share of the SoC power budget goes to the CPU cores." } else { "Driver-managed iGPU clocks." });
+        r.set("gpu.amdgpu_dpm", "auto", "Driver-managed iGPU clocks ('low' is not stable on this iGPU).");
     }
     if p.intel() && p.intel_igpu && (r.is(PowerSave) || (r.is(Gaming) && p.nvidia_dgpu)) {
         r.set("gpu.intel_slpc_profile", "power_saving", "iGPU clocks ramp gently: it only composites or idles here.");
@@ -873,7 +889,7 @@ mod tests {
         assert!(get(&d, "sched.ext").is_none());
         assert_eq!(get(&d, "vm.swappiness"), Some(&json!(150)));
         assert_eq!(get(&d, "zswap.enabled"), Some(&json!("0")));
-        assert_eq!(get(&d, "gpu.amdgpu_dpm"), Some(&json!("low")));
+        assert_eq!(get(&d, "gpu.amdgpu_dpm"), Some(&json!("auto")));
         assert_eq!(get(&d, "vm.dirty_background_bytes"), Some(&json!(64 << 20)));
         assert_eq!(get(&d, "vm.dirty_bytes"), Some(&json!(256 << 20)));
         assert_eq!(get(&d, "thp.enabled"), Some(&json!("always")));
@@ -910,6 +926,10 @@ mod tests {
         // Desktop on a laptop with dynamic EPP: EPP handed to the kernel.
         assert_eq!(get(&de, "cpu.dynamic_epp"), Some(&json!("enabled")));
         assert!(get(&de, "cpu.epp_ccd0").is_none());
+        assert_eq!(get(&de, "cpu.boost_ccd0"), Some(&json!("1")));
+        assert_eq!(get(&de, "cpu.boost_ccd1"), Some(&json!("0")));
+        assert_eq!(get(&de, "cpu.max_freq_ccd0"), Some(&json!(4_400_000)));
+        assert_eq!(get(&de, "pci.aspm"), Some(&json!("powersave")));
         // Every goal: valid preset name, no duplicate keys.
         for g in Goal::ALL {
             let d = decide(g, &p);
