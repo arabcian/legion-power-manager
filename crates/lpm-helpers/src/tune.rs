@@ -50,7 +50,7 @@ pub fn cpu_vendor() -> Vendor {
     *V.get_or_init(|| vendor_from_cpuinfo(crate::cpuinfo_head()))
 }
 
-fn vendor_ok(t: &Tunable) -> bool { t.vendor == Vendor::Any || t.vendor == cpu_vendor() }
+pub fn vendor_ok(t: &Tunable) -> bool { t.vendor == Vendor::Any || t.vendor == cpu_vendor() }
 
 /// Hybrid (Alder Lake and later) core class.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,6 +129,23 @@ pub enum Target {
     PciAspm,
     /// sched_ext BPF scheduler: starts / stops an scx_* binary (value = its name or "none").
     SchedExt,
+    /// The first of these files that exists (a knob that moved between
+    /// kernel versions, e.g. sched_itmt_enabled: /proc/sys -> debugfs in 6.14).
+    AnyFile(&'static [&'static str]),
+    /// power/control (runtime PM) of every PCI function, except display
+    /// devices, their sibling functions and the bridges above them, and
+    /// drivers that manage runtime PM themselves (see RPM_DRIVER_DENY).
+    PciRuntimePm,
+    /// power/control of every USB device except HID and audio devices.
+    UsbRuntimePm,
+    /// Same attribute on every SCSI/ATA host (SATA link power management).
+    ScsiHost(&'static str),
+    /// power/pm_qos_latency_tolerance_us of every NVMe controller (APST ceiling).
+    NvmeLatency,
+    /// vm.dirty_bytes / dirty_background_bytes. Writing bytes zeroes the ratio
+    /// twin, and 0 is not a valid bytes value, so while the system is in ratio
+    /// mode the baseline records "ratio:<n>" and restore writes the ratio file.
+    DirtyBytes { bytes: &'static str, ratio: &'static str },
 }
 
 pub struct Tunable {
@@ -271,6 +288,12 @@ pub const TUNABLES: &[Tunable] = &[
     warn(t("cpu.cstate_max", "CPU", "Deepest C-state kept",
       "Disables every C-state deeper than the one you pick, on every CPU. Two reasons to touch this: (1) input-latency chasing - deep C-states add microseconds of wake-up jitter on the way back to full clock, so capping to a shallower state trims worst-case latency at the cost of idle power and heat; (2) Curve Optimizer validation - the transition out of a deep idle state back to boost clock is exactly where a marginal core first crashes, so capping C-states while dialing in offsets (paired with a short MCE poll interval) surfaces instability faster than gaming normally would. Day-to-day/battery use: leave at 'all enabled'. Meant to be temporary, not a permanent setting.",
       Kind::Choice, Options::Special, Target::CState)),
+    t("cpu.wake_latency_us", "CPU", "CPU wake-up latency limit (µs)",
+      "Per-CPU PM QoS resume-latency constraint (cpuN/power/pm_qos_resume_latency_us). Both cpuidle governors (menu and teo) skip every idle state whose exit latency is above this value, so it is the fine-grained, reversible sibling of 'Deepest C-state kept': instead of naming a state you give the wake-up time you can accept, and the kernel keeps every state that is fast enough. 0 = no constraint (the kernel default - every C-state allowed). Example on Zen: C1 exits in ~1 µs, C2 in tens of µs, C3/CC6 in hundreds; a limit just below the deepest state's latency trims the worst-case wake-up jitter while keeping the shallow savings. The cost is the same as capping C-states: idle power, heat and - on a laptop - less boost headroom for the busy cores, because sleeping cores no longer hand their share of the power budget back. The special 'n/a' value (poll forever, no idle at all) is deliberately not offered.",
+      int(0, 100_000), NO, Target::PerCpu("power/pm_qos_resume_latency_us")),
+    t("cpu.schedutil_rate_limit_us", "CPU", "schedutil rate limit (µs)",
+      "Only exists while the governor is schedutil (amd-pstate guided/passive, intel_cpufreq, acpi-cpufreq). Minimum time between two frequency requests from the scheduler. Lower = the clock follows load changes sooner (snappier, more requests); higher = fewer changes and less overhead, at the price of reacting later to bursts. Has no effect in amd-pstate / intel_pstate active mode, where the hardware (CPPC/HWP) picks the frequency on its own.",
+      int(0, 1_000_000), NO, Target::File("/sys/devices/system/cpu/cpufreq/schedutil/rate_limit_us")),
     // ── Memory ────────────────────────────────────────────────────────────
     t("thp.enabled", "Memory", "THP enabled",
       "Transparent HugePages: promotes small pages into 2 MB pages where possible, cutting TLB misses for large allocations. madvise = only for memory ranges the app explicitly opts into (Proton/DXVK/most game engines already do this) - the recommended default, no surprise stalls. always = the kernel tries everywhere, which can add a synchronous compaction stall the first time a large allocation needs a huge page; only worth it if you profiled a specific non-madvise-aware workload. never = off, for debugging a THP-related issue.",
@@ -356,6 +379,39 @@ pub const TUNABLES: &[Tunable] = &[
     t("vm.page_cluster", "Memory", "vm.page-cluster",
       "Consecutive swap pages read ahead on a swap-in, as a power of two (0 = 1 page, 3 = 8 pages, the disk-swap-era default). Readahead assumes sequential access, true for spinning disks but pointless for zram/NVMe swap where random access is just as fast - 0 avoids wasted effort on pages you will not touch next. Only raise this if you have real swap on a traditional disk.",
       int(0, 6), NO, Target::File("/proc/sys/vm/page-cluster")),
+    t("vm.dirty_background_ratio", "Memory", "vm.dirty_background_ratio (%)",
+      "Share of dirtyable memory that may be dirty (written but not yet on disk) before the background flusher threads start writing it out. Only shown while the system uses the ratio form: dirty_background_bytes is its counterpart and writing one zeroes the other, so on a system configured in bytes this row stays n/a instead of silently switching the unit. With lots of RAM the stock 10% is gigabytes - it all has to reach the disk eventually, and a large flush competing with game asset reads or an fsync() from the desktop is a classic source of multi-second hitches. 1-5% on a 16-64 GB machine keeps writeback in small, steady chunks. For power saving the opposite (a larger buffer) lets the disk idle longer.",
+      int(1, 100), NO, Target::File("/proc/sys/vm/dirty_background_ratio")),
+    t("vm.dirty_ratio", "Memory", "vm.dirty_ratio (%)",
+      "Share of dirtyable memory that may be dirty before a process that writes is throttled and made to write back itself (the stall you feel). Counterpart of dirty_bytes, same ratio-only rule as the background row. Keep it above the background ratio (the kernel halves the background value otherwise). Low (2-10%) = bounded stalls and short fsync() times - desktop/gaming; high (20-40%, TuneD throughput-performance uses 40) = large write bursts are absorbed at RAM speed - throughput.",
+      int(1, 100), NO, Target::File("/proc/sys/vm/dirty_ratio")),
+    t("vm.dirty_background_bytes", "Memory", "vm.dirty_background_bytes",
+      "Absolute form of dirty_background_ratio: background writeback starts once this many bytes are dirty. On a machine with lots of RAM even 1% is several hundred MB, so the byte form is the only way to get small, steady writeback. CachyOS ships 67108864 (64 MB). Writing it switches the system to byte mode (the ratio row then shows n/a); restoring writes the original ratio back.",
+      int(8192, 68_719_476_736), NO, Target::DirtyBytes { bytes: "/proc/sys/vm/dirty_background_bytes", ratio: "/proc/sys/vm/dirty_background_ratio" }),
+    t("vm.dirty_bytes", "Memory", "vm.dirty_bytes",
+      "Absolute form of dirty_ratio: a writing process is throttled once this many bytes are dirty. CachyOS ships 268435456 (256 MB) so a large copy or download can never pile up gigabytes that then flush all at once and stall the compositor. Keep it above the background value. Same byte-mode switch and restore rule as the background row.",
+      int(8192, 68_719_476_736), NO, Target::DirtyBytes { bytes: "/proc/sys/vm/dirty_bytes", ratio: "/proc/sys/vm/dirty_ratio" }),
+    t("vm.dirty_writeback_centisecs", "Memory", "vm.dirty_writeback_centisecs",
+      "Interval (1/100 s) at which the flusher threads wake up to write old dirty data. Stock 500 (5 s). Raising it to 1500 (15 s, TLP's power-saving value) batches writes so an NVMe/SSD can stay in a low-power state longer - a small but real battery win - at the cost of more data lost on a crash or power cut. 0 (never wake periodically) is not offered: dirty data would then only leave RAM under memory pressure.",
+      int(100, 360_000), NO, Target::File("/proc/sys/vm/dirty_writeback_centisecs")),
+    t("vm.dirty_expire_centisecs", "Memory", "vm.dirty_expire_centisecs",
+      "Age (1/100 s) after which dirty data is old enough to be written by the next periodic flush. Stock 3000 (30 s). Longer on battery (fewer, bigger write bursts, disk sleeps more), shorter when you want less unwritten data at risk. Pairs with the writeback interval above.",
+      int(100, 360_000), NO, Target::File("/proc/sys/vm/dirty_expire_centisecs")),
+    t("vm.vfs_cache_pressure", "Memory", "vm.vfs_cache_pressure",
+      "How eagerly the kernel reclaims the dentry/inode caches (the directory and file metadata cache) relative to the page cache. 100 = stock balance. Lower (e.g. 50) keeps metadata cached longer: file dialogs, shader-cache directories, Steam library scans and `emerge` dependency walks stay fast after they were touched once - cheap on a machine with plenty of RAM. Above 100 frees metadata sooner (low-RAM systems). Do not go near 0: the caches then can never be reclaimed and can end in an OOM.",
+      int(1, 1000), NO, Target::File("/proc/sys/vm/vfs_cache_pressure")),
+    t("zswap.enabled", "Memory", "zswap",
+      "Compressed RAM cache in front of a real swap device: pages that would be written to disk are compressed and kept in RAM, and only the coldest ones go on to the swap partition/file. Turns most swap-outs into a few microseconds of compression instead of disk I/O, which is the difference between a system that slows down under memory pressure and one that stalls. Useful only with a disk swap device; with zram swap it is double compression and should be off.",
+      Kind::Bool, NO, Target::File("/sys/module/zswap/parameters/enabled")),
+    t("zswap.compressor", "Memory", "zswap compressor",
+      "Algorithm for the zswap pool. lz4 = fastest compression and decompression (lowest latency when a swapped page is touched again), lower ratio; zstd = noticeably better ratio (more pages fit in the pool, fewer reach the disk) for more CPU per page. Offered: what the kernel has loaded or can load. A change creates a new pool; pages already stored stay in the old one until they are read back.",
+      Kind::Choice, Options::Special, Target::File("/sys/module/zswap/parameters/compressor")),
+    t("zswap.max_pool_percent", "Memory", "zswap max pool (% of RAM)",
+      "Upper bound of the compressed pool as a share of RAM (stock 20). Larger = more swapped data stays in RAM compressed, less disk swap I/O; smaller = more RAM for everything else. The pool is not preallocated, it only grows under pressure.",
+      int(1, 100), NO, Target::File("/sys/module/zswap/parameters/max_pool_percent")),
+    t("zswap.shrinker_enabled", "Memory", "zswap shrinker",
+      "Kernel 6.8+: under memory pressure zswap writes its coldest compressed pages on to the swap device proactively, instead of only when the pool is full. Keeps the pool from filling up with pages that will never be used again. 1 is right for almost everyone.",
+      Kind::Bool, NO, Target::File("/sys/module/zswap/parameters/shrinker_enabled")),
     // ── Scheduler ─────────────────────────────────────────────────────────
     warn(t("sched.ext", "Scheduler", "sched_ext scheduler",
       "Runs a sched_ext BPF scheduler (kernel 6.12+ with CONFIG_SCHED_CLASS_EXT, plus the scx schedulers installed) in place of the kernel's EEVDF while the setting is active; restoring stops it and EEVDF takes over again instantly. lavd = latency-criticality aware, built for gaming and interactive loads (frame pacing, input latency) and aware of big/little and X3D core differences; bpfland = prioritises interactive tasks, good general desktop choice; rusty/flash/cosmos/p2dq are more specialised. Best used as a game-mode setting. A buggy scheduler cannot hang the system: the kernel's watchdog ejects it and falls back to EEVDF. Only scx_* binaries that are root-owned in system directories are ever started.",
@@ -378,6 +434,18 @@ pub const TUNABLES: &[Tunable] = &[
     t("kernel.cfs_bandwidth_slice_us", "Scheduler", "sched_cfs_bandwidth_slice_us",
       "Internal time slice (µs) used when a cgroup has a CPU bandwidth quota enforced. Only matters if something on the system sets a cgroup CPU quota (some containers, systemd resource-control units); inert otherwise. Leave at default unless you run quota-limited cgroups yourself.",
       int(1, 1_000_000), NO, Target::File("/proc/sys/kernel/sched_cfs_bandwidth_slice_us")),
+    t("kernel.sched_util_clamp_min_rt_default", "Scheduler", "RT tasks' default boost (uclamp)",
+      "Utilization-clamp minimum given to every real-time task that did not set its own (0-1024). Stock 1024 = any RT task (PipeWire, audio threads, IRQ threads, some kernel threads) makes schedutil request the maximum frequency the moment it runs - historical behaviour, and expensive on battery. A lower value (e.g. 0-256) lets schedutil pick a frequency from the RT load instead. Only matters with the schedutil governor (and for capacity-aware placement on hybrid CPUs); in amd-pstate / intel_pstate active mode the hardware picks the clock and this has no effect on frequency.",
+      int(0, 1024), NO, Target::File("/proc/sys/kernel/sched_util_clamp_min_rt_default")),
+    t("kernel.sched_energy_aware", "Scheduler", "Energy Aware Scheduling",
+      "EAS places each waking task on the CPU where the energy model says it costs least. It only ever runs on asymmetric-capacity CPUs without SMT, with an energy model and the schedutil governor (e.g. Intel hybrid parts without Hyper-Threading such as Lunar/Arrow Lake); the row is n/a everywhere else. 1 = efficiency first (small tasks packed onto efficient cores), 0 = classic load balancing (more throughput for bursty multi-threaded loads).",
+      Kind::Bool, NO, Target::File("/proc/sys/kernel/sched_energy_aware")),
+    t("kernel.sched_schedstats", "Scheduler", "sched_schedstats",
+      "Scheduler statistics collection (per-task wait/sleep accounting used by perf sched, latencytop and some monitoring tools). It costs a little on every context switch; 0 turns it off. Some tools switch it on and never switch it back - leave it on only while you are actually profiling.",
+      Kind::Bool, NO, Target::File("/proc/sys/kernel/sched_schedstats")),
+    dbg(t("sched.itmt", "Scheduler", "Preferred-core scheduling (ITMT)",
+      "Lets the scheduler prefer the cores the firmware ranks fastest (Intel Turbo Boost Max 3.0 / AMD Preferred Core, reported through amd-pstate or intel_pstate). With it on, a lightly threaded load lands on the best-binned cores first: higher single-thread clocks, and idle cores stay idle. Kernel 6.14 moved the switch from /proc/sys/kernel to debugfs (x86/sched_itmt_enabled); whichever exists is used. Almost always best left on; off is for comparing or debugging core placement.",
+      Kind::Bool, NO, Target::AnyFile(&["/proc/sys/kernel/sched_itmt_enabled", "/sys/kernel/debug/x86/sched_itmt_enabled"]))),
     dbg(t("sched.preempt", "Scheduler", "Preemption model (debugfs)",
       "Live-switchable preemption model on PREEMPT_DYNAMIC kernels (shows 'root only' if the kernel was not built with it, or debugfs is not mounted - the row still activates, root just cannot read the current value from an unprivileged describe). full = a running task can be preempted almost anywhere: lowest latency, right for desktop/gaming and what the gaming presets set. voluntary = only at explicit preemption points: slightly higher latency, slightly higher throughput, a good middle ground. none = cooperative-style, maximum throughput minimum latency guarantees, essentially never wanted on a desktop. lazy (6.13+) = full's latency behaviour with some of voluntary's throughput via deferred preemption; use it for compile-heavy presets if your kernel supports it, otherwise voluntary is the fallback (see the Compile throughput preset).",
       Kind::Choice, Options::Fixed(&["none", "voluntary", "full", "lazy"]), Target::File("/sys/kernel/debug/sched/preempt"))),
@@ -396,6 +464,9 @@ pub const TUNABLES: &[Tunable] = &[
     t("wq.power_efficient", "Scheduler", "workqueue power_efficient",
       "When enabled (Y/1, the kernel's power-saving default), some per-CPU kernel workqueues are allowed to migrate to an unbound worker to save power. Disabling it (N/0, what the gaming presets set) keeps that work pinned to the CPU that queued it - marginally lower latency for whatever depends on that work completing promptly, at a small power-efficiency cost. Combine with the 'Unbound workqueue CPUs' row below to also steer the workqueues that are unbound by design onto a specific CCD.",
       Kind::Bool, NO, Target::File("/sys/module/workqueue/parameters/power_efficient")),
+    t("wq.affinity_scope", "Scheduler", "Unbound workqueue affinity scope",
+      "Kernel 6.6+: how widely an unbound work item may travel from the CPU that queued it. cache (stock) = within the same L3 - on a two-CCD Ryzen the work stays on the die that asked for it, no cross-CCD cache traffic; smt / cpu = even closer (better locality, less work-conservation); numa / system = anywhere (best for spreading heavy work, worst locality). Use together with 'Unbound workqueue CPUs', which is a hard CPU mask; this row is only the locality preference inside that mask.",
+      Kind::Choice, Options::Fixed(&["cpu", "smt", "cache", "numa", "system"]), Target::File("/sys/module/workqueue/parameters/default_affinity_scope")),
     t("wq.cpumask", "Scheduler", "Unbound workqueue CPUs",
       "Confines every unbound kernel workqueue (writeback, crypto, most filesystem background work) to the CPUs of one CCD, keeping that background work off whichever CCD the game runs on. Typical use: set this to 'frequency' (or whichever CCD is NOT hosting the game) while the Game launch tab's affinity points the game at 'cache'/the V-Cache CCD - filesystem/crypto work then physically cannot preempt or share L2/L3 with the game's threads. Pick 'all' to undo (kernel default spreads across every CPU). Only offered with 2+ CCDs; a single-CCD chip has nothing to confine work away from.",
       Kind::Choice, Options::Special, Target::WqCpumask),
@@ -444,6 +515,19 @@ pub const TUNABLES: &[Tunable] = &[
     t("usb.autosuspend", "Devices", "USB autosuspend delay (s)",
       "Default autosuspend delay (seconds) applied to USB devices as they are plugged in or the driver binds. -1 disables autosuspend entirely for newly-bound devices: no risk of a mouse/controller/USB DAC needing a moment to wake up right when you move it - the recommended value for gaming peripherals. This only affects devices that bind after the change; anything already plugged in keeps whatever delay it already had (replug it, or reboot with this in the boot preset, to apply retroactively). A positive number is the idle seconds before autosuspend for devices without their own override.",
       int(-1, 3600), NO, Target::File("/sys/module/usbcore/parameters/autosuspend")),
+    // ── Power (runtime PM of devices) ─────────────────────────────────────
+    t("pm.pci_runtime", "Power", "PCI runtime PM",
+      "Runtime power management of every PCI function (power/control): auto = an idle device (Wi-Fi, card reader, USB/Thunderbolt controller, audio, SATA) may drop to D3 and is woken on demand - TLP's battery setting, often worth 1-3 W idle on a laptop; on = always powered (no resume delay, TLP's AC setting). GPUs are left alone, together with their audio/USB-C sibling functions and every bridge above them: the NVIDIA dGPU reaches D3cold through its own driver and its root port, and forcing 'on' there would keep it awake. Drivers that manage this themselves (nvidia, nouveau, amdgpu, radeon, i915, xe, mei_me) are skipped too.",
+      Kind::Choice, Options::Fixed(&["auto", "on"]), Target::PciRuntimePm),
+    t("pm.usb_runtime", "Power", "USB runtime PM (connected devices)",
+      "Runtime autosuspend of the USB devices plugged in right now (power/control) - the 'USB autosuspend delay' row only affects devices that bind later. auto = idle devices (webcam, fingerprint reader, Bluetooth, hubs) suspend; on = never. HID (mouse, keyboard, controller) and USB audio devices are always skipped: suspended input devices lose the first movement, suspended DACs pop.",
+      Kind::Choice, Options::Fixed(&["auto", "on"]), Target::UsbRuntimePm),
+    t("pm.sata_alpm", "Power", "SATA link power (ALPM)",
+      "AHCI link power management of every SATA port. med_power_with_dipm = the modern default (TLP recommends it for AC and battery): link and device may enter partial/slumber states when idle, a large idle saving with a tiny resume delay. min_power = deepest states, most saving, occasionally causes errors on older drives. max_performance = link always active, lowest latency. n/a on machines with only NVMe drives.",
+      Kind::Choice, Options::Fixed(&["max_performance", "medium_power", "med_power_with_dipm", "min_power"]), Target::ScsiHost("link_power_management_policy")),
+    t("pm.nvme_latency_us", "Power", "NVMe APST latency tolerance (µs)",
+      "Ceiling on the entry+exit latency of the NVMe power states that Autonomous Power State Transition may use, per controller (power/pm_qos_latency_tolerance_us). The driver reprograms APST immediately. 0 = APST off: the drive never enters a non-operational state - no wake-up hitch when a game streams from an idle drive, but ~0.5-1 W more at idle and a warmer drive. 100000 (the usual default) = every state the drive offers. A middle value keeps the shallow states only. n/a when the drive has no APST.",
+      int(0, 1_000_000), NO, Target::NvmeLatency),
     amd(t("gpu.amdgpu_dpm", "Devices", "iGPU DPM level (amdgpu)",
       "Forces the integrated Radeon GPU's power state. 'low' pins the iGPU to its lowest performance level, freeing shared SoC power/thermal budget for the CPU cores - worth trying specifically when gaming on the discrete GPU, since the iGPU is doing nothing but display output/compositing anyway. 'auto' (default) lets the driver manage it dynamically. 'high' forces maximum iGPU performance, only useful running GPU work on the iGPU itself (rare on a laptop with a discrete GPU) - not something a gaming preset should set.",
       Kind::Choice, Options::Fixed(&["auto", "low", "high"]), Target::AmdgpuDpm)),
@@ -574,7 +658,7 @@ pub fn x3d_mode_path() -> Option<PathBuf> {
         .and_then(|p| canonical_in_sysfs(&p))
 }
 
-fn cstate_names() -> Vec<String> {
+pub fn cstate_names() -> Vec<String> {
     numbered(&Path::new(CPU_DIR).join("cpu0/cpuidle"), "state").into_iter()
         .map(|(i, p)| read(&p.join("name")).unwrap_or_else(|| format!("state{i}")))
         .collect()
@@ -816,9 +900,9 @@ pub fn record_ccd_park(role: &str, label: Option<&str>, cpus: &[usize]) -> Resul
     crate::write_root_file(CCD_PARK_RECORD, body.to_string().as_bytes())
 }
 
-fn possible_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("possible")).map(|s| cpu_list(&s)).unwrap_or_default() }
-fn present_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("present")).map(|s| cpu_list(&s)).unwrap_or_default() }
-fn online_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("online")).map(|s| cpu_list(&s)).unwrap_or_default() }
+pub fn possible_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("possible")).map(|s| cpu_list(&s)).unwrap_or_default() }
+pub fn present_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("present")).map(|s| cpu_list(&s)).unwrap_or_default() }
+pub fn online_cpus() -> Vec<usize> { read(&Path::new(CPU_DIR).join("online")).map(|s| cpu_list(&s)).unwrap_or_default() }
 
 // ── nvidia-powerd guard ──────────────────────────────────────────────────
 // nvidia-powerd (Dynamic Boost) walks every CPU's cpuid/cpufreq data and does
@@ -996,7 +1080,7 @@ fn pci_latency_write(cfg: &Path, hex: &str) -> std::io::Result<()> {
 
 // ── discovery for the other targets ──────────────────────────────────────
 
-fn block_devs() -> Vec<PathBuf> {
+pub fn block_devs() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir("/sys/block").into_iter().flatten().flatten()
         .filter(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
@@ -1117,7 +1201,9 @@ pub fn firmware_owned(t: &Tunable, err: &str) -> bool {
     matches!(t.target, Target::File(p) if p.ends_with("pcie_aspm/parameters/policy")) && err.contains("os error 1)")
 }
 
-pub fn best_effort(t: &Tunable) -> bool { matches!(t.target, Target::Irq | Target::PciLatency | Target::PciAspm) }
+pub fn best_effort(t: &Tunable) -> bool {
+    matches!(t.target, Target::Irq | Target::PciLatency | Target::PciAspm | Target::PciRuntimePm | Target::UsbRuntimePm)
+}
 
 // ── command-backed targets (Wi-Fi power save, sched_ext) ─────────────────
 
@@ -1282,12 +1368,121 @@ fn pci_aspm_files() -> Vec<PathBuf> {
     v
 }
 
+// ── runtime PM / SATA / NVMe discovery ────────────────────────────────────
+
+/// Drivers that run their own runtime-PM policy (GPU drivers, the ME).
+const RPM_DRIVER_DENY: &[&str] = &["nvidia", "nouveau", "amdgpu", "radeon", "i915", "xe", "mei_me"];
+
+fn driver_name(dev: &Path) -> Option<String> {
+    std::fs::read_link(dev.join("driver")).ok()?.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
+/// PCI power/control files the runtime-PM row may touch. Display devices,
+/// the other functions of their slot (HDA / USB-C on the dGPU) and every
+/// bridge above them are excluded: their D3cold is the GPU driver's business.
+fn pci_runtime_files() -> Vec<PathBuf> {
+    let devs: Vec<PathBuf> = std::fs::read_dir(PCI_DEVICES).into_iter().flatten().flatten()
+        .filter_map(|e| std::fs::canonicalize(e.path()).ok())
+        .filter(|p| p.starts_with("/sys/devices"))
+        .collect();
+    let class = |d: &Path| read(&d.join("class")).unwrap_or_default();
+    let display: Vec<&PathBuf> = devs.iter().filter(|d| class(d).starts_with("0x03")).collect();
+    let slot = |d: &Path| d.file_name().map(|n| n.to_string_lossy().rsplit_once('.').map_or(String::new(), |x| x.0.to_owned()));
+    let display_slots: Vec<Option<String>> = display.iter().map(|d| slot(d)).collect();
+    let mut v: Vec<PathBuf> = devs.iter()
+        .filter(|d| !class(d).starts_with("0x03"))
+        .filter(|d| !display_slots.contains(&slot(d)))
+        .filter(|d| !display.iter().any(|g| g.starts_with(d.as_path())))
+        .filter(|d| driver_name(d).map_or(true, |n| !RPM_DRIVER_DENY.contains(&n.as_str())))
+        .map(|d| d.join("power/control"))
+        .filter(|p| p.is_file())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// USB devices (not interfaces) without a HID (03) or audio (01) interface.
+fn usb_runtime_files() -> Vec<PathBuf> {
+    let base = Path::new("/sys/bus/usb/devices");
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(base).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.contains(':') { continue; }
+        let Some(dev) = canonical_in_sysfs(&e.path()) else { continue };
+        let skip = std::fs::read_dir(&dev).into_iter().flatten().flatten()
+            .filter(|i| i.file_name().to_string_lossy().starts_with(&format!("{name}:")))
+            .any(|i| matches!(read(&i.path().join("bInterfaceClass")).as_deref(), Some("03") | Some("01")));
+        let f = dev.join("power/control");
+        if !skip && f.is_file() { v.push(f); }
+    }
+    v.sort();
+    v
+}
+
+fn scsi_host_files(attr: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir("/sys/class/scsi_host").into_iter().flatten().flatten()
+        .map(|e| e.path().join(attr))
+        .filter(|p| p.is_file())
+        .filter_map(|p| canonical_in_sysfs(&p))
+        .collect();
+    v.sort();
+    v
+}
+
+fn nvme_latency_files() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = numbered(Path::new("/sys/class/nvme"), "nvme").into_iter()
+        .map(|(_, p)| p.join("power/pm_qos_latency_tolerance_us"))
+        .filter(|p| p.is_file())
+        .filter_map(|p| canonical_in_sysfs(&p))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Compressors zswap can use: loaded ones from /proc/crypto plus the usual
+/// algorithms present as modules (setting the parameter autoloads them).
+fn zswap_compressors() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    let crypto = std::fs::read_to_string("/proc/crypto").unwrap_or_default();
+    let mut name = String::new();
+    for l in crypto.lines() {
+        let Some((k, val)) = l.split_once(':') else { continue };
+        match k.trim() {
+            "name" => name = val.trim().to_owned(),
+            "type" if matches!(val.trim(), "scomp" | "acomp" | "compression") => {
+                if !name.is_empty() && !v.contains(&name) { v.push(name.clone()); }
+            }
+            _ => {}
+        }
+    }
+    for a in ["lz4", "lz4hc", "zstd", "lzo", "lzo-rle", "842", "deflate"] {
+        if !v.iter().any(|x| x == a) && kmod_available(a, "crypto") { v.push(a.into()); }
+    }
+    v.retain(|x| x.len() <= 32 && x.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)));
+    v
+}
+
+/// Target::File rows that exist but must not be offered in some states.
+fn file_usable(p: &str) -> bool {
+    match p {
+        // Ratio rows only while the system is in ratio mode (the bytes twin reads 0):
+        // restoring a ratio of 0 over a bytes configuration would zero both.
+        "/proc/sys/vm/dirty_ratio" => read(Path::new("/proc/sys/vm/dirty_bytes")).as_deref() == Some("0"),
+        "/proc/sys/vm/dirty_background_ratio" => read(Path::new("/proc/sys/vm/dirty_background_bytes")).as_deref() == Some("0"),
+        // Present but empty (and not writable) where EAS cannot run.
+        "/proc/sys/kernel/sched_energy_aware" => read(Path::new(p)).map_or(false, |v| !v.is_empty()),
+        _ => true,
+    }
+}
+
 /// Writes one tunable value to one concrete target, dispatching the targets
 /// that are not plain files. Everything else goes through write_checked.
 pub fn write_value(t: &Tunable, f: &Path, data: &str) -> Result<(), String> {
     match t.target {
         Target::WifiPowerSave => wifi_set(f, data),
         Target::SchedExt => scx_set(data),
+        Target::DirtyBytes { ratio, .. } if data.starts_with("ratio:") => write_checked(Path::new(ratio), &data[6..]),
         _ => write_checked(f, data),
     }
 }
@@ -1302,7 +1497,14 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
         // smt/control also reports notsupported / forceoff / notimplemented: not writable then.
         Target::File(p) if p.ends_with("/smt/control") =>
             if matches!(read(Path::new(p)).as_deref(), Some("on") | Some("off")) { vec![PathBuf::from(p)] } else { vec![] },
+        Target::File(p) if !file_usable(p) => vec![],
         Target::File(p) => existing(PathBuf::from(p)),
+        Target::AnyFile(list) => list.iter().map(PathBuf::from).find(|p| p.is_file()).into_iter().collect(),
+        Target::PciRuntimePm => pci_runtime_files(),
+        Target::UsbRuntimePm => usb_runtime_files(),
+        Target::ScsiHost(a) => scsi_host_files(a),
+        Target::NvmeLatency => nvme_latency_files(),
+        Target::DirtyBytes { bytes, .. } => existing(PathBuf::from(bytes)),
         // scaling_governor / energy_performance_preference: on a 2+ CCD chip the
         // per-CCD override rows below cover the same file set (and always run
         // after this row, so leaving both visible just invites setting one and
@@ -1378,6 +1580,11 @@ pub fn options(t: &Tunable) -> Vec<(String, String)> {
             }
             // Keep whatever is set now selectable even if we could not see its module.
             if let Some(cur) = read(Path::new(p)) { if !v.contains(&cur) { v.push(cur); } }
+            same(v)
+        }
+        (Options::Special, Target::File(p)) if p.ends_with("zswap/parameters/compressor") => {
+            let mut v = zswap_compressors();
+            if let Some(cur) = read(Path::new(p)) { if !cur.is_empty() && !v.contains(&cur) { v.push(cur); } }
             same(v)
         }
         (Options::Special, Target::File(p)) if p.ends_with("tcp_congestion_control") => {
@@ -1654,6 +1861,7 @@ pub fn baseline_value(t: &Tunable, f: &Path) -> Option<String> {
         Target::PciLatency => return pci_latency_read(f).map(|b| format!("{b:02x}")),
         Target::WifiPowerSave => return wifi_get(f),
         Target::SchedExt => return scx_current(),
+        Target::DirtyBytes { ratio, .. } if read(f).as_deref() == Some("0") => return read(Path::new(ratio)).map(|r| format!("ratio:{r}")),
         _ => {}
     }
     let raw = read(f)?;
@@ -1692,7 +1900,12 @@ fn write_checked_inner(f: &Path, data: &str) -> Result<(), String> {
     let s = f.to_string_lossy();
     if s.starts_with("/proc/") {
         let ok = is_irq_file(f)
-            || (s.starts_with("/proc/sys/") && TUNABLES.iter().any(|t| matches!(t.target, Target::File(p) if p == s)));
+            || (s.starts_with("/proc/sys/") && TUNABLES.iter().any(|t| match t.target {
+                Target::File(p) => p == s,
+                Target::AnyFile(list) => list.contains(&s.as_ref()),
+                Target::DirtyBytes { bytes, ratio } => bytes == s || ratio == s,
+                _ => false,
+            }));
         if !ok { return Err(format!("{s}: refused (outside the allowlist)")); }
         return sysfs_write(f, data.as_bytes()).map_err(|e| format!("{s}: {e}"));
     }

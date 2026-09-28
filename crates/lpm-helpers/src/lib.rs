@@ -12,6 +12,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 pub mod amdgpu;
+pub mod autotune;
 pub mod bootguard;
 pub mod fan_table;
 pub mod health;

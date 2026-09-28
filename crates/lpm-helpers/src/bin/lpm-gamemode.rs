@@ -462,6 +462,15 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
         }
     }
 
+    // 5b. EC fan boost (Full Speed flag), after the platform profile
+    if let Some(on) = s["fan_fullspeed"].as_bool() {
+        let v = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"),
+                              &json!({"device": "fan_fullspeed", "value": if on { "1" } else { "0" }}))
+            .unwrap_or_else(|e| json!({"ok": false, "error": e}));
+        line("Fan boost", if v["ok"] == true { Ok(if on { "turbo".into() } else { "auto".into() }) }
+                          else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
+    }
+
     // 6. keyboard lighting — in-process as the user (udev uaccess on the
     //    hidraw node); lighting-helper through pkexec only if that is denied.
     if let Some(req) = lighting::scene_request(&s["lighting"]) {

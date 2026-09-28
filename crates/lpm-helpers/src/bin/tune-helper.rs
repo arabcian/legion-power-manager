@@ -2,6 +2,9 @@
 //!
 //! One JSON object on stdin, one JSON line on stdout:
 //!   {"op":"describe"}                                  any user: tunables, live values, state, topology
+//!   {"op":"autotune","goal":"gaming"}                  any user: hardware profile + derived preset
+//!       (goal: powersave | gaming | throughput | desktop; see lpm_helpers::autotune)
+//!   {"op":"profile"}                                   any user: the hardware profile autotune uses
 //!   {"op":"apply","values":{k:v,..},"mode":"manual"|"game","preset":"name"}
 //!       "replace":true (manual only): first restore every knob this request
 //!       does not set, so switching presets never leaves the previous one's
@@ -551,6 +554,14 @@ fn run() -> Value {
     match op {
         "health" => return lpm_helpers::health::scan(req["since"].as_u64().unwrap_or(0)),
         "nvreg_describe" => return lpm_helpers::nvreg::describe(),
+        "autotune" => return match req["goal"].as_str().and_then(lpm_helpers::autotune::Goal::parse) {
+            Some(g) => lpm_helpers::autotune::autotune(g),
+            None => json!({"ok": false, "error": "goal must be one of powersave, gaming, throughput, desktop"}),
+        },
+        "profile" => {
+            let p = lpm_helpers::autotune::Profile::gather();
+            return json!({"ok": true, "profile": p.to_json(), "summary": p.summary()});
+        }
         _ => {}
     }
     if !is_root() { return json!({"ok": false, "error": format!("'{op}' needs root (run through pkexec)")}); }
