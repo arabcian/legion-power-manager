@@ -11,3 +11,14 @@ serde_json = "1"
 libc = "0.2"
 lpm-spectrum = { path = "../lpm-spectrum" }
 
+
+# One source, two polkit-pinned binaries (role fixed at compile time via CARGO_BIN_NAME):
+#   tune-helper          everything (raw values, boot preset, preset store, driver options)
+#   tune-profile-helper  only ops that cannot set a value the user has not approved (see PROFILE_OPS)
+[[bin]]
+name = "tune-helper"
+path = "src/bin/tune-helper.rs"
+
+[[bin]]
+name = "tune-profile-helper"
+path = "src/bin/tune-helper.rs"

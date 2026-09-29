@@ -12,6 +12,11 @@
 #                 offscreen training
 #                 run over every tab, then the final build with the profile)
 #   --no-harden   drop stack protector / FORTIFY=3 / CET / full RELRO / PIE on the GUI
+#   --security-level=N   1 (default): wheel+local+active session is silent for the helpers;
+#                 2: every helper asks for the admin password (polkit keeps it for its cache
+#                 window); firmware-persistent writes always ask;
+#                 3: as 2, except applying an approved Optimizations preset by name (tune-profile-helper). Asked interactively when
+#                 not given (LPM_SECURITY_LEVEL works too); DESTDIR/non-tty installs use 1.
 #   --clang       build the GUI with clang++ (+ lld when present) and link the Rust
 #                 helpers with clang; same as ./install-clang.sh
 #
@@ -34,6 +39,7 @@ PREFIX=${PREFIX:-/usr}
 DESTDIR=${DESTDIR:-}
 LIBEXEC="$PREFIX/libexec/legion-power-manager"
 UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
+SECLEVEL=${LPM_SECURITY_LEVEL:-}
 BUILD=1 LEGACY=0 NATIVE=1 LTO=1 PGO=1 HARDEN=1 CLANG=0
 for a in "$@"; do
     case "$a" in
@@ -45,10 +51,25 @@ for a in "$@"; do
         --no-pgo) PGO=0 ;;
         --no-harden) HARDEN=0 ;;
         --clang) CLANG=1 ;;
+        --security-level=*) SECLEVEL=${a#*=} ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
 [[ -n "$DESTDIR" || $EUID -eq 0 ]] || { echo "run as root (or set DESTDIR)" >&2; exit 1; }
+
+if [[ -z $SECLEVEL ]]; then
+    SECLEVEL=1
+    if [[ -z $DESTDIR && -t 0 ]]; then
+        echo "Polkit security level for the root helpers:"
+        echo "  1) password-free for an administrator (wheel) at the machine   [default]"
+        echo "  2) every helper asks for the administrator password (polkit caches it briefly)"
+        echo "  3) like 2, but applying an already approved Optimizations preset (scenes, game hooks) stays password-free;"
+        echo "     saving/approving presets, typed values and every other helper ask"
+        ans=""; read -r -p "Level [1]: " ans || true
+        [[ -n $ans ]] && SECLEVEL=$ans
+    fi
+fi
+[[ $SECLEVEL == [123] ]] || { echo "invalid security level '$SECLEVEL' (use 1, 2 or 3)" >&2; exit 2; }
 
 as_user() { if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then sudo -u "$SUDO_USER" "$@"; else "$@"; fi; }
 
@@ -131,7 +152,7 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/lpm-boot-guard" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/tune-profile-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/lpm-boot-guard" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$T/lpm-autotune" "$DESTDIR$PREFIX/bin/"
@@ -141,7 +162,7 @@ install -d "${own[@]}" -m 0755 "$DESTDIR$PREFIX/share/polkit-1/actions" "$DESTDI
     "$DESTDIR/etc/init.d" "$DESTDIR/etc/nvcurve/profiles"
 sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/com.legion-power-manager.policy > "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"; chmod 0644 "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"
-sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/49-legion-power-manager.rules > "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
+sed -e "s|@LIBEXEC@|$LIBEXEC|g" -e "s|@SECLEVEL@|$SECLEVEL|g" packaging/polkit/49-legion-power-manager.rules > "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"; chmod 0644 "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 # Keyboard lighting: uaccess on the Spectrum controller's hidraw node.
 UDEVDIR=${UDEVDIR:-$PREFIX/lib/udev/rules.d}

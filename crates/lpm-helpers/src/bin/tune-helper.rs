@@ -1,5 +1,9 @@
 //! Root helper for the Optimizations tab, `lpm-gamemode` and the boot service.
 //!
+//! Built twice from this file (Cargo.toml): `tune-helper` serves every op, `tune-profile-helper` only
+//! PROFILE_OPS. polkit pins one action per binary path, so "apply a preset the user already approved"
+//! and "make the kernel take values just typed" can carry different authentication (install.sh level 3).
+//!
 //! One JSON object on stdin, one JSON line on stdout:
 //!   {"op":"describe"}                                  any user: tunables, live values, state, topology
 //!   {"op":"autotune","goal":"gaming"}                  any user: hardware profile + derived preset
@@ -17,6 +21,11 @@
 //!   {"op":"boost","nice":-5,"autogroup":true}          renice the process that ran pkexec
 //!   {"op":"set_boot","values":{..}|null,"preset":".."} store/clear the boot preset (root-owned file)
 //!   {"op":"boot"}                                      apply the boot preset (OpenRC service)
+//!   {"op":"apply_preset","preset":"name","mode":"manual"|"game","replace":bool,"soft_park":bool,"owner_pid":N}
+//!       like apply, but the values are read from the root-owned store /etc/legion-power-manager/presets/<name>.json,
+//!       never from the request ("preset":null with replace:true = no preset: restore what the previous one set)
+//!   {"op":"preset_save","name":"..","values":{..}} | {"op":"preset_save","presets":{name:{..}}}   tune-helper only:
+//!       validate and store presets (root-owned); {"op":"preset_delete","name":".."} removes one
 //!   {"op":"guard_reset"}                               resume boot presets paused by lpm-boot-guard
 //!
 //! Keys are looked up in lpm_helpers::tune::TUNABLES; paths never come from a
@@ -60,6 +69,17 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(8);
 const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 fn is_root() -> bool { unsafe { libc::geteuid() == 0 } }
+
+/// Root-owned, world-readable store of approved presets (values only). Written by `preset_save` (tune-helper),
+/// read by `apply_preset` (both binaries) and by lpm-gamemode.
+const PRESET_DIR: &str = "/etc/legion-power-manager/presets";
+
+fn profile_role() -> bool { env!("CARGO_BIN_NAME") == "tune-profile-helper" }
+
+/// Ops tune-profile-helper serves as root. None can put a value on the kernel that the user has not approved:
+/// stored presets by name, restoring saved originals, game-session bookkeeping, fixed read-only tools, and the
+/// root-owned boot preset. (Read-only ops that need no root are answered before this check.)
+const PROFILE_OPS: &[&str] = &["snapshot", "apply_preset", "release", "prune", "restore", "restore_keys", "boost", "isolate_join", "tool", "boot"];
 
 struct Lock(#[allow(dead_code)] fs::File);
 
@@ -367,6 +387,11 @@ fn valid_preset(p: &Value) -> Option<String> {
 
 fn op_apply(req: &Value) -> Value {
     let Some(values) = req["values"].as_object() else { return json!({"ok": false, "error": "values must be an object"}) };
+    apply_with(values, req)
+}
+
+/// Core of `apply` (values from the request: tune-helper only) and `apply_preset` (values from the approved store).
+fn apply_with(values: &Map<String, Value>, req: &Value) -> Value {
     if values.len() > TUNABLES.len() { return json!({"ok": false, "error": "too many values"}); }
     let mode = req["mode"].as_str().unwrap_or("manual");
     if !["manual", "game"].contains(&mode) { return json!({"ok": false, "error": "mode must be manual or game"}); }
@@ -540,6 +565,94 @@ fn op_isolate_join(req: &Value) -> Value {
     })
 }
 
+/// Known keys with values that validate against *this* machine; knobs this machine lacks are not stored.
+fn clean_values(values: &Map<String, Value>) -> Result<Map<String, Value>, Vec<Value>> {
+    let mut clean = Map::new();
+    let mut rejected = Vec::new();
+    for (k, v) in values {
+        match tune::find(k) {
+            Some(t) if tune::files(t).is_empty() && !t.debugfs => {}
+            Some(t) => match tune::validate(t, v) {
+                Ok(s) => { clean.insert(k.clone(), json!(s)); }
+                Err(e) => rejected.push(json!({"key": k, "error": e})),
+            },
+            None if tune::RETIRED_KEYS.contains(&k.as_str()) => {}
+            None => rejected.push(json!({"key": k, "error": "unknown key"})),
+        }
+    }
+    if rejected.is_empty() { Ok(clean) } else { Err(rejected) }
+}
+
+fn preset_name(s: &str) -> Option<String> {
+    let ok = !s.is_empty() && s.len() <= 64 && s.chars().next().map_or(false, char::is_alphanumeric)
+        && s.chars().all(|c| c.is_alphanumeric() || " _-.".contains(c)) && !s.contains("..");
+    ok.then(|| s.to_owned())
+}
+
+fn preset_file(name: &str) -> Option<String> { preset_name(name).map(|n| format!("{PRESET_DIR}/{n}.json")) }
+
+/// The approved values of a preset; they are validated again knob by knob when applied.
+fn store_preset(name: &str) -> Result<Map<String, Value>, String> {
+    let file = preset_file(name).ok_or("invalid preset name")?;
+    let text = read_root_file(&file, 256 * 1024).ok_or_else(|| format!(
+        "preset '{name}' is not approved (save it in Legion Power Manager → Optimizations, or run: lpm-gamemode APPROVE '{name}')"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("preset '{name}': {e}"))?;
+    v["values"].as_object().cloned().ok_or_else(|| format!("preset '{name}' has no values"))
+}
+
+fn op_apply_preset(req: &Value) -> Value {
+    let mode = req["mode"].as_str().unwrap_or("manual");
+    let mut values = match req["preset"].as_str() {
+        Some(n) => match store_preset(n) { Ok(m) => m, Err(e) => return json!({"ok": false, "error": e}) },
+        // No preset + replace (a scene that resets tuning): restore what the previous preset had set.
+        None if mode == "manual" && req["replace"].as_bool() == Some(true) => Map::new(),
+        None => return json!({"ok": false, "error": "preset must be a name"}),
+    };
+    let parked = if mode == "game" && req["soft_park"].as_bool().unwrap_or(false) { tune::soft_park_values(&mut values) } else { None };
+    let mut r = apply_with(&values, req);
+    if let (Some(role), true) = (parked, r.is_object()) { r["parked"] = json!(role); }
+    r
+}
+
+/// tune-helper only: validates and stores presets (all-or-nothing). One preset {name, values} or a batch {presets: {name: values}}.
+fn op_preset_save(req: &Value) -> Value {
+    let mut items: Vec<(String, &Map<String, Value>)> = Vec::new();
+    if let Some(ps) = req["presets"].as_object() {
+        if ps.len() > 64 { return json!({"ok": false, "error": "too many presets"}); }
+        for (n, v) in ps {
+            let Some(m) = v.as_object() else { return json!({"ok": false, "error": format!("{n}: values must be an object")}) };
+            items.push((n.clone(), m));
+        }
+    } else if let Some(m) = req["values"].as_object() {
+        items.push((req["name"].as_str().unwrap_or("").to_owned(), m));
+    } else {
+        return json!({"ok": false, "error": "values must be an object (or presets an object of objects)"});
+    }
+    let mut prepared: Vec<(String, Vec<u8>)> = Vec::new();
+    for (n, m) in &items {
+        let Some(file) = preset_file(n) else { return json!({"ok": false, "error": format!("invalid preset name '{n}'")}) };
+        if m.len() > TUNABLES.len() { return json!({"ok": false, "error": format!("{n}: too many values")}); }
+        match clean_values(m) {
+            Ok(c) => prepared.push((file, serde_json::to_vec_pretty(&json!({"values": c})).unwrap())),
+            Err(rej) => return json!({"ok": false, "error": "invalid values", "preset": n, "results": rej}),
+        }
+    }
+    if let Err(e) = secure_dir(ETC_DIR).and_then(|_| secure_dir(PRESET_DIR)) { return json!({"ok": false, "error": e}); }
+    for (file, body) in &prepared {
+        if let Err(e) = write_root_file(file, body) { return json!({"ok": false, "error": e}); }
+    }
+    json!({"ok": true, "saved": prepared.len()})
+}
+
+fn op_preset_delete(req: &Value) -> Value {
+    let Some(file) = req["name"].as_str().and_then(preset_file) else { return json!({"ok": false, "error": "invalid preset name"}) };
+    match fs::remove_file(&file) {
+        Ok(()) => json!({"ok": true}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({"ok": true}),
+        Err(e) => json!({"ok": false, "error": format!("{file}: {e}")}),
+    }
+}
+
 fn op_set_boot(req: &Value) -> Value {
     if let Err(e) = secure_dir(ETC_DIR) { return json!({"ok": false, "error": e}); }
     match &req["values"] {
@@ -549,22 +662,10 @@ fn op_set_boot(req: &Value) -> Value {
             Err(e) => json!({"ok": false, "error": format!("{BOOT_FILE}: {e}")}),
         },
         Value::Object(values) => {
-            // Store only known keys with values that validate against *this* machine.
-            let mut clean = Map::new();
-            let mut rejected = Vec::new();
-            for (k, v) in values {
-                match tune::find(k) {
-                    // Not on this machine: nothing to validate against, so not stored.
-                    Some(t) if tune::files(t).is_empty() && !t.debugfs => {}
-                    Some(t) => match tune::validate(t, v) {
-                        Ok(s) => { clean.insert(k.clone(), json!(s)); }
-                        Err(e) => rejected.push(json!({"key": k, "error": e})),
-                    },
-                    None if tune::RETIRED_KEYS.contains(&k.as_str()) => {}
-                    None => rejected.push(json!({"key": k, "error": "unknown key"})),
-                }
-            }
-            if !rejected.is_empty() { return json!({"ok": false, "error": "invalid values", "results": rejected}); }
+            let clean = match clean_values(values) {
+                Ok(c) => c,
+                Err(rejected) => return json!({"ok": false, "error": "invalid values", "results": rejected}),
+            };
             let body = json!({"preset": valid_preset(&req["preset"]), "values": clean});
             match write_root_file(BOOT_FILE, &serde_json::to_vec_pretty(&body).unwrap()) {
                 Ok(()) => json!({"ok": true, "boot": body}),
@@ -616,10 +717,14 @@ fn run() -> Value {
         }
         _ => {}
     }
+    if profile_role() && !PROFILE_OPS.contains(&op) {
+        return json!({"ok": false, "error": format!("'{op}' is not available in tune-profile-helper (it needs tune-helper)")});
+    }
     if !is_root() { return json!({"ok": false, "error": format!("'{op}' needs root (run through pkexec)")}); }
     let out = match op {
         "snapshot" => json!({"ok": true}),
         "apply" => op_apply(&req),
+        "apply_preset" => op_apply_preset(&req),
         "release" => op_release(&req),
         // Ends game sessions whose launcher died (pruning runs in every locked op).
         "prune" => locked(|_| json!({"ok": true})),
@@ -640,14 +745,33 @@ fn run() -> Value {
             Ok(v) => json!({"ok": true, "guard": v}),
             Err(e) => json!({"ok": false, "error": e}),
         },
+        "preset_save" => op_preset_save(&req),
+        "preset_delete" => op_preset_delete(&req),
         _ => json!({"ok": false, "error": "unknown op"}),
     };
     // Unprivileged describe reads the debugfs values from this copy (debugfs stays root-only).
-    if matches!(op, "snapshot" | "apply" | "release" | "restore" | "restore_keys" | "boot" | "prune") { tune::write_debugfs_snapshot(); }
+    if matches!(op, "snapshot" | "apply" | "apply_preset" | "release" | "restore" | "restore_keys" | "boot" | "prune") { tune::write_debugfs_snapshot(); }
     out
 }
 
 fn main() {
     init();
     std::process::exit(finish(run()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn profile_role_cannot_take_values() {
+        for op in ["apply", "set_boot", "nvreg_set", "guard_reset", "preset_save", "preset_delete"] {
+            assert!(!PROFILE_OPS.contains(&op), "{op} must stay tune-helper only");
+        }
+    }
+    #[test]
+    fn preset_names() {
+        assert!(preset_name("Gaming 2").is_some());
+        let long = "a".repeat(65);
+        for bad in ["", ".x", "a/b", "a..b", "x\n", long.as_str()] { assert!(preset_name(bad).is_none(), "{bad:?}"); }
+    }
 }

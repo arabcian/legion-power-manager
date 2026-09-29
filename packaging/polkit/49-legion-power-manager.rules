@@ -34,6 +34,19 @@
  * without the user noticing, so it always gets AUTH_ADMIN (password every
  * time, no keep), for wheel members at the machine too.
  *
+ * Security level (chosen at install time, install.sh --security-level=N):
+ *   1  the behaviour described above: wheel + local + active session is silent.
+ *   2  no silent grants: the same session gets auth_admin_keep (one password,
+ *      then polkit's own cache window) for every helper except the read-only
+ *      sensor stream and keyboard lighting. Scenes, power modes, presets and
+ *      game hooks therefore ask for the password too; a game hook without a
+ *      polkit agent times out and skips the tuning instead of hanging.
+ *  3  as 2, except tune-profile-helper (com.legion-power-manager.tune.profile): applying an Optimizations
+ *      preset the user approved earlier is served from a root-owned store BY NAME, so it cannot carry a value
+ *      nobody approved. Approving/saving presets (tune-helper) and every other helper still ask. Scenes and
+ *      game hooks keep their tuning step silent; their other steps (Ryzen/NVIDIA/... helpers) ask.
+ * Changing the level = rerun install.sh (the rules file is root-owned in /etc).
+ *
  * Distributions without a `wheel` group (Debian/Ubuntu use `sudo`): add
  * `|| subject.isInGroup("sudo")` to the condition below.
  */
@@ -41,10 +54,17 @@
 // Only a local, active session of a wheel member is granted silently;
 // everyone else (SSH, other seats, service accounts) gets auth_admin.
 var HELPERS = ["fwattr-helper", "legion-profile-helper", "ryzen-co-helper",
-               "tune-helper", "nvcurve-root-helper", "intel-uv-helper", "legion-gpu-helper",
+               "tune-helper", "tune-profile-helper", "nvcurve-root-helper", "intel-uv-helper", "legion-gpu-helper",
                "lighting-helper", "amdgpu-helper", "nvcurve-sensors"].map(function (h) {
     return "@LIBEXEC@/" + h;
 });
+var SECURITY_LEVEL = @SECLEVEL@;
+// Read-only / non-power helpers that stay silent at every level.
+var SILENT_IDS = ["com.legion-power-manager.nvcurve.sensors", "com.legion-power-manager.lighting.write"];
+var SILENT_HELPERS = ["@LIBEXEC@/nvcurve-sensors", "@LIBEXEC@/lighting-helper"];
+// Level 3 only: applying an already approved Optimizations preset by name (scenes, game hooks, restore).
+var PROFILE_ID = "com.legion-power-manager.tune.profile";
+var PROFILE_HELPER = "@LIBEXEC@/tune-profile-helper";
 var FIRMWARE_ACTION = "com.legion-power-manager.firmware.write";
 var FIRMWARE_HELPER = "@LIBEXEC@/legion-firmware-helper";
 
@@ -59,7 +79,11 @@ polkit.addRule(function (action, subject) {
          HELPERS.indexOf(action.lookup("program")) >= 0);
     if (!ours) { return; }
     if (subject.local && subject.active && subject.isInGroup("wheel")) {
-        return polkit.Result.YES;
+        var silent = SILENT_IDS.indexOf(action.id) >= 0 ||
+            (action.id === "org.freedesktop.policykit.exec" && SILENT_HELPERS.indexOf(action.lookup("program")) >= 0);
+        if (SECURITY_LEVEL >= 3 && (action.id === PROFILE_ID ||
+            (action.id === "org.freedesktop.policykit.exec" && action.lookup("program") === PROFILE_HELPER))) { silent = true; }
+        return (SECURITY_LEVEL >= 2 && !silent) ? polkit.Result.AUTH_ADMIN_KEEP : polkit.Result.YES;
     }
     return polkit.Result.AUTH_ADMIN;
 });

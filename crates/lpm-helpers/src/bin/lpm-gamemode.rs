@@ -57,7 +57,17 @@ const UNDERVOLT_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 /// Same directory nvcurve-root-helper applies from.
 const NVCURVE_PROFILES: &str = "/etc/nvcurve/profiles";
 
-fn helper() -> String { format!("{HELPER_DIR}/tune-helper") }
+/// Everything this tool asks of root goes to tune-profile-helper (approved presets by name, restore, game
+/// bookkeeping); only APPROVE talks to tune-helper.
+fn helper() -> String { format!("{HELPER_DIR}/tune-profile-helper") }
+
+const STORE_DIR: &str = "/etc/legion-power-manager/presets";
+
+/// The approved (root-owned) copy of a preset's values. tune-profile-helper applies from it by name.
+fn store_values(name: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(format!("{STORE_DIR}/{name}.json")).ok()?).ok()?;
+    v["values"].is_object().then(|| v["values"].clone())
+}
 
 fn xdg_config() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute())
@@ -91,8 +101,11 @@ fn load_preset(name: Option<&str>) -> Result<(String, Value), String> {
     };
     if !valid_name(&name) { return Err(format!("invalid preset name '{name}'")); }
     let p = presets_dir().join(format!("{name}.json"));
-    let v = read_json(&p).ok_or_else(|| format!("cannot read preset {}", p.display()))?;
-    if !v["values"].is_object() { return Err(format!("preset '{name}' has no values")); }
+    let mut v = read_json(&p).ok_or_else(|| format!("cannot read preset {}", p.display()))?;
+    if !v.is_object() { return Err(format!("preset '{name}' is not a JSON object")); }
+    // Only the root-owned copy counts as the preset's values; the user's file may say anything.
+    v["values"] = store_values(&name).ok_or_else(|| format!(
+        "preset '{name}' is not approved — run: lpm-gamemode APPROVE '{name}' (or save it in the Optimizations tab)"))?;
     Ok((name, v))
 }
 
@@ -146,15 +159,14 @@ fn report(tag: &str, v: &Value) -> bool {
 }
 
 fn apply(name: Option<&str>, mode: &str) -> Result<bool, String> {
-    let (name, mut p) = load_preset(name)?;
-    if mode == "game" {
-        if let Some(r) = soft_park(&mut p) {
-            log!("lpm-gamemode PRE: CCD '{r}' parked for the game without hot-unplug (game kept off it, IRQs and kernel work moved onto it)");
-        }
-    }
-    let mut req = json!({"op": "apply", "mode": mode, "preset": name, "values": p["values"]});
+    // The request names the preset; tune-profile-helper takes the values from the approved store.
+    let (name, _) = load_preset(name)?;
+    let mut req = json!({"op": "apply_preset", "mode": mode, "preset": name, "soft_park": mode == "game"});
     if mode == "game" { req["owner_pid"] = json!(OWNER.load(Ordering::SeqCst)); }
     let v = pkexec(&req)?;
+    if let Some(r) = v["parked"].as_str() {
+        log!("lpm-gamemode PRE: CCD '{r}' parked for the game without hot-unplug (game kept off it, IRQs and kernel work moved onto it)");
+    }
     Ok(report(if mode == "game" { "PRE" } else { "APPLY" }, &v))
 }
 
@@ -463,20 +475,12 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
     }
 
     // 5. Optimizations preset — switched, not stacked ("replace"); a preset
-    //    that only exists built into the GUI travels in the scene as "values".
+    //    is applied by name from the approved store (tune-profile-helper).
     if parts.tuning {
         if let Some(c) = scene_choice(&s["tuning"]) {
             let r = (|| -> Result<String, String> {
-                let (values, preset) = match &c {
-                    Err(()) => (json!({}), Value::Null),
-                    Ok(n) => {
-                        let vals = load_preset(Some(n)).map(|(_, p)| p["values"].clone()).ok()
-                            .or_else(|| s["tuning"]["values"].as_object().map(|m| Value::Object(m.clone())))
-                            .ok_or_else(|| format!("preset \"{n}\" not found"))?;
-                        (vals, json!(n))
-                    }
-                };
-                let v = pkexec(&json!({"op": "apply", "mode": "manual", "replace": true, "values": values, "preset": preset}))?;
+                let preset = match &c { Err(()) => Value::Null, Ok(n) => json!(n) };
+                let v = pkexec(&json!({"op": "apply_preset", "mode": "manual", "replace": true, "preset": preset}))?;
                 if v["game_active"] == true { return Ok("left alone (game session active)".into()); }
                 if v["ok"] != true { return Err(v["error"].as_str().unwrap_or("failed").into()); }
                 Ok(match c { Err(()) => "originals restored".into(), Ok(n) => format!("\"{n}\"") })
@@ -624,12 +628,7 @@ fn undervolt(forced: bool) -> bool {
 /// Turns a game preset's `cpu.ccd_park` into the soft form; returns the role.
 /// A CCD that is already offline (parked by hand) is left as it is.
 fn soft_park(preset: &mut Value) -> Option<String> {
-    let role = preset["values"]["cpu.ccd_park"].as_str().filter(|r| *r != "none")?.to_owned();
-    tune::resolve_ccd(&tune::ccx_groups(), &role)?;
-    let vals = preset["values"].as_object_mut()?;
-    vals.remove("cpu.ccd_park");
-    for k in ["irq.affinity", "wq.cpumask"] { vals.entry(k).or_insert_with(|| json!(role)); }
-    Some(role)
+    tune::soft_park_values(preset["values"].as_object_mut()?)
 }
 
 /// Proton's WINE_CPU_TOPOLOGY for this process's CPU set: logical CPU i ->
@@ -904,9 +903,30 @@ fn status() -> i32 {
     0
 }
 
+/// APPROVE [preset…]: stores the values of user presets (all of them by default) in the root-owned store the
+/// helper applies from. Needs the tune-helper authorization. Migrates presets saved before the store existed.
+fn approve(names: &[String]) -> i32 {
+    let all: Vec<String> = if names.is_empty() {
+        std::fs::read_dir(presets_dir()).into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.strip_suffix(".json")).map(str::to_owned)).collect()
+    } else { names.to_vec() };
+    let mut presets = serde_json::Map::new();
+    for n in all.into_iter().filter(|n| valid_name(n)) {
+        if let Some(v) = read_json(&presets_dir().join(format!("{n}.json"))) {
+            if v["values"].is_object() { presets.insert(n, v["values"].clone()); }
+        }
+    }
+    if presets.is_empty() { log!("lpm-gamemode APPROVE: no preset to approve"); return 1; }
+    let n = presets.len();
+    match pkexec_helper(&format!("{HELPER_DIR}/tune-helper"), &json!({"op": "preset_save", "presets": presets})) {
+        Ok(v) => { let ok = report("APPROVE", &v); if ok { log!("lpm-gamemode APPROVE: {n} preset(s) approved"); } (!ok) as i32 }
+        Err(e) => { log!("lpm-gamemode: {e}"); 1 }
+    }
+}
+
 fn usage() -> i32 {
     log!("usage: lpm-gamemode PRE [preset] | POST | RUN [preset] [--] cmd… | WRAP [preset] [--] cmd…\n\
-               \x20                   | APPLY preset | UNDERVOLT | SCENE name | RESTORE | STATUS");
+               \x20                   | APPLY preset | UNDERVOLT | SCENE name | RESTORE | STATUS | APPROVE [preset…]");
     2
 }
 
@@ -929,6 +949,7 @@ fn main() {
         Some("PRE") => { OWNER.store(launcher_pid(), Ordering::SeqCst); pre(args.get(1).map(String::as_str)) }
         Some("POST") => { OWNER.store(launcher_pid(), Ordering::SeqCst); post().map_or_else(fail, |ok| (!ok) as i32) }
         Some("APPLY") if args.len() == 2 => apply(Some(&args[1]), "manual").map_or_else(fail, |ok| (!ok) as i32),
+        Some("APPROVE") => approve(&args[1..]),
         Some("RESTORE") => pkexec(&json!({"op": "restore"})).map_or_else(fail, |v| (!report("RESTORE", &v)) as i32),
         Some("UNDERVOLT") => (!undervolt(true)) as i32,
         Some("SCENE") if args.len() == 2 => {

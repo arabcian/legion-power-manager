@@ -513,6 +513,9 @@ came up during the sysfs review, as one tab backed by a Rust root helper.
 
     crates/lpm-helpers/src/tune.rs          allowlist table + sysfs logic (shared)
     crates/lpm-helpers/src/bin/tune-helper  pkexec target: apply / restore / boost / boot
+    crates/lpm-helpers/src/bin/tune-helper.rs is also built as tune-profile-helper (Cargo [[bin]]): only
+    apply_preset (values from the root-owned store /etc/legion-power-manager/presets, by name) / restore / release /
+    boost / boot / tools. Raw values, preset_save/delete, set_boot and driver options stay in tune-helper.
     crates/lpm-helpers/src/bin/lpm-gamemode Lutris/Steam front end (user process)
     gui/src/optimizetab.{h,cpp}             the tab
     packaging/openrc/lpm-tune               boot preset service

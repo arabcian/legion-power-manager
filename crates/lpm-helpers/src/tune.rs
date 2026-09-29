@@ -1672,6 +1672,17 @@ fn scx_wait(enabled: bool, secs: u64) -> bool {
     false
 }
 
+/// Game mode's "soft" CCD park: a preset's `cpu.ccd_park` becomes IRQ / workqueue routing onto that CCD
+/// (nothing is hot-unplugged). Returns the CCD role. Shared by lpm-gamemode and tune-profile-helper, so the
+/// helper can do it on the values it takes from the approved store.
+pub fn soft_park_values(vals: &mut Map<String, Value>) -> Option<String> {
+    let role = vals.get("cpu.ccd_park")?.as_str().filter(|r| *r != "none")?.to_owned();
+    resolve_ccd(&ccx_groups(), &role)?;
+    vals.remove("cpu.ccd_park");
+    for k in ["irq.affinity", "wq.cpumask"] { vals.entry(k).or_insert_with(|| json!(role)); }
+    Some(role)
+}
+
 fn scx_stop() -> Result<(), String> {
     for pid in scx_pids() { unsafe { libc::kill(pid, libc::SIGINT); } }  // scx tools detach cleanly on SIGINT
     if scx_wait(false, 3) || read(Path::new(SCX_STATE)).as_deref() != Some("enabled") { return Ok(()); }
