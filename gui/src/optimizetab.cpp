@@ -57,6 +57,17 @@ static const QString NVCURVE_PROFILES = QStringLiteral("/etc/nvcurve/profiles");
 
 static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-helper")); }
 
+// Ops that can only put saved originals back or apply an *approved* preset by name go to tune-profile-helper;
+// raw values, the boot preset, the preset store and driver options go to tune-helper (install.sh security level 3
+// asks for the password there only).
+static QString helperForOp(const QString &op) {
+    static const QStringList profileOps{"snapshot", "apply_preset", "release", "prune", "restore", "restore_keys", "boost", "isolate_join", "tool"};
+    return privileged::helperPath(profileOps.contains(op) ? QStringLiteral("tune-profile-helper") : QStringLiteral("tune-helper"));
+}
+
+// Root-owned copy of a preset that tune-profile-helper / lpm-gamemode apply by name.
+static bool storeHas(const QString &name) { return QFile::exists(QStringLiteral("/etc/legion-power-manager/presets/") + name + QStringLiteral(".json")); }
+
 // ── built-in presets ────────────────────────────────────────────────────────
 // Templates only: values a machine does not offer are skipped on load. Keep
 // the names valid for lpm-gamemode (letters, digits, space, _ - .).
@@ -1184,7 +1195,9 @@ void OptimizeTab::saveAs() {
     }
     loadedPreset_ = name;
     reloadPresets(name);
-    showStatus(QStringLiteral("Saved \"%1\" (%2 settings)").arg(name).arg(values.size()), theme::OK);
+    approvePreset(name, values, [this, name, n = values.size()] {
+        showStatus(QStringLiteral("Saved \"%1\" (%2 settings)").arg(name).arg(n), theme::OK);
+    });
 }
 
 void OptimizeTab::deleteSelected() {
@@ -1201,6 +1214,7 @@ void OptimizeTab::deleteSelected() {
     }
     reloadPresets();
     updateLaunchPreview();
+    if (storeHas(name)) runOp({{"op", "preset_delete"}, {"name", name}}, QStringLiteral("Remove approved copy"), nullptr);
 }
 
 void OptimizeTab::useForGames() {
@@ -1217,7 +1231,11 @@ void OptimizeTab::useForGames() {
     if (!writeJsonFile(configFile(), cfg, &err)) { QMessageBox::critical(this, "Use for games", err); return; }
     reloadPresets(name);
     updateLaunchPreview();
-    showStatus(QStringLiteral("★ \"%1\" is now the game preset. Hook lpm-gamemode into Lutris/Steam (Game launch tab).").arg(name), theme::OK, 10000);
+    auto announce = [this, name] {
+        showStatus(QStringLiteral("★ \"%1\" is now the game preset. Hook lpm-gamemode into Lutris/Steam (Game launch tab).").arg(name), theme::OK, 10000);
+    };
+    // lpm-gamemode applies the root-owned approved copy, by name.
+    if (storeHas(name)) announce(); else approvePreset(name, p.value("values").toObject(), announce);
 }
 
 void OptimizeTab::setBoot() {
@@ -1379,8 +1397,10 @@ void OptimizeTab::showAutotuneReport(const QJsonObject &d, const QStringList &no
     if (!writeUserPreset(name, p, &err)) { QMessageBox::critical(this, QStringLiteral("Save preset"), err); return; }
     loadedPreset_ = name;
     reloadPresets(name);
-    if (forGames) useForGames();
-    else showStatus(QStringLiteral("Saved \"%1\".").arg(name), theme::OK);
+    approvePreset(name, p.value("values").toObject(), [this, name, forGames] {
+        if (forGames) useForGames();
+        else showStatus(QStringLiteral("Saved \"%1\".").arg(name), theme::OK);
+    });
 }
 
 // ── apply / restore ─────────────────────────────────────────────────────────
@@ -1460,11 +1480,16 @@ void OptimizeTab::restoreAll(bool confirm) {
     });
 }
 
+void OptimizeTab::approvePreset(const QString &name, const QJsonObject &values, std::function<void()> then) {
+    runOp({{"op", "preset_save"}, {"name", name}, {"values", values}}, QStringLiteral("Approve preset"),
+          [then](const QJsonObject &res) { if (res.value(QStringLiteral("ok")).toBool() && then) then(); });
+}
+
 void OptimizeTab::runOp(const QJsonObject &req, const QString &what, std::function<void(const QJsonObject &)> then) {
     if (busy_) return;
     setBusy(true);
     showStatus(what + "…", theme::MUTED, 0);
-    privileged::run(helperPath(), req, this, [this, what, then](const privileged::Result &r) {
+    privileged::run(helperForOp(req.value(QStringLiteral("op")).toString()), req, this, [this, what, then](const privileged::Result &r) {
         setBusy(false);
         if (!r.reached) {
             showStatus(what + " failed.", theme::DANGER);

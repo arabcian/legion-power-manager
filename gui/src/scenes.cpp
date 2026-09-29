@@ -457,7 +457,7 @@ void SceneEngine::checkGameEnd() {
     Q_EMIT finished(QString(), true, {QStringLiteral("the game launcher exited without its POST hook — leaving the game scene")});
     const QString target = auto_.enabled && ac_ ? (*ac_ ? auto_.onAc : auto_.onBattery) : before;
     // Ends the dead session and restores the game tuning (tune-helper prune).
-    privileged::run(privileged::helperPath("tune-helper"), QJsonObject{{"op", "prune"}}, this,
+    privileged::run(privileged::helperPath("tune-profile-helper"), QJsonObject{{"op", "prune"}}, this,
                     [this, target](const privileged::Result &) { if (validName(target) && !auto_.paused) apply(target); }, 120000);
 }
 
@@ -663,18 +663,27 @@ void SceneEngine::start(const Scene &s) {
     //    go back to their originals, and a running game's tuning is left alone.
     if (s.tuning.kind != Choice::Unchanged) {
         addStep("Optimizations", [this, c = s.tuning](Done done) {
-            QJsonObject req{{"op", "apply"}, {"mode", "manual"}, {"replace", true}, {"values", QJsonObject()}};
-            if (c.kind == Choice::Profile) {
-                const QJsonObject p = win_->optimize()->presetObject(c.name);
-                if (p.isEmpty()) { done(false, "preset '" + c.name + "' not found"); return; }
-                req["values"] = p.value("values").toObject();
-                req["preset"] = c.name;
-            }
-            privileged::run(privileged::helperPath("tune-helper"), req, this, [done, c](const privileged::Result &r) {
-                if (r.reached && r.json.value("game_active").toBool()) { done(true, "left alone (game session active)"); return; }
-                if (!r.ok()) { done(false, r.message()); return; }
-                done(true, c.kind == Choice::Reset ? QStringLiteral("originals restored") : "'" + c.name + "'");
-            }, 120000);
+            // By name: tune-profile-helper takes the values from the root-owned approved store, never from this request.
+            QJsonObject req{{"op", "apply_preset"}, {"mode", "manual"}, {"replace", true}, {"preset", QJsonValue::Null}};
+            auto run = [this, done, c](const QJsonObject &rq) {
+                privileged::run(privileged::helperPath("tune-profile-helper"), rq, this, [done, c](const privileged::Result &r) {
+                    if (r.reached && r.json.value("game_active").toBool()) { done(true, "left alone (game session active)"); return; }
+                    if (!r.ok()) { done(false, r.message()); return; }
+                    done(true, c.kind == Choice::Reset ? QStringLiteral("originals restored") : "'" + c.name + "'");
+                }, 120000);
+            };
+            if (c.kind != Choice::Profile) { run(req); return; }
+            const QJsonObject p = win_->optimize()->presetObject(c.name);
+            if (p.isEmpty()) { done(false, "preset '" + c.name + "' not found"); return; }
+            req["preset"] = c.name;
+            if (QFile::exists(QStringLiteral("/etc/legion-power-manager/presets/") + c.name + QStringLiteral(".json"))) { run(req); return; }
+            // First use: approve (store root-owned) once, then apply by name.
+            privileged::run(privileged::helperPath("tune-helper"),
+                            QJsonObject{{"op", "preset_save"}, {"name", c.name}, {"values", p.value("values").toObject()}}, this,
+                            [run, req, done](const privileged::Result &r) {
+                                if (!r.ok()) { done(false, r.message()); return; }
+                                run(req);
+                            }, 120000);
         });
     }
 

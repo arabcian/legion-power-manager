@@ -43,7 +43,7 @@ static constexpr qint64 LOG_MAX_BYTES = 16 << 20;  // then kernel.log -> kernel.
 static constexpr int MAX_SHOWN_LINES = 6000;
 static constexpr qint64 TAIL_BYTES = 512 << 10;
 
-static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-helper")); }
+static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-profile-helper")); }
 
 static const char *const LEVELS[] = {"EMERG", "ALERT", "CRIT", "ERR", "WARN"};
 

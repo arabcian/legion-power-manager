@@ -40,7 +40,7 @@ static constexpr int POLL_ROOT_MS = 300000;  // restricted kernel log: pkexec, r
 static constexpr int MAX_ROWS = 500;
 static constexpr qint64 LOG_MAX_BYTES = 8 << 20;  // then health.log -> health.log.1
 
-static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-helper")); }
+static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-profile-helper")); }
 
 static const char *levelColor(const QString &l) {
     if (l == QLatin1String("critical")) return theme::DANGER;
