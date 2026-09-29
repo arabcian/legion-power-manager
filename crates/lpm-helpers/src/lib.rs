@@ -12,14 +12,24 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 pub mod amdgpu;
+pub mod autotune;
 pub mod bootguard;
+pub mod dgpu;
 pub mod fan_table;
+pub mod health;
 pub mod memory_spd;
 pub mod intel_uv;
 pub mod intel_uv_daemon;
+pub mod iorate;
+pub mod defaults;
+pub mod calib;
+pub mod bench;
+pub mod isolate;
 pub mod legion_wmi;
 pub mod lighting;
 pub mod machine;
+pub mod nvreg;
+pub mod tools;
 pub mod tune;
 
 /// The first processor block of /proc/cpuinfo (vendor, family, model, name are

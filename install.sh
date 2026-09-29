@@ -12,6 +12,13 @@
 #                 offscreen training
 #                 run over every tab, then the final build with the profile)
 #   --no-harden   drop stack protector / FORTIFY=3 / CET / full RELRO / PIE on the GUI
+#   --security-level=N   1 (default): wheel+local+active session is silent for the helpers;
+#                 2: every helper asks for the admin password (polkit keeps it for its cache
+#                 window); firmware-persistent writes always ask;
+#                 3: as 2, except applying an approved Optimizations preset by name (tune-profile-helper). Asked interactively when
+#                 not given (LPM_SECURITY_LEVEL works too); DESTDIR/non-tty installs use 1.
+#   --clang       build the GUI with clang++ (+ lld when present) and link the Rust
+#                 helpers with clang; same as ./install-clang.sh
 #
 # Layout:
 #   /usr/bin/legion-power-manager                   GUI (Qt6)
@@ -32,7 +39,8 @@ PREFIX=${PREFIX:-/usr}
 DESTDIR=${DESTDIR:-}
 LIBEXEC="$PREFIX/libexec/legion-power-manager"
 UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
-BUILD=1 LEGACY=0 NATIVE=1 LTO=1 PGO=1 HARDEN=1
+SECLEVEL=${LPM_SECURITY_LEVEL:-}
+BUILD=1 LEGACY=0 NATIVE=1 LTO=1 PGO=1 HARDEN=1 CLANG=0
 for a in "$@"; do
     case "$a" in
         --no-build) BUILD=0 ;;
@@ -42,24 +50,72 @@ for a in "$@"; do
         --pgo) PGO=1 ;;
         --no-pgo) PGO=0 ;;
         --no-harden) HARDEN=0 ;;
+        --clang) CLANG=1 ;;
+        --security-level=*) SECLEVEL=${a#*=} ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
 [[ -n "$DESTDIR" || $EUID -eq 0 ]] || { echo "run as root (or set DESTDIR)" >&2; exit 1; }
+
+if [[ -z $SECLEVEL ]]; then
+    SECLEVEL=1
+    if [[ -z $DESTDIR && -t 0 ]]; then
+        echo "Polkit security level for the root helpers:"
+        echo "  1) password-free for an administrator (wheel) at the machine   [default]"
+        echo "  2) every helper asks for the administrator password (polkit caches it briefly)"
+        echo "  3) like 2, but applying an already approved Optimizations preset (scenes, game hooks) stays password-free;"
+        echo "     saving/approving presets, typed values and every other helper ask"
+        ans=""; read -r -p "Level [1]: " ans || true
+        [[ -n $ans ]] && SECLEVEL=$ans
+    fi
+fi
+[[ $SECLEVEL == [123] ]] || { echo "invalid security level '$SECLEVEL' (use 1, 2 or 3)" >&2; exit 2; }
 
 as_user() { if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then sudo -u "$SUDO_USER" "$@"; else "$@"; fi; }
 
 onoff() { (( $1 )) && echo ON || echo OFF; }
 
 if (( BUILD )); then
+    # ── Toolchain ──
+    cmake_cc=() LLD=0 PROFDATA=llvm-profdata
+    if (( CLANG )); then
+        # sudo's secure_path drops the user's PATH: on Gentoo clang lives only in
+        # /usr/lib/llvm/<N>/bin, so look there too and use absolute paths.
+        llvm_find() {  # llvm_find <tool>
+            local p; p=$(command -v "$1" 2>/dev/null) && { echo "$p"; return; }
+            p=$(compgen -G "/usr/lib/llvm/*/bin/$1" | sort -V | tail -1) && [[ -n $p ]] && { echo "$p"; return; }
+            p=$(compgen -c "$1-" | grep -E "^$1-[0-9]+$" | sort -V | tail -1) && [[ -n $p ]] && command -v "$p"
+        }
+        CLANGXX=$(llvm_find clang++ || true); CLANGC=$(llvm_find clang || true)
+        [[ -n $CLANGXX && -n $CLANGC ]] || { echo "!! --clang: clang/clang++ not found (PATH or /usr/lib/llvm/*/bin)" >&2; exit 1; }
+        echo ">> clang: $CLANGXX"
+        cmake_cc=(-DCMAKE_CXX_COMPILER="$CLANGXX")  # the GUI is CXX-only
+        # lld handles clang's LTO objects without the LLVMgold plugin.
+        if LLDBIN=$(llvm_find ld.lld) && [[ -n $LLDBIN ]]; then
+            LLD=1; cmake_cc+=(-DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld --ld-path=$LLDBIN")
+        fi
+        PROFDATA=$(llvm_find llvm-profdata || true)
+        if [[ -z $PROFDATA ]] && (( PGO )); then echo "!! llvm-profdata not found — building without PGO" >&2; PGO=0; fi
+    fi
+    # A build dir configured with the other compiler cannot be reused.
+    for d in gui/build gui/build-pgo; do
+        c=$(grep -s '^CMAKE_CXX_COMPILER:' "$d/CMakeCache.txt" | cut -d= -f2 || true)
+        [[ -z $c ]] && continue
+        if { (( CLANG )) && [[ $c != *clang* ]]; } || { (( !CLANG )) && [[ $c == *clang* ]]; }; then rm -rf "$d"; fi
+    done
+
     # ── Rust: fat LTO + codegen-units=1 + panic=abort come from Cargo.toml ──
     rustflags=${RUSTFLAGS:-}
     (( NATIVE )) && rustflags+=" -C target-cpu=native"
+    if (( CLANG )); then
+        rustflags+=" -C linker=$CLANGC"
+        (( LLD )) && rustflags+=" -C link-arg=-fuse-ld=lld -C link-arg=--ld-path=$LLDBIN"
+    fi
     as_user env RUSTFLAGS="$rustflags" cargo build --release --locked
 
     # ── GUI ──
     gui_cmake() {  # gui_cmake <builddir> <pgo-mode>
-        as_user cmake -S gui -B "$1" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+        as_user cmake -S gui -B "$1" "${cmake_cc[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DLPM_HELPER_DIR="$LIBEXEC" -DLPM_LTO="$(onoff $LTO)" -DLPM_NATIVE="$(onoff $NATIVE)" \
             -DLPM_HARDEN="$(onoff $HARDEN)" -DLPM_PGO="$2" -DLPM_PGO_DIR="$PWD/gui/build-pgo/profile"
         as_user cmake --build "$1" -j"$(nproc)"
@@ -80,7 +136,7 @@ if (( BUILD )); then
         rm -rf "$rt"
         prof=gui/build-pgo/profile
         if compgen -G "$prof/*.profraw" >/dev/null; then    # clang
-            as_user llvm-profdata merge -o "$prof/default.profdata" "$prof"/*.profraw
+            as_user "$PROFDATA" merge -o "$prof/default.profdata" "$prof"/*.profraw
         fi
         if [[ -z $(find "$prof" -type f 2>/dev/null | head -1) ]]; then
             echo "!! training produced no profile — building without PGO" >&2
@@ -96,17 +152,17 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/lpm-boot-guard" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/tune-profile-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/lpm-boot-guard" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
-install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$DESTDIR$PREFIX/bin/"
+install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$T/lpm-autotune" "$T/lpm-calibrate" "$DESTDIR$PREFIX/bin/"
 DESTDIR="$DESTDIR" cmake --install gui/build --strip
 
 install -d "${own[@]}" -m 0755 "$DESTDIR$PREFIX/share/polkit-1/actions" "$DESTDIR/etc/polkit-1/rules.d" \
     "$DESTDIR/etc/init.d" "$DESTDIR/etc/nvcurve/profiles"
 sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/com.legion-power-manager.policy > "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"; chmod 0644 "$DESTDIR$PREFIX/share/polkit-1/actions/com.legion-power-manager.policy"
-sed "s|@LIBEXEC@|$LIBEXEC|g" packaging/polkit/49-legion-power-manager.rules > "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
+sed -e "s|@LIBEXEC@|$LIBEXEC|g" -e "s|@SECLEVEL@|$SECLEVEL|g" packaging/polkit/49-legion-power-manager.rules > "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 [[ $EUID -eq 0 ]] && chown root:root "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"; chmod 0644 "$DESTDIR/etc/polkit-1/rules.d/49-legion-power-manager.rules"
 # Keyboard lighting: uaccess on the Spectrum controller's hidraw node.
 UDEVDIR=${UDEVDIR:-$PREFIX/lib/udev/rules.d}

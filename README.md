@@ -21,7 +21,7 @@ required, no telemetry, works on OpenRC and systemd.
 | **NVIDIA Curve Optimizer** | Drag-and-edit V/F curve, core/memory offsets, named profiles, apply at boot |
 | **Ryzen Curve Optimizer** *(AMD)* | Per-core and all-core Curve Optimizer, CPPC-ranked cores, profiles |
 | **Intel Undervolt** *(Intel)* | Voltage offsets, IccMax, TCC offset, PL1/PL2, AC/battery profiles, ThrottleStop.ini import, live throttle monitor |
-| **Optimizations** | ~60 documented kernel/scheduler/memory/storage knobs, built-in presets, game launch hooks for Lutris and Steam, boot-parameter advisor, one-click *Restore originals* |
+| **Optimizations** | ~80 documented CPU/memory/scheduler/power/storage knobs, weighted, hardware-aware **Autotune** (power saving · gaming · throughput · desktop; see [Autotune](#autotune) below), built-in presets, game launch hooks for Lutris and Steam, boot-parameter advisor, one-click *Restore originals* |
 | **Lighting** *(Gen10 Spectrum keyboards)* | Per-key RGB editor on a drawing of your own keyboard, firmware effects, 6 hardware profiles, brightness, lid logo, accent lights |
 
 Everything important is also in the **tray menu**. Every setting has a tooltip
@@ -65,7 +65,10 @@ sudo ./install.sh
 `install.sh` builds everything tuned for this machine (native CPU, LTO, PGO,
 hardening) and installs to `/usr`. Options: `--no-native` for portable
 binaries, `--no-lto`, `--no-pgo`, `--no-harden`, `--remove-legacy` to remove
-the old Python version. Remove with `sudo ./uninstall.sh`.
+the old Python version, `--security-level=N` (see [Security levels](#security-levels)). Remove with `sudo ./uninstall.sh`.
+
+To build with clang/LLVM instead of GCC: `sudo ./install-clang.sh` (same options;
+uses lld when installed and `llvm-profdata` for PGO).
 
 ### Gentoo
 
@@ -113,6 +116,71 @@ Copy the tarball into your `DISTDIR` and emerge the ebuild from
 
 Nothing is applied permanently by accident: tuning can always be undone with
 *Restore originals*, curves with *Reset*, lighting with *Factory reset profile*.
+
+## Autotune
+
+Optimizations → **⚙ Autotune** profiles the machine (CPU topology and V-Cache,
+cpufreq driver, RAM, swap, storage, kernel, boot parameters, memory and I/O
+pressure history) and fills the tab with a preset for the chosen goal. Nothing
+is written until you press *Apply checked*.
+
+- **Anchored at boot defaults.** The boot-time values (kernel + distro + your
+  sysctl, before TLP) are the reference; settings move at most 2× from them
+  unless evidence justifies more, and settings the pressure guard had to roll
+  back are penalised, then retired. Enable `lpm-boot-guard` for the snapshot.
+- **Weighted, not "bigger is better".** Every setting with a trade-off is
+  scored over latency, throughput, power, memory footprint and stability; a
+  value is written only if it clearly beats leaving the setting alone. Each goal
+  has default weights; **Weights…** changes them per goal (also
+  `lpm-autotune <goal> --weights latency=1.2,footprint=0.8`).
+- **Measured, bounded memory settings.** `vm.dirty_bytes` /
+  `dirty_background_bytes` come from the disk's sustained write rate (about
+  1 s / 0.25 s of writes, at most 2 % of RAM / 1 GiB). Watermark, reserve and
+  THP/khugepaged values stay inside RAM-derived limits, never use a
+  combination the kernel rejects, and rise only when reclaim evidence exists.
+- **Boot parameters win** (`usbcore.autosuspend=`, `pcie_aspm=`,
+  `transparent_hugepage=`); `kernel.watchdog` is never disabled.
+- **Safety net.** tune-helper refuses values that fail the audit (e.g.
+  `dirty_bytes` of a few KiB), and after applying memory/writeback settings a
+  120 s pressure guard restores them if I/O or memory stalls persist.
+- **64-bit values** are edited and stored without truncation.
+
+```sh
+lpm-autotune desktop                 # show a preset (powersave|gaming|throughput|desktop)
+lpm-autotune gaming --save           # save it as "Auto Gaming"
+sudo lpm-autotune probe              # measure disk write speed (<= 512 MiB, <= 4 s)
+lpm-autotune audit [--fix]           # find/repair unsafe values in scenes and presets
+lpm-autotune report [SECONDS]        # memory, THP, writeback, PSI, vmstat deltas
+sudo lpm-calibrate [--budget MIN]    # build the machine signature: every CPU/scheduler/memory knob, idle + under load
+```
+
+After updating from an older version run `lpm-autotune audit --fix`, then
+re-save your scenes so the root preset store is rewritten. Details:
+[docs/AUTOTUNE.md](docs/AUTOTUNE.md).
+
+## Security levels
+
+Chosen at install time (`--security-level=N` or asked interactively):
+
+| Level | Behaviour |
+|---|---|
+| 1 (default) | local, active `wheel` user runs helpers without a password |
+| 2 | every helper asks for the admin password (polkit caches it briefly) |
+| 3 | as 2, except applying an already-approved Optimizations preset by name |
+
+Firmware-persistent changes always ask, at every level.
+
+## Troubleshooting
+
+- **Freezes or instability after applying a preset:** *Restore originals* in
+  Optimizations; then `lpm-autotune audit` to look for unsafe values. Boot
+  presets are paused automatically after a crash (`lpm-boot-guard`).
+- **High idle memory use:** `lpm-autotune report` (look at `AnonHugePages`,
+  watermarks, `MemAvailable`).
+- **Tab or row missing:** the hardware, kernel driver or tool behind it is
+  absent — see Requirements.
+- **Health tab** keeps the kernel-log history (Xid, MCE, AER, lockups, guard
+  rollbacks) across boots.
 
 ## Requirements
 

@@ -32,21 +32,27 @@ use std::path::{Path, PathBuf};
 const FW_BASE: &str = "/sys/class/firmware-attributes";
 const ACPI_CALL: &str = "/proc/acpi/call";
 
-/// cTGP: no hard cap the user can't exceed — they asked to write freely for a
-/// test. Kept only as a sanity ceiling so a typo can't send a wild value to
-/// the EC. The recommended envelope is available from status on request.
-pub const CTGP_SANITY_MAX: i64 = 250;
+/// cTGP range. The legal ceiling depends on the GPU model: the vBIOS max power
+/// limit (nvidia-smi) minus the Dynamic Boost ceiling, e.g. RTX 5080 Laptop
+/// 175 W → 150 W. Read live while the dGPU is awake and cached, so the range
+/// is still right while it sleeps; CTGP_FALLBACK_MAX only before first probe.
+pub const CTGP_MIN: i64 = 5;
+pub const CTGP_FALLBACK_MAX: i64 = 150;
+const DYN_BOOST_MAX: i64 = 25;
+const CTGP_CACHE: &str = "/var/cache/legion-power-manager/ctgp_max";
 
-/// Upper bound for a cTGP write: the vBIOS envelope when nvidia-smi can report
-/// it (skipped, not woken, while the dGPU sleeps), else CTGP_SANITY_MAX.
 fn ctgp_cap() -> i64 {
-    match nvidia_power_limits() {
-        Some((_, maxp)) if maxp > 0 => {
-            let boost = wmae_get(0x0201_0000).ok().filter(|b| (0..=50).contains(b)).unwrap_or(0);
-            (maxp - boost).clamp(1, CTGP_SANITY_MAX)
+    if let Some((_, maxp)) = nvidia_power_limits().filter(|&(_, m)| m > DYN_BOOST_MAX) {
+        let cap = (maxp - DYN_BOOST_MAX).max(CTGP_MIN);
+        let cached = std::fs::read_to_string(CTGP_CACHE).ok().and_then(|t| t.trim().parse::<i64>().ok());
+        if cached != Some(cap) {
+            let _ = std::fs::create_dir_all("/var/cache/legion-power-manager");
+            let _ = std::fs::write(CTGP_CACHE, cap.to_string());
         }
-        _ => CTGP_SANITY_MAX,
+        return cap;
     }
+    std::fs::read_to_string(CTGP_CACHE).ok().and_then(|t| t.trim().parse::<i64>().ok())
+        .filter(|&c| (CTGP_MIN..=300).contains(&c)).unwrap_or(CTGP_FALLBACK_MAX)
 }
 
 pub struct Feat {
@@ -60,7 +66,7 @@ pub struct Feat {
 }
 
 pub const FEATURES: &[Feat] = &[
-    Feat { key: "ctgp",       attr: "gpu_nv_ctgp",      id: 0x0202_0000, label: "cTGP",                  unit: "W",  via_acpi: true,  lo: 5,  hi: CTGP_SANITY_MAX },
+    Feat { key: "ctgp",       attr: "gpu_nv_ctgp",      id: 0x0202_0000, label: "cTGP",                  unit: "W",  via_acpi: true,  lo: CTGP_MIN, hi: CTGP_FALLBACK_MAX },
     Feat { key: "boost_up",   attr: "gpu_nv_ppab",      id: 0x0201_0000, label: "Dynamic Boost ceiling", unit: "W",  via_acpi: true,  lo: 1,  hi: 25 },
     Feat { key: "boost_down", attr: "gpu_nv_cpu_boost", id: 0x020B_0000, label: "Dynamic Boost floor",   unit: "W",  via_acpi: true,  lo: 1,  hi: 25 },
     Feat { key: "ac_offset",  attr: "gpu_nv_ac_offset", id: 0,           label: "CPU+GPU total offset",  unit: "W",  via_acpi: false, lo: 10, hi: 130 },
@@ -436,7 +442,10 @@ pub fn status(want_envelope: bool) -> Value {
             if s.ranged { o["min"] = json!(s.min); o["max"] = json!(s.max); o["step"] = json!(s.step.max(1)); o["ranged"] = json!(true); }
             if let Some(d) = s.def { o["default"] = json!(d); }
         }
-        if o.get("ranged").is_none() { o["min"] = json!(f.lo); o["max"] = json!(f.hi); o["step"] = json!(1); o["ranged"] = json!(false); }
+        if o.get("ranged").is_none() {
+            let hi = if f.key == "ctgp" { ctgp_cap() } else { f.hi };
+            o["min"] = json!(f.lo); o["max"] = json!(hi); o["step"] = json!(1); o["ranged"] = json!(false);
+        }
         vals.insert(f.key.into(), o);
     }
     // cTGP recommended envelope from nvidia-smi (advisory, opt-in).
@@ -505,6 +514,8 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
         let r = (|| {
             if use_wmae(f) {
                 if !acpi_available() { return Err("acpi_call not available".into()); }
+                // Preflight: the id must answer a read on this firmware before it is written.
+                wmae_get(f.id).map_err(|e| format!("{}: WMAE id not readable on this firmware ({e}); refusing to write", f.label))?;
                 wmae_set(f.id, v)?;
                 let back = wmae_get(f.id)?;
                 if back != v { return Err(format!("readback {back} ≠ {v}")); }
@@ -516,9 +527,11 @@ pub fn apply(values: &serde_json::Map<String, Value>) -> Value {
                 Ok(format!("{} = {} {}", f.label, back, f.unit))
             }
         })();
-        all &= r.is_ok();
+        let failed = r.is_err();
+        all &= !failed;
         results.push(match r { Ok(m) => json!({"what": key, "ok": true, "message": m}),
                                Err(m) => json!({"what": key, "ok": false, "message": m}) });
+        if failed { break; }  // never keep writing EC limits after one failed
     }
     json!({"ok": all, "results": results, "custom": in_custom(),
            "note": if in_custom() { Value::Null } else { json!("Not in the Custom platform profile — the firmware overwrites these on the next profile change.") }})
@@ -594,6 +607,11 @@ pub fn set_igpu_mode(mode: u64, force: bool) -> Value {
             return json!({"ok": false, "needs_force": true,
                 "error": format!("this kernel has no {} driver: with the dGPU cut off nothing could drive the display.", igpu_driver_name(kind))});
         }
+    }
+    // Both iGPU-only and Auto (on battery) make the EC eject the dGPU's slot. The
+    // NVIDIA driver must be gone by then, or its remove hangs holding the PCI lock.
+    if mode != 0 && igpu_present().is_some() {
+        if let Err(v) = crate::dgpu::release() { return v; }
     }
     if !acpi_available() { modprobe_acpi_call(); }
     match wmaa(0x3F, 0) {

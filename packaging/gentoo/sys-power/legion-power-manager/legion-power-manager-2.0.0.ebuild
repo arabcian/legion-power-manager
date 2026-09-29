@@ -54,16 +54,18 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lighting-helper,amdgpu-helper,nvcurve-sensors,lpm-boot-guard}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,tune-profile-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lighting-helper,amdgpu-helper,nvcurve-sensors,lpm-boot-guard}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
-	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv}
+	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv,lpm-autotune,lpm-calibrate}
 
 	cmake_src_install
 
 	insinto /usr/share/polkit-1/actions
 	sed -i "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" packaging/polkit/* || die
 	doins packaging/polkit/com.legion-power-manager.policy
+	# Security level 1 (silent for wheel at the machine); for level 2 or 3 edit SECURITY_LEVEL in the installed rules file.
+	sed -i "s|@SECLEVEL@|1|g" packaging/polkit/49-legion-power-manager.rules || die
 	insinto /etc/polkit-1/rules.d
 	doins packaging/polkit/49-legion-power-manager.rules
 	local s

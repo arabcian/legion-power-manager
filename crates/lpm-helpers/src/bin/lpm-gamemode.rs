@@ -48,13 +48,26 @@ const MAX_PRESET_BYTES: u64 = 256 * 1024;
 
 /// Exact, case-sensitive profile name looked up in both curve tools.
 const UNDERVOLT_PROFILE: &str = "GAMING";
-const HOTPLUG_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// RUN: how long to look for a PRE that has not taken the start lock yet.
+const START_DETECT: std::time::Duration = std::time::Duration::from_secs(3);
+/// RUN: upper bound for PRE's start sequence (scene, undervolt, preset).
+const START_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 const PKEXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const UNDERVOLT_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 /// Same directory nvcurve-root-helper applies from.
 const NVCURVE_PROFILES: &str = "/etc/nvcurve/profiles";
 
-fn helper() -> String { format!("{HELPER_DIR}/tune-helper") }
+/// Everything this tool asks of root goes to tune-profile-helper (approved presets by name, restore, game
+/// bookkeeping); only APPROVE talks to tune-helper.
+fn helper() -> String { format!("{HELPER_DIR}/tune-profile-helper") }
+
+const STORE_DIR: &str = "/etc/legion-power-manager/presets";
+
+/// The approved (root-owned) copy of a preset's values. tune-profile-helper applies from it by name.
+fn store_values(name: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(format!("{STORE_DIR}/{name}.json")).ok()?).ok()?;
+    v["values"].is_object().then(|| v["values"].clone())
+}
 
 fn xdg_config() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute())
@@ -88,8 +101,11 @@ fn load_preset(name: Option<&str>) -> Result<(String, Value), String> {
     };
     if !valid_name(&name) { return Err(format!("invalid preset name '{name}'")); }
     let p = presets_dir().join(format!("{name}.json"));
-    let v = read_json(&p).ok_or_else(|| format!("cannot read preset {}", p.display()))?;
-    if !v["values"].is_object() { return Err(format!("preset '{name}' has no values")); }
+    let mut v = read_json(&p).ok_or_else(|| format!("cannot read preset {}", p.display()))?;
+    if !v.is_object() { return Err(format!("preset '{name}' is not a JSON object")); }
+    // Only the root-owned copy counts as the preset's values; the user's file may say anything.
+    v["values"] = store_values(&name).ok_or_else(|| format!(
+        "preset '{name}' is not approved — run: lpm-gamemode APPROVE '{name}' (or save it in the Optimizations tab)"))?;
     Ok((name, v))
 }
 
@@ -143,10 +159,14 @@ fn report(tag: &str, v: &Value) -> bool {
 }
 
 fn apply(name: Option<&str>, mode: &str) -> Result<bool, String> {
-    let (name, p) = load_preset(name)?;
-    let mut req = json!({"op": "apply", "mode": mode, "preset": name, "values": p["values"]});
+    // The request names the preset; tune-profile-helper takes the values from the approved store.
+    let (name, _) = load_preset(name)?;
+    let mut req = json!({"op": "apply_preset", "mode": mode, "preset": name, "soft_park": mode == "game"});
     if mode == "game" { req["owner_pid"] = json!(OWNER.load(Ordering::SeqCst)); }
     let v = pkexec(&req)?;
+    if let Some(r) = v["parked"].as_str() {
+        log!("lpm-gamemode PRE: CCD '{r}' parked for the game without hot-unplug (game kept off it, IRQs and kernel work moved onto it)");
+    }
     Ok(report(if mode == "game" { "PRE" } else { "APPLY" }, &v))
 }
 
@@ -167,10 +187,13 @@ fn game_start(name: Option<&str>) -> (bool, i32) {
     let _start_lock = user_lock("gamemode-start.lock");
     let cfg = read_json(&config_dir().join("tune.json")).unwrap_or(Value::Null);
     let first = game_refcount() == 0;
-    match cfg["game_scene"].as_str().filter(|n| valid_name(n)) {
+    let paused = scenes_paused();
+    if paused && cfg["game_scene"].as_str().is_some() { log!("lpm-gamemode: scenes are paused — game scene skipped"); }
+    match cfg["game_scene"].as_str().filter(|n| valid_name(n) && !paused) {
         Some(scene) if first => enter_game_scene(scene, cfg["undervolt_cpu"] == true, cfg["undervolt_gpu"] == true),
         Some(_) => log!("lpm-gamemode: another game is running — its scene stays"),
-        None => { undervolt(false); }
+        None if first => { undervolt(false); }
+        None => {}
     }
     match apply(name, "game") {
         Ok(ok) => (true, (!ok) as i32),
@@ -262,9 +285,20 @@ fn enter_game_scene(scene: &str, cpu: bool, gpu: bool) {
     write_scene_state(&st);
 }
 
+fn scenes_paused() -> bool {
+    read_json(&config_dir().join("scenes.json")).map_or(false, |v| v["paused"] == true)
+}
+
 fn leave_game_scene() {
     let mut st = read_scene_state();
     if st.get("game_scene").map_or(true, Value::is_null) { return; }
+    if scenes_paused() {
+        st["game_scene"] = Value::Null;
+        st["before_game"] = Value::Null;
+        write_scene_state(&st);
+        log!("lpm-gamemode: last game closed — scenes are paused, no scene change");
+        return;
+    }
     let auto = read_json(&config_dir().join("scenes.json")).unwrap_or(Value::Null);
     let target = if auto["auto"] == true {
         let key = if on_ac().unwrap_or(true) { "on_ac" } else { "on_battery" };
@@ -343,6 +377,17 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
         Err(e) => { ok = false; log!("lpm-gamemode: scene {name}: ✗ {what}: {e}"); }
     };
 
+    // 0. EC fan boost (Full Speed flag) FIRST: switching it off before the profile change means
+    //    the fans never spin up for the new profile and then drop again.
+    let fan_want = s["fan_fullspeed"].as_bool();
+    if let Some(on) = fan_want {
+        let v = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"),
+                              &json!({"device": "fan_fullspeed", "value": if on { "1" } else { "0" }}))
+            .unwrap_or_else(|e| json!({"ok": false, "error": e}));
+        line("Fan boost", if v["ok"] == true { Ok(if on { "turbo".into() } else { "auto".into() }) }
+                          else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
+    }
+
     // 1. power profile (firmware limits below need Custom)
     if let Some(p) = s["platform_profile"].as_str().filter(|p| !p.is_empty() && p.len() <= 32) {
         let r = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"),
@@ -350,6 +395,18 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
             .and_then(|v| if v["ok"] == true { Ok(v["effective"].as_str().unwrap_or(p).to_owned()) }
                           else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
         line("power profile", r);
+    }
+
+    // The EC may reset the flag when the profile changes: re-assert only if it no longer matches.
+    if let (Some(on), Some(_)) = (fan_want, s["platform_profile"].as_str().filter(|p| !p.is_empty())) {
+        let h = format!("{HELPER_DIR}/legion-profile-helper");
+        if let Ok(v) = pkexec_helper(&h, &json!({"fan_fullspeed": "get"})) {
+            if v["ok"] == true && v["on"].as_bool() != Some(on) {
+                let r = pkexec_helper(&h, &json!({"device": "fan_fullspeed", "value": if on { "1" } else { "0" }}))
+                    .and_then(|v| if v["ok"] == true { Ok("re-applied after the profile change".to_owned()) } else { Err("failed".to_owned()) });
+                line("Fan boost", r);
+            }
+        }
     }
 
     // 2. firmware limits
@@ -418,25 +475,28 @@ fn apply_scene(name: &str, parts: SceneParts) -> bool {
     }
 
     // 5. Optimizations preset — switched, not stacked ("replace"); a preset
-    //    that only exists built into the GUI travels in the scene as "values".
+    //    is applied by name from the approved store (tune-profile-helper).
     if parts.tuning {
         if let Some(c) = scene_choice(&s["tuning"]) {
             let r = (|| -> Result<String, String> {
-                let (values, preset) = match &c {
-                    Err(()) => (json!({}), Value::Null),
-                    Ok(n) => {
-                        let vals = load_preset(Some(n)).map(|(_, p)| p["values"].clone()).ok()
-                            .or_else(|| s["tuning"]["values"].as_object().map(|m| Value::Object(m.clone())))
-                            .ok_or_else(|| format!("preset \"{n}\" not found"))?;
-                        (vals, json!(n))
-                    }
-                };
-                let v = pkexec(&json!({"op": "apply", "mode": "manual", "replace": true, "values": values, "preset": preset}))?;
+                let preset = match &c { Err(()) => Value::Null, Ok(n) => json!(n) };
+                let v = pkexec(&json!({"op": "apply_preset", "mode": "manual", "replace": true, "preset": preset}))?;
                 if v["game_active"] == true { return Ok("left alone (game session active)".into()); }
                 if v["ok"] != true { return Err(v["error"].as_str().unwrap_or("failed").into()); }
                 Ok(match c { Err(()) => "originals restored".into(), Ok(n) => format!("\"{n}\"") })
             })();
             line("Optimizations", r);
+        }
+    }
+
+    // 5a. Custom-mode fan curve: only while the Custom profile is active (the EC follows the table there only).
+    if let Some(lv) = s["fan_table"].as_array().filter(|a| a.len() == 10 && a.iter().all(|x| x.as_u64().map_or(false, |n| (1..=10).contains(&n)))) {
+        if current_platform_profile().as_deref() != Some("custom") {
+            line("Fan curve", Ok("skipped (not the Custom power profile)".into()));
+        } else {
+            let v = pkexec_helper(&format!("{HELPER_DIR}/legion-profile-helper"), &json!({"fan_table": "set", "levels": lv}))
+                .unwrap_or_else(|e| json!({"ok": false, "error": e}));
+            line("Fan curve", if v["ok"] == true { Ok("table written".into()) } else { Err(v["error"].as_str().unwrap_or("failed").to_owned()) });
         }
     }
 
@@ -554,6 +614,52 @@ fn undervolt(forced: bool) -> bool {
     all_ok && (!forced || !steps.is_empty())
 }
 
+// ── CCD park in game mode ─────────────────────────────────────────────────
+// A hot-unplugged CCD leaves a hole in the CPU numbers (9955HX3D with CCD1
+// parked: online 0-7,16-23). Wine takes the online *count* as its CPU count
+// and maps logical CPU i to host CPU i (system affinity mask 0-15), while its
+// processor info lists 0-7,16-23: every per-core thread pin of a game hits
+// an offline or out-of-mask CPU, and games that check it do not start.
+// nvidia-powerd dies on the missing CPUs too. Game mode therefore empties the
+// CCD instead of taking it offline: the game is pinned to the other CCD(s),
+// IRQs and unbound kernel work are moved onto the parked one. The
+// Optimizations tab's manual Apply still hot-unplugs.
+
+/// Turns a game preset's `cpu.ccd_park` into the soft form; returns the role.
+/// A CCD that is already offline (parked by hand) is left as it is.
+fn soft_park(preset: &mut Value) -> Option<String> {
+    tune::soft_park_values(preset["values"].as_object_mut()?)
+}
+
+/// Proton's WINE_CPU_TOPOLOGY for this process's CPU set: logical CPU i ->
+/// host CPU, SMT siblings as adjacent pairs ("Ns:a,b,…"). None when Wine's
+/// own view (host 0..online-1) is already right. Proton rejects host ids
+/// >= the online count, so above a hole only the ids below it are mapped.
+fn wine_topology() -> Option<String> {
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if n < 1 { return None; }
+    let n = n as usize;
+    let mut usable = Vec::new();
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 { return None; }
+        for c in 0..n { if libc::CPU_ISSET(c, &set) { usable.push(c); } }
+    }
+    if usable.is_empty() || usable.len() == n { return None; }
+    let siblings = |c: usize| std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"))
+        .map(|s| tune::cpu_list(s.trim())).unwrap_or_default();
+    let mut order: Vec<usize> = Vec::new();
+    let mut pairs = true;
+    for &c in &usable {
+        if order.contains(&c) { continue; }
+        let s: Vec<usize> = siblings(c).into_iter().filter(|x| usable.contains(x)).collect();
+        if s.len() != 2 { pairs = false; break; }
+        order.extend(s);
+    }
+    let list = |v: &[usize]| v.iter().map(usize::to_string).collect::<Vec<_>>().join(",");
+    Some(if pairs { format!("{}s:{}", order.len() / 2, list(&order)) } else { format!("{}:{}", usable.len(), list(&usable)) })
+}
+
 // ── launch boost ──────────────────────────────────────────────────────────
 
 fn set_affinity(cpus: &[usize]) -> std::io::Result<()> {
@@ -568,7 +674,9 @@ fn set_affinity(cpus: &[usize]) -> std::io::Result<()> {
 }
 
 /// Applies the preset's `run` block to this process; the game inherits it.
-fn prepare_run(preset: &Value) {
+/// `parked`: soft-parked CCD role, the game is kept off it when the preset
+/// pins nothing itself.
+fn prepare_run(preset: &Value, parked: Option<&str>) {
     let run = &preset["run"];
     let nice = run["nice"].as_i64().unwrap_or(0);
     if (-20..=-1).contains(&nice) {
@@ -576,6 +684,16 @@ fn prepare_run(preset: &Value) {
             Ok(v) if v["ok"] == true => {}
             Ok(v) => log!("lpm-gamemode: nice boost failed: {}", v["error"].as_str().unwrap_or("?")),
             Err(e) => log!("lpm-gamemode: nice boost failed: {e}"),
+        }
+    }
+    // Soft park: the game gets the other CCD(s) to itself through a cgroup
+    // partition (everything else is moved off them); pinning below stays as
+    // the fallback when the partition is not available.
+    if let Some(pr) = parked {
+        match pkexec(&json!({"op": "isolate_join", "park": pr})) {
+            Ok(v) if v["ok"] == true => log!("lpm-gamemode: game CPU partition {} (rest of the system moved off it)", v["cpus"].as_str().unwrap_or("?")),
+            Ok(v) => log!("lpm-gamemode: game CPU partition not used: {}", v["error"].as_str().unwrap_or("?")),
+            Err(e) => log!("lpm-gamemode: game CPU partition not used: {e}"),
         }
     }
     let role = run["affinity"].as_str().unwrap_or("none");
@@ -588,6 +706,22 @@ fn prepare_run(preset: &Value) {
                 Err(e) => log!("lpm-gamemode: sched_setaffinity: {e}"),
             },
             None => log!("lpm-gamemode: affinity '{role}' does not apply to this CPU, skipped"),
+        }
+    } else if let Some(pr) = parked {
+        let groups = tune::ccx_groups();
+        if let Some(pg) = tune::resolve_ccd(&groups, pr) {
+            let rest: Vec<usize> = groups.iter().flat_map(|g| g.cpus.iter().copied()).filter(|c| !pg.cpus.contains(c)).collect();
+            match set_affinity(&rest) {
+                Ok(()) => log!("lpm-gamemode: pinned off the parked CCD ({})", tune::fmt_cpu_list(&rest)),
+                Err(e) => log!("lpm-gamemode: sched_setaffinity: {e}"),
+            }
+        }
+    }
+    // Wine/Proton must see exactly the CPUs the game may use (see soft_park).
+    if std::env::var_os("WINE_CPU_TOPOLOGY").is_none() {
+        if let Some(t) = wine_topology() {
+            std::env::set_var("WINE_CPU_TOPOLOGY", &t);
+            log!("lpm-gamemode: WINE_CPU_TOPOLOGY={t}");
         }
     }
 }
@@ -639,10 +773,11 @@ fn wrap(args: &[String]) -> i32 {
     OWNER.store(std::process::id() as i32, Ordering::SeqCst);
     let (name, cmd) = split_cmd(args);
     if cmd.is_empty() { log!("lpm-gamemode WRAP: no command"); return 2; }
-    let (pname, preset) = match load_preset(name.as_deref()) { Ok(p) => p, Err(e) => { log!("lpm-gamemode: {e}"); return 2 } };
+    let (pname, mut preset) = match load_preset(name.as_deref()) { Ok(p) => p, Err(e) => { log!("lpm-gamemode: {e}"); return 2 } };
+    let parked = soft_park(&mut preset);
     // The refcount is taken as soon as the helper was reached, even if a knob failed.
     let (entered, _) = game_start(Some(&pname));
-    prepare_run(&preset);
+    prepare_run(&preset, parked.as_deref());
     // Forward termination so POST still runs when the launcher stops us.
     // `as *const ()` first: casting a function item straight to an integer type is
     // deprecated (function pointers aren't guaranteed integer-representable), even
@@ -677,45 +812,59 @@ fn wrap(args: &[String]) -> i32 {
 }
 
 /// Lutris runs the pre-launch script (PRE) and the command prefix (RUN) in
-/// parallel unless "Wait for pre-launch script completion" is set. If the
-/// preset hot-plugs CPUs (SMT off, CCD park), RUN must not read the CCD
-/// topology — or pin the game — while CPUs are still going offline.
-fn wait_for_hotplug(preset: &Value) {
-    let vals = &preset["values"];
-    if !tune::HOTPLUG_KEYS.iter().any(|k| !vals[*k].is_null()) { return; }
-    let deadline = std::time::Instant::now() + HOTPLUG_WAIT;
-    let smt_off = vals["cpu.smt"] == "off";
-    let settled = || {
-        let game = describe_state().map_or(false, |st| st["source"] == "game" && st["refcount"].as_u64().unwrap_or(0) > 0);
+/// parallel unless "Wait for pre-launch script completion" is set. RUN must
+/// not start the game while PRE is still working: the game scene / "GAMING"
+/// undervolt (CPU CO, then the NVIDIA curve reset + write + read-back) would
+/// otherwise run while the game is bringing the dGPU up, and a preset that
+/// hot-plugs CPUs (SMT off, CCD park) must finish before RUN reads the CCD
+/// topology. PRE holds gamemode-start.lock for its whole start sequence, so
+/// RUN waits until that lock is free and game mode is active.
+fn start_lock_held() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(runtime_dir().join("gamemode-start.lock")) else { return false };
+    let busy = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
+    busy  // our own lock (if taken) is released when `f` drops
+}
+
+fn wait_for_start(preset: &Value) {
+    let t0 = std::time::Instant::now();
+    let hotplug = tune::HOTPLUG_KEYS.iter().any(|k| !preset["values"][*k].is_null());
+    let smt_off = preset["values"]["cpu.smt"] == "off";
+    loop {
+        let held = start_lock_held();
+        // tune-helper's world-readable state file: no helper process (full sysfs describe) every 200 ms while the game starts.
+        let active = !held && read_json(Path::new("/run/legion-power-manager/tune/state.json"))
+            .map_or(false, |st| st["source"] == "game" && lpm_helpers::live_game_sessions(&st) > 0);
         let smt = !smt_off || read_json_str("/sys/devices/system/cpu/smt/active").as_deref() == Some("0");
-        game && smt
-    };
-    while !settled() {
-        if std::time::Instant::now() >= deadline {
-            log!("lpm-gamemode RUN: game mode not applied after {} s (is PRE set, and did it succeed?) — pinning with the current topology",
-                      HOTPLUG_WAIT.as_secs());
+        if active && smt { break; }
+        let waited = t0.elapsed();
+        // No PRE hook at all: nothing will ever take the lock.
+        if !held && !active && waited >= START_DETECT {
+            if hotplug { log!("lpm-gamemode RUN: game mode not applied (is PRE set, and did it succeed?) — pinning with the current topology"); }
+            return;
+        }
+        if waited >= START_WAIT {
+            log!("lpm-gamemode RUN: PRE still busy after {} s — starting the game anyway", START_WAIT.as_secs());
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     // CPU offlining finishes before tune-helper returns, but give cacheinfo a beat to settle.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    if hotplug { std::thread::sleep(std::time::Duration::from_millis(200)); }
 }
 
 fn read_json_str(p: &str) -> Option<String> { std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned()) }
 
-/// tune-helper's describe, run directly as the user (no pkexec needed).
-fn describe_state() -> Option<Value> {
-    let out = Command::new(helper()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-        .and_then(|mut c| { c.stdin.take().unwrap().write_all(br#"{"op":"describe"}"#)?; c.wait_with_output() }).ok()?;
-    serde_json::from_slice::<Value>(&out.stdout).ok().map(|v| v["state"].clone())
-}
 
 fn run_exec(args: &[String]) -> i32 {
     let (name, cmd) = split_cmd(args);
     if cmd.is_empty() { log!("lpm-gamemode RUN: no command"); return 2; }
     match load_preset(name.as_deref()) {
-        Ok((_, p)) => { wait_for_hotplug(&p); prepare_run(&p) }
+        Ok((_, mut p)) => {
+            let parked = soft_park(&mut p);
+            wait_for_start(&p);
+            prepare_run(&p, parked.as_deref())
+        }
         Err(e) => log!("lpm-gamemode: {e} — starting without boost"),
     }
     let err = Command::new(&cmd[0]).args(&cmd[1..]).exec();
@@ -735,6 +884,10 @@ fn status() -> i32 {
         if st["active"] == true { "ACTIVE" } else { "off" }, st["source"].as_str().unwrap_or("-"),
         st["preset"].as_str().unwrap_or("-"), st["refcount"], st["saved_files"]);
     println!("default  : {}", default_preset().unwrap_or_else(|| "-".into()));
+    let iso = &v["isolation"];
+    if iso["active"] == true {
+        println!("partition: {} ({}, {} process(es))", iso["cpus"].as_str().unwrap_or(""), iso["partition"].as_str().unwrap_or(""), iso["procs"]);
+    }
     if let Some(b) = v["boot"].as_object() { println!("at boot  : {}", b.get("preset").and_then(Value::as_str).unwrap_or("(unnamed)")); }
     for c in v["topology"]["ccds"].as_array().into_iter().flatten() {
         println!("CCD{}     : cpus {}  L3 {} MB  max {} MHz", c["index"], c["cpus"].as_str().unwrap_or(""),
@@ -750,9 +903,30 @@ fn status() -> i32 {
     0
 }
 
+/// APPROVE [preset…]: stores the values of user presets (all of them by default) in the root-owned store the
+/// helper applies from. Needs the tune-helper authorization. Migrates presets saved before the store existed.
+fn approve(names: &[String]) -> i32 {
+    let all: Vec<String> = if names.is_empty() {
+        std::fs::read_dir(presets_dir()).into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.strip_suffix(".json")).map(str::to_owned)).collect()
+    } else { names.to_vec() };
+    let mut presets = serde_json::Map::new();
+    for n in all.into_iter().filter(|n| valid_name(n)) {
+        if let Some(v) = read_json(&presets_dir().join(format!("{n}.json"))) {
+            if v["values"].is_object() { presets.insert(n, v["values"].clone()); }
+        }
+    }
+    if presets.is_empty() { log!("lpm-gamemode APPROVE: no preset to approve"); return 1; }
+    let n = presets.len();
+    match pkexec_helper(&format!("{HELPER_DIR}/tune-helper"), &json!({"op": "preset_save", "presets": presets})) {
+        Ok(v) => { let ok = report("APPROVE", &v); if ok { log!("lpm-gamemode APPROVE: {n} preset(s) approved"); } (!ok) as i32 }
+        Err(e) => { log!("lpm-gamemode: {e}"); 1 }
+    }
+}
+
 fn usage() -> i32 {
     log!("usage: lpm-gamemode PRE [preset] | POST | RUN [preset] [--] cmd… | WRAP [preset] [--] cmd…\n\
-               \x20                   | APPLY preset | UNDERVOLT | SCENE name | RESTORE | STATUS");
+               \x20                   | APPLY preset | UNDERVOLT | SCENE name | RESTORE | STATUS | APPROVE [preset…]");
     2
 }
 
@@ -775,6 +949,7 @@ fn main() {
         Some("PRE") => { OWNER.store(launcher_pid(), Ordering::SeqCst); pre(args.get(1).map(String::as_str)) }
         Some("POST") => { OWNER.store(launcher_pid(), Ordering::SeqCst); post().map_or_else(fail, |ok| (!ok) as i32) }
         Some("APPLY") if args.len() == 2 => apply(Some(&args[1]), "manual").map_or_else(fail, |ok| (!ok) as i32),
+        Some("APPROVE") => approve(&args[1..]),
         Some("RESTORE") => pkexec(&json!({"op": "restore"})).map_or_else(fail, |v| (!report("RESTORE", &v)) as i32),
         Some("UNDERVOLT") => (!undervolt(true)) as i32,
         Some("SCENE") if args.len() == 2 => {

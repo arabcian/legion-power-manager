@@ -6,8 +6,8 @@
 [Unit]
 Description=Legion Power Manager boot guard
 Documentation=file:///usr/share/doc/legion-power-manager/README.md
-After=local-fs.target
-Before=lpm-tune.service nvcurve-autoload.service lpm-intel-uv.service lpm-intel-uv-daemon.service
+After=local-fs.target systemd-sysctl.service systemd-tmpfiles-setup.service
+Before=tlp.service lpm-tune.service nvcurve-autoload.service lpm-intel-uv.service lpm-intel-uv-daemon.service
 
 [Service]
 Type=simple

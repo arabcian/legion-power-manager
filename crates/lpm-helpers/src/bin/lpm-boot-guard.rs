@@ -21,6 +21,8 @@ extern "C" fn on_term(_: libc::c_int) { STOP.store(true, Ordering::SeqCst); }
 fn fail(e: String) -> i32 { eprintln!("lpm-boot-guard: {e}"); 2 }
 
 fn arm() -> i32 {
+    // Boot defaults for autotune: before TLP and before any preset service.
+    if let Err(e) = lpm_helpers::defaults::capture() { eprintln!("lpm-boot-guard: boot-default snapshot failed: {e}"); }
     match bootguard::arm() {
         Ok(v) => {
             if v["tripped"] == true {

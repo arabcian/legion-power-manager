@@ -11,6 +11,7 @@
 //!   {"op": "aod_set", "values": {"tCL": 36, ...}}   BIOS DRAM timing overrides (AodSetupRpl)
 //!   {"op": "aod_restore"}                            write the newest AodSetupRpl backup back
 //!   {"op": "set_fw_oc", "key": "pbo_scalar"|"boost_mhz"|"curve_optimizer", "value": n}
+//!   {"op": "set_fw_oc_many", "values": {"pbo_scalar": n, ...}}
 //!   {"op": "set_gpu_mode", "mode": "hybrid"|"dgpu", "force": bool}   MUX, next boot
 //!   {"op": "set_igpu_mode", "mode": 0|1|2, "force": true}             only the forced override;
 //!                                                   the guarded path stays in legion-gpu-helper
@@ -29,6 +30,20 @@ fn run() -> Value {
         Some("set_fw_oc") => match (o.get("key").and_then(Value::as_str), o.get("value").and_then(Value::as_i64)) {
             (Some(k), Some(v)) => legion_wmi::set_fw_oc(k, v),
             _ => json!({"ok": false, "error": "'key' and 'value' required"}),
+        },
+        // Several tunes in one privileged call (one password prompt).
+        Some("set_fw_oc_many") => match o.get("values").and_then(Value::as_object) {
+            Some(m) if !m.is_empty() => {
+                let mut errs = Vec::new();
+                for (k, v) in m {
+                    match v.as_i64() {
+                        Some(n) => { let r = legion_wmi::set_fw_oc(k, n); if r["ok"] != json!(true) { errs.push(r["error"].as_str().unwrap_or(k).to_string()); } }
+                        None => errs.push(format!("{k}: value must be an integer")),
+                    }
+                }
+                if errs.is_empty() { json!({"ok": true, "reboot_required": true}) } else { json!({"ok": false, "error": errs.join("; ")}) }
+            }
+            _ => json!({"ok": false, "error": "'values' object required"}),
         },
         Some("set_gpu_mode") => legion_wmi::set_gpu_mode(o.get("mode").and_then(Value::as_str).unwrap_or(""), force),
         Some("set_igpu_mode") => legion_wmi::set_igpu_mode(o.get("mode").and_then(Value::as_u64).unwrap_or(99), force),

@@ -158,7 +158,7 @@ pub fn fan_data() -> Result<Vec<Value>, String> {
     let u32at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
     let mut out: Vec<Value> = Vec::new();
     let mut seen: Vec<(u16, u32)> = Vec::new();
-    for i in 0..aml.len().saturating_sub(56) {
+    for i in 0..(aml.len() + 1).saturating_sub(56) {
         let b = &aml[i..i + 56];
         if b[0] != 0xFF || b[1] != 0 || u32at(b, 4) != 10 || u32at(b, 32) != 10 { continue; }
         let (fid, sensor) = (u16at(b, 2), u32at(b, 28));

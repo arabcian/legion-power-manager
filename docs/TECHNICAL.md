@@ -105,6 +105,21 @@ Unchanged data locations: `/etc/nvcurve/{config.json,profiles/}` (GPU),
 
 ## Supported machines
 
+Hardware-safety rules taken from LenovoLegionToolkit (behaviour only, no code):
+
+- China-market names without "Legion" in DMI (Y9000*, R9000*, Y7000*, R7000*,
+  GeekPro G5000*) are accepted, in the GUI and in every helper.
+- Firmware quirks are keyed on the BIOS prefix (`SMCN19WW` → `SMCN`):
+  J2CN boards go Quiet → Balanced → Performance instead of straight to
+  Performance; K1CN boards step through another mode when leaving Custom.
+  Done in legion-profile-helper, so Home, tray, scenes and lpm-gamemode all
+  get it; the reply's `via` names the intermediate mode.
+- The Spectrum keyboard is only talked to on a 048D:C1xx hidraw interface
+  whose HID descriptor declares a 960-byte feature report; any other
+  interface of the same device gets no ioctl at all.
+- Everything else stays capability-based: each control appears only where
+  its sysfs node / WMI method answers (see the tabs' `present()` checks).
+
 Checked by the GUI at start (`sysinfo::supportedMachine`) and by every Rust
 helper in `lpm_helpers::init()` (`crates/lpm-helpers/src/machine.rs`), plus
 `lpm-gamemode` and `lpm-intel-uv`: `/sys/class/dmi/id/sys_vendor` must be
@@ -498,6 +513,9 @@ came up during the sysfs review, as one tab backed by a Rust root helper.
 
     crates/lpm-helpers/src/tune.rs          allowlist table + sysfs logic (shared)
     crates/lpm-helpers/src/bin/tune-helper  pkexec target: apply / restore / boost / boot
+    crates/lpm-helpers/src/bin/tune-helper.rs is also built as tune-profile-helper (Cargo [[bin]]): only
+    apply_preset (values from the root-owned store /etc/legion-power-manager/presets, by name) / restore / release /
+    boost / boot / tools. Raw values, preset_save/delete, set_boot and driver options stay in tune-helper.
     crates/lpm-helpers/src/bin/lpm-gamemode Lutris/Steam front end (user process)
     gui/src/optimizetab.{h,cpp}             the tab
     packaging/openrc/lpm-tune               boot preset service

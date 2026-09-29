@@ -9,7 +9,9 @@ GUARD="@LIBEXEC@/lpm-boot-guard"
 
 depend() {
 	need localmount
-	before lpm-tune nvcurve-autoload lpm-intel-uv lpm-intel-uv-daemon
+	# The boot-default snapshot must see the user's sysctl.conf but not TLP.
+	after sysctl
+	before tlp lpm-tune nvcurve-autoload lpm-intel-uv lpm-intel-uv-daemon
 }
 
 start() {

@@ -49,12 +49,14 @@ pub fn apply_profile_verified(gpu_index: usize, name: &str, cfg: &Config, max_re
     -> Result<String, String>
 {
     let (g, _) = gpu::get_gpu(gpu_index).map_err(|e| e.to_string())?;
-    let (rc, d) = vfcurve::reset_all_offsets(g, false);
-    if rc != 0 { return Err(format!("Reset failed: {d}")); }
-
+    // Validate the profile BEFORE touching the GPU: a typo or a broken file must not
+    // wipe the curve that is currently applied.
     let path = profile_path(&cfg.profile_dir, name).ok_or_else(|| format!("Invalid profile name: {name:?}"))?;
     if !path.is_file() { return Err(format!("Profile not found: {name}")); }
     let expected = load_profile(&path)?.deltas().map_err(|e| format!("Malformed curve_deltas in profile: {e}"))?;
+    let (rc, d) = vfcurve::reset_all_offsets(g, false);
+    if rc != 0 { return Err(format!("Reset failed: {d}")); }
+    let max_retries = max_retries.max(1);  // 0 attempts would report success without applying anything
 
     let mut errs: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();

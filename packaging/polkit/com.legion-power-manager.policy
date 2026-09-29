@@ -3,7 +3,7 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>legion-power-manager</vendor>
-  <!-- Ten Rust root helpers, each pinned by exec.path; installed root:root 0755
+  <!-- Eleven Rust root helpers, each pinned by exec.path; installed root:root 0755
        (nvcurve-root-helper 0700) under /usr/libexec/legion-power-manager.
        The password-less grant (wheel, local active session) comes only from
        /etc/polkit-1/rules.d/49-legion-power-manager.rules; the defaults below
@@ -91,6 +91,15 @@
     <message xml:lang="tr">Çekirdek optimizasyon ayarlarını değiştirmek için kimlik doğrulama gerekiyor</message>
     <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/tune-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="com.legion-power-manager.tune.profile">
+    <description>Apply an approved optimization preset via Legion Power Manager</description>
+    <description xml:lang="tr">Legion Power Manager üzerinden onaylı bir optimizasyon ön ayarını uygula</description>
+    <message>Authentication is required to apply an optimization preset</message>
+    <message xml:lang="tr">Bir optimizasyon ön ayarını uygulamak için kimlik doğrulama gerekiyor</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/tune-profile-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
   <action id="com.legion-power-manager.firmware.write">

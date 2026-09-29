@@ -154,6 +154,20 @@ fn smn_read(addr: u32) -> Result<u32, String> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// The SMN node exists only once ryzen_smu's PCI driver has probed, which can
+/// trail the module load (async probe, a fresh modprobe, resume rebind). The
+/// old single exists() check reported "not loaded" in that window.
+fn smn_ready() -> bool {
+    if Path::new(SMN).exists() { return true; }
+    modprobe("ryzen_smu");
+    if !Path::new("/sys/module/ryzen_smu").exists() { return false; }
+    for _ in 0..30 {
+        if Path::new(SMN).exists() { return true; }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
 fn amd_family() -> Option<u32> {
     let info = crate::cpuinfo_head();
     if !info.lines().any(|l| l.starts_with("vendor_id") && l.contains("AuthenticAMD")) { return None; }
@@ -189,8 +203,13 @@ pub fn read_umc() -> Result<Value, String> {
         Some(f) => return Err(format!("CPU family {f:#x}: UMC map only verified for AM5-generation (Zen 4/5)")),
         None => return Err("not an AMD CPU: live timings are read from the AMD memory controller".into()),
     }
-    if !Path::new(SMN).exists() { modprobe("ryzen_smu"); }
-    if !Path::new(SMN).exists() { return Err("ryzen_smu not loaded (needed for live timings)".into()); }
+    if !smn_ready() {
+        return Err(if Path::new("/sys/module/ryzen_smu").exists() {
+            format!("ryzen_smu is loaded but {SMN} did not appear (driver not bound to the CPU's PCI root yet)")
+        } else {
+            "ryzen_smu not loaded (needed for live timings)".into()
+        });
+    }
     let ch0 = decode_umc(&|off| smn_read(UMC0 + off))?;
     // Second channel: report whether it runs the same timings.
     let ch1 = decode_umc(&|off| smn_read(UMC0 + UMC_STRIDE + off)).ok();
@@ -396,7 +415,7 @@ pub fn aod_set(values: Option<&Value>) -> Value {
         aod_supported()?;
         let vals = values.and_then(Value::as_object).ok_or("'values' must be an object {name: number}")?;
         let mut b = aod_load()?;
-        aod_verify(&b)?;
+        let live = aod_verify(&b)?;
         let orig = b.clone();
         for (name, v) in vals {
             let &(_, i, lo, hi) = AOD_FIELDS.iter().find(|f| f.0 == name).ok_or(format!("'{name}' is not editable"))?;
@@ -408,7 +427,14 @@ pub fn aod_set(values: Option<&Value>) -> Value {
             b[o + 1..o + 3].copy_from_slice(&v.to_le_bytes());
         }
         let g = |n: &str| AOD_FIELDS.iter().find(|f| f.0 == n).map(|f| rec(&b, f.1).1).unwrap_or(0);
-        if g("tRC") < g("tRAS") + g("tRP") { return Err("tRC must be ≥ tRAS + tRP".into()); }
+        // Effective values: an Auto record's stored number is not what the BIOS runs, use the live one.
+        let eff = |n: &str| -> u64 {
+            let (m, v) = AOD_FIELDS.iter().find(|f| f.0 == n).map_or((0, 0), |f| rec(&b, f.1));
+            if m == 1 { v as u64 } else { live["timings"][n].as_u64().unwrap_or(0) }
+        };
+        if ["tRC", "tRAS", "tRP"].iter().any(|k| vals.contains_key(*k)) && eff("tRC") < eff("tRAS") + eff("tRP") {
+            return Err("tRC must be ≥ tRAS + tRP".into());
+        }
         // Refresh ordering, only between records that are actually in use
         // (manual); an Auto record's stored number is not what the BIOS runs.
         let manual = |n: &str| AOD_FIELDS.iter().find(|f| f.0 == n).map_or(false, |f| rec(&b, f.1).0 == 1);
@@ -437,10 +463,10 @@ pub fn aod_restore() -> Value {
         // A backup taken under another BIOS version may use another layout.
         let meta = fs::read_to_string(src.with_extension("json")).ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok());
-        if let Some(bios) = meta.as_ref().and_then(|m| m["bios_version"].as_str()) {
-            if bios != dmi("bios_version") {
-                return Err(format!("the backup was taken under BIOS {bios}, this is {} — refusing", dmi("bios_version")));
-            }
+        let bios = meta.as_ref().and_then(|m| m["bios_version"].as_str())
+            .ok_or("the backup has no BIOS version record; refusing")?;
+        if bios != dmi("bios_version") {
+            return Err(format!("the backup was taken under BIOS {bios}, this is {} — refusing", dmi("bios_version")));
         }
         if data == cur {
             return Ok(json!({"ok": true, "changed": false, "restored": src.display().to_string()}));

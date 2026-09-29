@@ -405,6 +405,37 @@ fn request(opcode: u8, payload: &[u8]) -> Report {
     b
 }
 
+/// Longest Feature report a HID report descriptor declares, in bytes, with the
+/// report-ID byte counted when the device uses IDs (Windows'
+/// FeatureReportByteLength). Short items only; malformed input → None.
+pub fn max_feature_report_len(desc: &[u8]) -> Option<usize> {
+    let (mut size, mut count, mut id) = (0u32, 0u32, 0u8);
+    let mut stack: Vec<(u32, u32, u8)> = Vec::new();
+    let mut bits: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < desc.len() {
+        let b = desc[i];
+        if b == 0xFE {  // long item: 0xFE, size, tag, data
+            i += 3 + *desc.get(i + 1)? as usize;
+            continue;
+        }
+        let n = [0, 1, 2, 4][(b & 3) as usize];
+        let data = desc.get(i + 1..i + 1 + n)?;
+        let v = data.iter().rev().fold(0u32, |a, &x| (a << 8) | x as u32);
+        match b & 0xFC {
+            0x74 => size = v,
+            0x94 => count = v,
+            0x84 => id = v as u8,
+            0xA4 => stack.push((size, count, id)),
+            0xB4 => (size, count, id) = stack.pop()?,
+            0xB0 => *bits.entry(id).or_default() += u64::from(size) * u64::from(count),
+            _ => {}
+        }
+        i += 1 + n;
+    }
+    bits.iter().map(|(&rid, &b)| (b as usize + 7) / 8 + usize::from(rid != 0)).max()
+}
+
 pub struct Device {
     file: File,
     path: PathBuf,
@@ -432,6 +463,13 @@ impl Device {
             let mut it = id.split(':').skip(1).map(|s| u32::from_str_radix(s, 16).ok());
             let (Some(Some(vid)), Some(Some(pid))) = (it.next(), it.next()) else { continue };
             if vid as u16 != VENDOR_ID || (pid as u16 & PRODUCT_MASK) != PRODUCT_MATCH {
+                continue;
+            }
+            // Same guard as LenovoLegionToolkit: only an interface whose HID
+            // descriptor declares a REPORT_LEN-byte feature report is spoken
+            // to. Other 048D:C1xx interfaces never get a single ioctl.
+            let Ok(desc) = fs::read(dir.join("device/report_descriptor")) else { continue };
+            if max_feature_report_len(&desc) != Some(REPORT_LEN) {
                 continue;
             }
             let node = Path::new("/dev").join(dir.file_name().unwrap());
@@ -568,6 +606,17 @@ impl Device {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn feature_len_from_descriptor() {
+        // Report ID 7, 8-bit × 959 feature → 960 bytes with the ID.
+        let d = [0x06, 0x89, 0xFF, 0x09, 0x07, 0xA1, 0x01, 0x85, 0x07, 0x75, 0x08, 0x96, 0xBF, 0x03, 0x09, 0x01,
+                 0xB1, 0x02, 0xC0];
+        assert_eq!(super::max_feature_report_len(&d), Some(super::REPORT_LEN));
+        // An input-only interface declares no feature report.
+        assert_eq!(super::max_feature_report_len(&[0x85, 0x01, 0x75, 0x08, 0x95, 0x40, 0x81, 0x02]), None);
+        assert_eq!(super::max_feature_report_len(&[0x95]), None);  // truncated
+    }
+
     use super::*;
 
     /// Grid as reported by a Legion Pro 7 16AFR10H.
