@@ -20,6 +20,7 @@ pub mod health;
 pub mod memory_spd;
 pub mod intel_uv;
 pub mod intel_uv_daemon;
+pub mod iorate;
 pub mod isolate;
 pub mod legion_wmi;
 pub mod lighting;

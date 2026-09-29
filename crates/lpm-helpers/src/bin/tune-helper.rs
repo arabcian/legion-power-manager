@@ -6,8 +6,11 @@
 //!
 //! One JSON object on stdin, one JSON line on stdout:
 //!   {"op":"describe"}                                  any user: tunables, live values, state, topology
-//!   {"op":"autotune","goal":"gaming"}                  any user: hardware profile + derived preset
-//!       (goal: powersave | gaming | throughput | desktop; see lpm_helpers::autotune)
+//!   {"op":"autotune","goal":"gaming","weights":{..}}   any user: hardware profile + derived preset
+//!       (goal: powersave | gaming | throughput | desktop; optional objective weights; see lpm_helpers::autotune)
+//!   {"op":"audit"}                                     any user: safety audit of the root preset store + boot preset
+//!   {"op":"io_probe"}                                  tune-helper only: bounded write-rate probe for autotune
+//!       (<= 512 MiB O_DIRECT into an unlinked O_TMPFILE on /var/tmp; result in /var/lib/legion-power-manager/io-probe.json)
 //!   {"op":"profile"}                                   any user: the hardware profile autotune uses
 //!   {"op":"apply","values":{k:v,..},"mode":"manual"|"game","preset":"name"}
 //!       "replace":true (manual only): first restore every knob this request
@@ -28,6 +31,12 @@
 //!       validate and store presets (root-owned); {"op":"preset_delete","name":".."} removes one
 //!   {"op":"guard_reset"}                               resume boot presets paused by lpm-boot-guard
 //!
+//! Values that fail lpm_helpers::autotune::audit's hard limits (e.g. an int32-
+//! wrapped vm.dirty_bytes of 8192) are never stored or written. After an apply
+//! that wrote memory/writeback knobs, a detached guard watches PSI for
+//! GUARD_SECS and restores exactly those knobs if every task starts stalling
+//! (verdict in /run/legion-power-manager/tune/guard.json and the kernel log).
+//!
 //! Keys are looked up in lpm_helpers::tune::TUNABLES; paths never come from a
 //! request. The first write to a concrete file records its original value in
 //! /run/legion-power-manager/tune/state.json (tmpfs: a reboot is a full
@@ -43,6 +52,7 @@
 //! retry loop and a hard deadline: a stuck helper must not freeze the GUI or
 //! the game launcher forever.
 
+use lpm_helpers::autotune;
 use lpm_helpers::tune::{self, TUNABLES};
 use lpm_helpers::*;
 use serde_json::{json, Map, Value};
@@ -57,6 +67,8 @@ const RUN_DIR: &str = "/run/legion-power-manager";
 const STATE_DIR: &str = "/run/legion-power-manager/tune";
 const STATE_FILE: &str = "/run/legion-power-manager/tune/state.json";
 const LOCK_FILE: &str = "/run/legion-power-manager/tune/lock";
+const GUARD_PID: &str = "/run/legion-power-manager/tune/guard.pid";
+const GUARD_FILE: &str = "/run/legion-power-manager/tune/guard.json";
 const ETC_DIR: &str = "/etc/legion-power-manager";
 const BOOT_FILE: &str = "/etc/legion-power-manager/tune-boot.json";
 const MAX_BASELINE: usize = 16_384;
@@ -128,6 +140,17 @@ struct State {
     preset: Option<String>,
     /// "manual" | "game" | "boot" — who applied last.
     source: Option<String>,
+    /// key -> where its recorded original came from: "tlp" when TLP had already
+    /// set it (the original is TLP's state, not the kernel's default), else "system".
+    origins: std::collections::BTreeMap<String, String>,
+}
+
+/// Keys TLP manages; their first-seen value on a TLP system is TLP's, not the kernel's.
+fn origin_of(key: &str) -> &'static str {
+    const TLP: &[&str] = &["pm.", "usb.", "pci.aspm", "cpu.epp", "cpu.governor", "cpu.boost", "cpu.dynamic_epp", "cpu.min_freq",
+                           "cpu.max_freq", "snd.", "net.wifi", "net.wol", "disk.", "gpu.amdgpu_abm", "gpu.amdgpu_dpm", "kernel.watchdog",
+                           "vm.dirty_writeback", "vm.dirty_expire", "vm.laptop_mode", "blk.scheduler", "cpu.platform"];
+    if Path::new("/run/tlp").is_dir() && TLP.iter().any(|p| key.starts_with(p)) { "tlp" } else { "system" }
 }
 
 impl State {
@@ -152,11 +175,15 @@ impl State {
             sessions,
             preset: v["preset"].as_str().map(str::to_owned),
             source: v["source"].as_str().map(str::to_owned),
+            origins: v["origins"].as_object().map(|o| o.iter().filter_map(|(k, x)| Some((k.clone(), x.as_str()?.to_owned()))).collect()).unwrap_or_default(),
         }
     }
 
     fn save(&self) -> Result<(), String> {
+        let origins: Map<String, Value> = self.origins.iter()
+            .filter(|(k, _)| self.baseline.iter().any(|(b, _, _)| b == *k)).map(|(k, o)| (k.clone(), json!(o))).collect();
         let v = json!({
+            "origins": origins,
             "baseline": self.baseline.iter().map(|(k, p, v)| json!([k, p, v])).collect::<Vec<_>>(),
                       "refcount": self.refcount(), "preset": self.preset, "source": self.source,
                       "sessions": self.sessions.iter().map(|(p, t)| json!({"pid": p, "start": t})).collect::<Vec<_>>(),
@@ -180,8 +207,9 @@ impl State {
 fn summary(st: &State) -> Value {
     let mut keys: Vec<&str> = Vec::new();
     for (k, _, _) in &st.baseline { if !keys.contains(&k.as_str()) { keys.push(k); } }
+    let tlp: Vec<&String> = st.origins.iter().filter(|(k, o)| *o == "tlp" && keys.contains(&k.as_str())).map(|(k, _)| k).collect();
     json!({"active": !st.baseline.is_empty(), "refcount": st.refcount(), "preset": st.preset,
-        "source": st.source, "saved_files": st.baseline.len(), "keys": keys})
+        "source": st.source, "saved_files": st.baseline.len(), "keys": keys, "tlp_originals": tlp})
 }
 
 /// Applies `values` in table order. Returns per-key results and all-ok.
@@ -194,10 +222,17 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             all_ok = false;
         }
     }
+    // Hard safety limits (int32-wrapped dirty limits, reserves that OOM the box, ...).
+    let rejects: Vec<autotune::Issue> = autotune::audit(values, &autotune::AuditCtx::live()).into_iter().filter(|i| i.reject).collect();
     // Table order, not request order: pstate mode first, hot-plug last.
     let mut first = true;
     for t in TUNABLES {
         let Some(raw) = values.get(t.key) else { continue };
+        if let Some(i) = rejects.iter().find(|i| i.key == t.key) {
+            results.push(json!({"key": t.key, "ok": false, "error": format!("refused by the safety audit: {} (run lpm-autotune audit --fix)", i.msg)}));
+            all_ok = false;
+            continue;
+        }
         if !std::mem::take(&mut first) { std::thread::sleep(tune::KNOB_GAP); }
         if t.debugfs && !tune::ensure_debugfs() {
             results.push(json!({"key": t.key, "ok": true, "skipped": "debugfs unavailable"}));
@@ -238,6 +273,7 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
             if fresh {
                 if st.baseline.len() >= MAX_BASELINE { errs.push("baseline full".into()); break; }
                 st.baseline.push((t.key.to_owned(), f.clone(), orig));
+                st.origins.entry(t.key.to_owned()).or_insert_with(|| origin_of(t.key).to_owned());
             }
             todo.push((f, data, fresh));
         }
@@ -318,7 +354,7 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
     let selected = |k: &str| only.map_or(true, |o| o.iter().any(|x| x == k));
     let mut order: Vec<usize> = (0..st.baseline.len()).filter(|&i| selected(&st.baseline[i].0)).collect();
     order.sort_by_key(|&i| (!tune::is_hotplug(&st.baseline[i].0), i));
-    let (mut n, mut errs) = (0, Vec::new());
+    let (mut n, mut errs, mut deferred) = (0, Vec::new(), 0);
     // Entries whose original could not be written back stay in the baseline:
     // dropping them would lose the only record of the original value while the
     // knob is still changed. A later restore (GUI, POST, service stop) retries.
@@ -343,7 +379,9 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
             Ok(()) => n += 1,
             // Per-policy files vanish when the pstate mode is restored first; not an error.
             Err(_) if !f.exists() => {}
-            Err(_) if tune::find(key).map_or(false, tune::best_effort) => {}
+            // Best-effort rows (IRQs, PCI/USB devices): not an error, but the
+            // original stays recorded for the next restore instead of being lost.
+            Err(_) if tune::find(key).map_or(false, tune::best_effort) => { failed.insert(i); deferred += 1; }
             Err(e) => { failed.insert(i); errs.push(json!({"key": key, "error": e})); }
         }
     }
@@ -359,7 +397,9 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
     // written back (those stay recorded for the next restore attempt).
     if only.is_none() { st.sessions.clear(); }
     if st.baseline.is_empty() { st.sessions.clear(); st.preset = None; st.source = None; }
-    json!({"restored": n, "errors": errs})
+    let mut r = json!({"restored": n, "errors": errs});
+    if deferred > 0 { r["deferred"] = json!(deferred); }
+    r
 }
 
 fn locked<F: FnOnce(&mut State) -> Value>(f: F) -> Value {
@@ -399,7 +439,8 @@ fn apply_with(values: &Map<String, Value>, req: &Value) -> Value {
     let replace = req["replace"].as_bool().unwrap_or(false);
     if replace && mode != "manual" { return json!({"ok": false, "error": "replace is only valid in manual mode"}); }
     let owner = if mode == "game" { session_owner(req) } else { (None, None) };
-    locked(|st| {
+    let base = autotune::Pressure::sample();
+    let out = locked(|st| {
         let mut restored = Value::Null;
         if replace {
             // A scene switch (e.g. AC → battery) must not yank a running game's tuning.
@@ -429,7 +470,71 @@ fn apply_with(values: &Map<String, Value>, req: &Value) -> Value {
         if values.is_empty() && st.baseline.is_empty() { st.source = None; }
         json!({"ok": ok, "applied": true, "results": results, "restored": restored,
             "error": (!ok).then_some("some settings could not be applied")})
-    })
+    });
+    guard_after(out, base)
+}
+
+/// Starts the pressure guard when the apply wrote guarded knobs.
+fn guard_after(mut out: Value, base: autotune::Pressure) -> Value {
+    let keys: Vec<String> = out["results"].as_array().map(|a| a.iter()
+        .filter(|r| r["ok"].as_bool() == Some(true) && r["written"].as_u64().unwrap_or(0) > 0)
+        .filter_map(|r| r["key"].as_str()).filter(|k| autotune::guarded(k)).map(str::to_owned).collect()).unwrap_or_default();
+    if !keys.is_empty() && std::env::var_os("LPM_NO_GUARD").is_none() && spawn_guard(&keys, base) {
+        out["guard"] = json!({"keys": keys, "seconds": autotune::GUARD_SECS});
+    }
+    out
+}
+
+/// Detached child: samples PSI at 1 Hz for GUARD_SECS; if the verdict trips,
+/// restores exactly `keys` (unless someone changed them meanwhile). Returns
+/// true in the parent when the child started.
+fn spawn_guard(keys: &[String], base: autotune::Pressure) -> bool {
+    if let Some(pid) = fs::read_to_string(GUARD_PID).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|p| *p > 1) {
+        // Only a guard of ours: /proc/<pid>/comm is the helper's own name.
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm.trim().starts_with("tune-") { unsafe { libc::kill(pid, libc::SIGTERM); } }
+    }
+    let applied: Vec<(String, Option<String>)> = keys.iter().map(|k| (k.clone(), tune::find(k).and_then(tune::current))).collect();
+    let pid = unsafe { libc::fork() };
+    if pid != 0 { return pid > 0; }
+    // Child: own session, no inherited descriptors (stdout pipe of pkexec, the tune lock).
+    unsafe {
+        libc::setsid();
+        let null = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+        if null >= 0 { for fd in 0..3 { libc::dup2(null, fd); } }
+        let fds: Vec<i32> = fs::read_dir("/proc/self/fd").into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok()).filter(|&fd| fd > 2).collect();
+        for fd in fds { libc::close(fd); }
+    }
+    let _ = write_root_file(GUARD_PID, std::process::id().to_string().as_bytes());
+    let mut window = Vec::with_capacity(autotune::GUARD_SECS);
+    let mut verdict = None;
+    for _ in 0..autotune::GUARD_SECS {
+        std::thread::sleep(Duration::from_secs(1));
+        // Another apply/restore changed our knobs: this guard's job is over.
+        if applied.iter().any(|(k, v)| tune::find(k).and_then(tune::current) != *v) { break; }
+        window.push(autotune::Pressure::sample());
+        if let Some(v) = autotune::guard_verdict(&base, &window) { verdict = Some(v); break; }
+    }
+    if let Some(v) = verdict {
+        let restored = match lock() {
+            Ok(_l) => {
+                let mut st = State::load();
+                let r = restore_entries(&mut st, Some(keys));
+                let _ = st.save();
+                r
+            }
+            Err(e) => json!({"error": e}),
+        };
+        let body = json!({"time": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                          "verdict": v, "keys": keys, "restored": restored});
+        let _ = write_root_file(GUARD_FILE, &serde_json::to_vec_pretty(&body).unwrap());
+        // Warning level: the Health tab keeps it in its kernel-log history.
+        let _ = fs::write("/dev/kmsg", format!("<4>legion-power-manager: autotune guard restored {} after {v}\n", keys.join(",")));
+        tune::write_debugfs_snapshot();
+    }
+    let _ = fs::remove_file(GUARD_PID);
+    unsafe { libc::_exit(0) }
 }
 
 fn op_release(req: &Value) -> Value {
@@ -566,7 +671,7 @@ fn op_isolate_join(req: &Value) -> Value {
 }
 
 /// Known keys with values that validate against *this* machine; knobs this machine lacks are not stored.
-fn clean_values(values: &Map<String, Value>) -> Result<Map<String, Value>, Vec<Value>> {
+fn clean_values(values: &Map<String, Value>) -> Result<(Map<String, Value>, Vec<Value>), Vec<Value>> {
     let mut clean = Map::new();
     let mut rejected = Vec::new();
     for (k, v) in values {
@@ -580,7 +685,15 @@ fn clean_values(values: &Map<String, Value>) -> Result<Map<String, Value>, Vec<V
             None => rejected.push(json!({"key": k, "error": "unknown key"})),
         }
     }
-    if rejected.is_empty() { Ok(clean) } else { Err(rejected) }
+    if !rejected.is_empty() { return Err(rejected); }
+    // Values the safety audit refuses are never stored (reported, not fatal:
+    // one bad legacy key must not block a whole batch of scene presets).
+    let mut dropped = Vec::new();
+    for i in autotune::audit(&clean, &autotune::AuditCtx::live()).into_iter().filter(|i| i.reject) {
+        clean.remove(&i.key);
+        dropped.push(json!({"key": i.key, "error": format!("refused by the safety audit: {}", i.msg)}));
+    }
+    Ok((clean, dropped))
 }
 
 fn preset_name(s: &str) -> Option<String> {
@@ -629,11 +742,15 @@ fn op_preset_save(req: &Value) -> Value {
         return json!({"ok": false, "error": "values must be an object (or presets an object of objects)"});
     }
     let mut prepared: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut dropped = Vec::new();
     for (n, m) in &items {
         let Some(file) = preset_file(n) else { return json!({"ok": false, "error": format!("invalid preset name '{n}'")}) };
         if m.len() > TUNABLES.len() { return json!({"ok": false, "error": format!("{n}: too many values")}); }
         match clean_values(m) {
-            Ok(c) => prepared.push((file, serde_json::to_vec_pretty(&json!({"values": c})).unwrap())),
+            Ok((c, d)) => {
+                dropped.extend(d.into_iter().map(|mut x| { x["preset"] = json!(n); x }));
+                prepared.push((file, serde_json::to_vec_pretty(&json!({"values": c})).unwrap()));
+            }
             Err(rej) => return json!({"ok": false, "error": "invalid values", "preset": n, "results": rej}),
         }
     }
@@ -641,7 +758,29 @@ fn op_preset_save(req: &Value) -> Value {
     for (file, body) in &prepared {
         if let Err(e) = write_root_file(file, body) { return json!({"ok": false, "error": e}); }
     }
-    json!({"ok": true, "saved": prepared.len()})
+    let mut out = json!({"ok": true, "saved": prepared.len()});
+    if !dropped.is_empty() { out["dropped"] = Value::Array(dropped); }
+    out
+}
+
+/// Safety audit of every stored preset and the boot preset (read-only).
+fn op_audit() -> Value {
+    let ctx = autotune::AuditCtx::live();
+    let mut found = Vec::new();
+    let mut files: Vec<String> = fs::read_dir(PRESET_DIR).into_iter().flatten().flatten()
+        .map(|e| e.path().to_string_lossy().into_owned()).filter(|p| p.ends_with(".json")).collect();
+    files.sort();
+    files.push(BOOT_FILE.to_owned());
+    for f in files {
+        let Some(v) = read_root_file(&f, 256 * 1024).and_then(|s| serde_json::from_str::<Value>(&s).ok()) else { continue };
+        for (path, i) in autotune::audit_tree(&v, &ctx) {
+            let mut j = i.to_json();
+            j["file"] = json!(f);
+            j["path"] = json!(path);
+            found.push(j);
+        }
+    }
+    json!({"ok": true, "issues": found})
 }
 
 fn op_preset_delete(req: &Value) -> Value {
@@ -663,7 +802,7 @@ fn op_set_boot(req: &Value) -> Value {
         },
         Value::Object(values) => {
             let clean = match clean_values(values) {
-                Ok(c) => c,
+                Ok((c, _)) => c,
                 Err(rejected) => return json!({"ok": false, "error": "invalid values", "results": rejected}),
             };
             let body = json!({"preset": valid_preset(&req["preset"]), "values": clean});
@@ -683,12 +822,14 @@ fn boot_preset() -> Option<Value> {
 fn op_boot() -> Value {
     let Some(b) = boot_preset() else { return json!({"ok": true, "applied": false, "message": "no boot preset"}) };
     let Some(values) = b["values"].as_object().cloned() else { return json!({"ok": false, "error": "boot preset has no values"}) };
-    locked(|st| {
+    let base = autotune::Pressure::sample();
+    let out = locked(|st| {
         st.preset = valid_preset(&b["preset"]);
         st.source = Some("boot".into());
         let (results, ok) = apply_values(st, &values);
         json!({"ok": ok, "applied": true, "results": results, "error": (!ok).then_some("some settings could not be applied")})
-    })
+    });
+    guard_after(out, base)
 }
 
 fn run() -> Value {
@@ -708,9 +849,10 @@ fn run() -> Value {
         "klog" => return lpm_helpers::health::klog(req["since"].as_u64().unwrap_or(0)),
         "nvreg_describe" => return lpm_helpers::nvreg::describe(),
         "autotune" => return match req["goal"].as_str().and_then(lpm_helpers::autotune::Goal::parse) {
-            Some(g) => lpm_helpers::autotune::autotune(g),
+            Some(g) => lpm_helpers::autotune::autotune_req(g, &req["weights"]),
             None => json!({"ok": false, "error": "goal must be one of powersave, gaming, throughput, desktop"}),
         },
+        "audit" => return op_audit(),
         "profile" => {
             let p = lpm_helpers::autotune::Profile::gather();
             return json!({"ok": true, "profile": p.to_json(), "summary": p.summary()});
@@ -746,6 +888,10 @@ fn run() -> Value {
             Err(e) => json!({"ok": false, "error": e}),
         },
         "preset_save" => op_preset_save(&req),
+        "io_probe" => match lpm_helpers::iorate::probe("/var/tmp") {
+            Ok(v) => json!({"ok": true, "probe": v}),
+            Err(e) => json!({"ok": false, "error": e}),
+        },
         "preset_delete" => op_preset_delete(&req),
         _ => json!({"ok": false, "error": "unknown op"}),
     };

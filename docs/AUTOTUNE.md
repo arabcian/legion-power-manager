@@ -1,101 +1,98 @@
 # Autotune
 
-Autotune turns the Optimizations tab into a preset generator: pick a base,
-LPM profiles the machine and checks every row with the value that base calls
-for **on this hardware**. Nothing is written until *Apply checked*; *Save*
-makes it an ordinary preset (usable as ★ game preset, boot preset or in a Scene).
+Autotune profiles the machine and proposes an Optimizations preset for one of
+four goals: **Power saving**, **Gaming**, **Bare throughput**, **Optimal desktop**.
+Nothing is written until you press *Apply checked* (or save it into a preset/scene).
 
-GUI: Optimizations → *Autotune for* [base] → **⚙ Autotune** (report dialog with
-the reason for every row). CLI:
+## How a value is chosen
 
-    lpm-autotune profile [--json]
-    lpm-autotune <powersave|gaming|throughput|desktop> [--json] [--save [NAME]]
+There are two kinds of rules.
 
-Both run unprivileged (`tune-helper {"op":"autotune","goal":...}`).
+**Structural rules** have one right answer for the hardware: amd-pstate active,
+V-Cache CCD roles, game affinity / IRQ steering on X3D, amdgpu DPM `auto`,
+bringing a parked CCD back, BBR + fq, swap cost model (kernel doc: swappiness
+> 100 for in-memory swap).
 
-## Pipeline (crates/lpm-helpers/src/autotune.rs)
+**Scored knobs** are every setting with a real trade-off. Each candidate value
+has an effect vector over five objectives relative to the reference
+("leave it", or the kernel default):
 
-1. **Profile::gather** – CPU vendor/model, cores/threads/SMT, L3 domains (CCDs),
-   V-Cache and frequency die, Intel P/E split, cpufreq driver and EPP support,
-   governors, cpuidle governors and C-state exit latencies, RAM, swap kind
-   (zram / disk+zswap / SSD / HDD), NVMe/HDD/SATA, battery and AC, GPUs
-   (NVIDIA/AMD/Intel), Wi-Fi, kernel version, NUMA nodes, installed sched_ext
-   schedulers, uncore range, and live values of state-dependent rows.
-2. **decide(goal, profile)** – pure rule set, one reason per decision (unit tested
-   with synthetic profiles: X3D laptop, desktop, Intel hybrid).
-3. **filter** – drops rows this machine/kernel does not offer (`tune::files`
-   empty) or values `tune::validate` rejects; they are listed as "skipped".
+| objective  | meaning |
+|------------|---------|
+| latency    | frame-time / input / wake-up smoothness |
+| throughput | work per second |
+| power      | idle and load power, heat |
+| footprint  | RAM held by the setting (reserves, THP bloat, dirty cache) |
+| stability  | risk of hangs, resume failures, OOM kills (always a cost) |
 
-Autotune never parks a CCD (it brings a parked one back): parking breaks
-Wine/Proton CPU numbering and nvidia-powerd; isolation is done with launch
-affinity plus IRQ/workqueue steering instead.
+`U = Σ weight × effect − 0.10 × deviation`. A candidate is written only if it
+beats the reference by 0.03 — otherwise the setting is left alone. Effects are
+ordinal estimates taken from kernel documentation plus this machine's evidence;
+a knob that fixes a problem the machine does not show earns nothing.
 
-## The four bases
+Default weights (latency, throughput, power, footprint, stability):
 
-| Area | Power saving | Gaming (latency + throughput) | Bare throughput | Optimal desktop |
-|---|---|---|---|---|
-| EPP | `power` | X3D: V-Cache CCD `performance`, frequency CCD `balance_power`; hybrid: P `performance`, E `balance_power` | laptop `balance_performance` (package-power-bound), desktop `performance` | `balance_performance`, or dynamic EPP on a laptop |
-| Turbo / floor | off / `cpuinfo_min` | on / `lowest_nonlinear` | on / `lowest_nonlinear` | on / `lowest_nonlinear` |
-| X3D preference | – | `cache` | `frequency` | – |
-| cpuidle | teo, all states | teo; laptop: no cap (deep idle = boost headroom); desktop: deepest state skipped via wake-latency QoS | all states | teo, all states |
-| THP | madvise, khugepaged slow | `always` + defer+madvise + max_ptes_none 409 (≥16 GB and kernel ≥6.12, else madvise) | same as gaming | same as gaming |
-| Dirty cache (bytes) | 10 % / 20 % of RAM, writeback 15 s, expire 60 s | 64 MB / 256 MB, writeback 15 s (CachyOS) | 10 % / 40 % of RAM, ≤16 GB (TuneD) | same as gaming |
-| Swap | zram: swappiness 150 (180 power saving), page-cluster 0, zswap off; SSD swap: 100 + zswap, page-cluster 1; HDD: 60 + zswap, page-cluster 2 (CachyOS) | | | |
-| Working set | – | MGLRU min_ttl 1 s (0 under 12 GB RAM or while memory pressure is high), vfs_cache_pressure 50, watermark_scale_factor sized to ~400 MiB headroom (≥16 GB, see Evidence) | watermark_scale_factor as gaming | as gaming |
-| Preemption / slice | lazy (6.13+) | full, stock EEVDF slice | lazy, stock slice, migration_cost 5 ms (TuneD) | lazy, stock slice |
-| Sched features (debugfs) | RUN_TO_PARITY on | NEXT_BUDDY on | RUN_TO_PARITY on | NEXT_BUDDY on |
-| Floor frequency (7.1+, if present) | `cpuinfo_min` | `nominal` | `nominal` | `nominal` |
-| khugepaged max_ptes_swap | 0 (with swap) | 0 (with swap) | stock | 0 (with swap) |
-| Steering | – | IRQs + unbound wq on frequency die / E-cores | all CPUs | – |
-| RT uclamp (schedutil only) | 0 | 1024 | 1024 | 256 |
-| Devices | ASPM powersave, PCI/USB runtime PM auto, HDA 1 s, Wi-Fi PS on, APST all states | ASPM performance, runtime PM on (GPU excluded), APST off, Wi-Fi PS off, iGPU low with dGPU | iGPU low with dGPU, SATA max_performance | SATA med_power_with_dipm |
-| Network | – | BBR + fq | BBR + fq | BBR + fq |
-| Launch | – | nice −5, pinned to V-Cache CCD on X3D | – | – |
+| goal       | lat | thr | pwr  | mem | stab |
+|------------|-----|-----|------|-----|------|
+| Gaming     | 1.0 | 0.6 | 0.15 | 0.4 | 1.0 |
+| Desktop    | 0.7 | 0.3 | 0.7  | 0.6 | 1.0 |
+| Throughput | 0.2 | 1.0 | 0.2  | 0.5 | 1.0 |
+| Power save | 0.2 | 0.1 | 1.0  | 0.5 | 1.0 |
 
-## Evidence layer (what the machine has actually been through)
+Change them per goal with **Weights…** next to the Autotune button, or
+`lpm-autotune <goal> --weights latency=1.2,footprint=0.8`. Range 0–3;
+stability cannot go below 0.5. The weights used are stored in the preset's
+`autotune` block.
 
-`Profile::gather` also reads `/proc/vmstat` (allocstall_*, pgscan_direct/kswapd,
-compact_stall, thp_fault_*, pswpout) and `/proc/pressure/{memory,cpu}` (avg300).
-Evidence never changes a goal's character; it only raises a safety margin or
-withholds an aggressive setting, and counters from a machine up for less than an
-hour (or with < 200k scanned pages) are ignored:
+## Memory and writeback
 
-- **watermark_scale_factor** is sized in bytes (~400 MiB of free headroom →
-  122 on 32 GB, 61 on 64 GB, 150 cap on 16 GB) instead of a fixed 125. If direct
-  reclaim is a regular event (≥ 10 % of scanned pages *and* ≥ 1000 allocstalls)
-  it is raised 1.5× and also applied below 16 GB.
-- **MGLRU min_ttl** trades thrashing for an OOM kill when the working set does
-  not fit, so it is switched off on < 12 GB RAM and while memory PSI is high
-  (some ≥ 10 % or full ≥ 1 %).
-- The report shows an "Observed" line with these numbers.
+| knob | rule |
+|------|------|
+| `vm.dirty_bytes` / `dirty_background_bytes` | sustained write rate × window (1 s / 0.25 s by default; 0.25–2 s scored), capped at 2 % of RAM and 1 GiB, floors 32 / 8 MiB, MiB-aligned. Rate: probe → `/sys/block/*/stat` → device class |
+| THP group (`enabled`, `max_ptes_none`, khugepaged pace, mTHP sizes) | searched jointly. `always` costs footprint (a touched 2 MB range takes a whole huge page; the split shrinker only returns it under pressure). With any mTHP size on, `max_ptes_none` is only 0 or 511 (kernel 7.x). Pace never above 2× the default. A `transparent_hugepage=` boot parameter is left alone |
+| `vm.watermark_scale_factor` | raised only with evidence (direct-reclaim share, allocstall, `kswapd_low_wmark_hit_quickly`); max 300 and 2 % of RAM / 1 GiB of headroom. That headroom leaves MemAvailable |
+| `vm.watermark_boost_factor` | never above 15000. Note: boosting *frees* page cache after fragmentation events; it does not hold memory |
+| `vm.min_free_kbytes` | never raised; a live value above 1 % of RAM / 256 MiB is repaired |
+| `mm.lru_gen_min_ttl` | scored against OOM risk; with the default weights it stays off |
+| `vm.compaction_proactiveness`, `vm.vfs_cache_pressure` | scored; at least one defrag path stays on with THP `always` |
 
-## Knobs added in this round (all verified against kernel sources)
+## Devices
 
-| Row | Source | Use |
-|---|---|---|
-| `sched.feat_next_buddy` | kernel/sched/features.h comment; tip commit aceccac58ad7 (Nov 2025) enabling it: waker/wakee share cache-hot data | Gaming, Desktop: on. Default-on on newer kernels, so it mostly pins the value |
-| `sched.feat_run_to_parity` | features.h: no wakeup preemption before 0-lag point or slice end (PREEMPT_SHORT can still cancel) | Throughput, PowerSave: on (fewer switches) |
-| `cpu.floor_freq` | amd-pstate docs (7.1, `amd_pstate_floor_freq`): frequency firmware throttles to first under power/thermal limits; kernel default = nominal | PowerSave `cpuinfo_min`, others `nominal`. n/a without CPPC Performance Priority (not on Zen 5 mobile today) |
-| `thp.khp_max_ptes_swap` | THP docs: swapped pages khugepaged reads back when collapsing (default 64) | 0 while swap exists, except Throughput |
+Runtime PM, ASPM, USB autosuspend, NVMe APST, HDA power save, Wi-Fi power save
+and suspend mode are scored with a stability cost. Boot parameters win:
+`usbcore.autosuspend=` → USB autosuspend is never touched; `pcie_aspm=force` →
+deeper ASPM states carry a larger risk; `pcie_aspm=off` → no ASPM rows.
+`kernel.watchdog` is never turned off (a hang would leave no log).
 
-Checked and deliberately **not** automated (no measured source for a fixed value,
-or the effect depends on the workload): `sched_domain` imbalance_pct/intervals
-(debugfs layout differs per kernel), `rcu_normal`/`rcu_expedited` (expedited
-grace periods skip idle CPUs, so the power argument is weak), EEVDF base slice,
-`percpu_pagelist_high_fraction`, `extfrag_threshold`, `vm.overcommit_*`,
-`laptop_mode`. CachyOS's 7.2 branch carries EEVDF/cgroup-mode patches
-(`cgroup_mode`, single runqueue) that are not mainline; they expose no stable knob to tune.
+## Hard limits (audit)
 
-Deliberately **not** automated: a global EEVDF slice (no measured source for a
-fixed value; EEVDF already favours short-slice tasks), `min_free_kbytes` (the
-kernel scales it itself), and sched_ext (scx_lavd is still in development and
-has open fps-regression reports on some CPUs – choose it per game after testing).
+`lpm-autotune audit` and tune-helper check every preset/scene/live value:
 
-EPP: Phoronix measured on Zen 5 that powersave + balance_performance had the
-lowest average CPU power, and on Ryzen mobile that uncapped games run at max
-clock with both performance and balance_performance – hence performance only on
-the game's CCD, balance_performance for desktop and power-bound throughput.
+- **refused**: `dirty_background_bytes` < 1 MiB, `dirty_bytes` < 4 MiB or ≤ background,
+  `watermark_scale_factor` > 1000, `min_free_kbytes` > 3 % of RAM, `vfs_cache_pressure` < 10
+- **warned** (with a fix): `max_ptes_none` ≠ 0/511 with mTHP on, khugepaged faster than 2×,
+  boost > 15000, reserves above 1 %, `zone_reclaim_mode` on a single node, …
 
-References: CachyOS-Settings (sysctl.d, THP tmpfiles), kernel docs (sysctl/vm, workqueue, sched-util-clamp, sched-energy,
-PM QoS sysfs ABI, NVMe APST commit), TuneD throughput/latency profiles, TLP
-defaults.
+tune-helper never stores or writes a refused value. Old presets/scenes (e.g. the
+int32-wrapped `dirty_bytes` 8192 / 290489958 from earlier GUI versions):
+
+    lpm-autotune audit            # list
+    lpm-autotune audit --fix      # repair (keeps *.json.bak), then re-save scenes in the GUI
+
+## Pressure guard
+
+After an apply that wrote memory/writeback knobs, a detached helper samples PSI
+once a second for 120 s. If `io full` stays ≥ max(2×before + 10, 25) % for 15 s,
+`memory full` ≥ max(before + 5, 10) % for 10 s, or allocation stalls exceed
+500/s for 10 s, it restores exactly those knobs, writes
+`/run/legion-power-manager/tune/guard.json` and a kernel-log warning (visible
+in the Health tab). It stops early when anything else changes those knobs.
+
+## Tools
+
+    sudo lpm-autotune probe       # ≤ 512 MiB / ≤ 4 s O_DIRECT write into an unlinked temp file
+    lpm-autotune report [SEC]     # meminfo, watermarks, THP/writeback settings, PSI, vmstat deltas
+    lpm-autotune <goal> --json    # full output incl. per-knob scores and constraint notes
+
+Baseline entries whose original came from TLP are listed as `tlp_originals` in
+the helper state: "restore" returns them to TLP's state, not the kernel default.

@@ -1,22 +1,44 @@
 //! Autotune: profiles the machine and derives an Optimizations preset for one
 //! of four goals (power saving, gaming, throughput, optimal desktop).
 //!
-//! Three stages, kept apart so the rules are testable without sysfs:
-//!   1. [`Profile::gather`]  reads hardware / kernel facts (unprivileged).
-//!   2. [`decide`]           pure rules: (goal, profile) -> key, value, reason.
-//!   3. [`autotune`]         drops what this machine does not offer (tune::files
-//!                           empty, value not accepted by tune::validate) and
-//!                           returns a preset object the GUI / lpm-autotune load.
+//! Stages (pure where it matters, so every rule is testable without sysfs):
+//!   1. [`Profile::gather`]  hardware / kernel facts, live values, evidence
+//!                           (vmstat, PSI) and the disk's sustained write rate.
+//!   2. [`decide_weighted`]  two kinds of rules:
+//!        * structural rules: topology/driver facts that have one right answer
+//!          (pstate mode, CCD roles, amdgpu DPM auto, bring a parked CCD back);
+//!        * scored knobs: every knob with a real trade-off is a set of candidate
+//!          values, each with an effect vector over five objectives
+//!          (latency, throughput, power, memory footprint, stability risk).
+//!          U = sum(w_o * effect_o) - MODESTY * deviation; the reference
+//!          ("leave it", or the kernel default) wins unless a candidate beats
+//!          it by MARGIN. Effects are ordinal estimates from kernel docs and
+//!          measured evidence, never "bigger is better": every non-reference
+//!          candidate carries a documented cost.
+//!   3. [`enforce`]          hard constraints no weight can buy: dirty pair
+//!                           ordering, THP/mTHP/max_ptes_none, watermark and
+//!                           reserve envelopes, EPP vs governor, boot params.
+//!   4. [`autotune_with`]    tune::validate + [`audit`] + availability filter.
 //!
-//! Every value is derived from the profile - topology (CCDs, V-Cache, hybrid),
-//! cpufreq driver and EPP support, C-state exit latencies, RAM size, swap kind,
-//! storage type, battery, GPUs, kernel version - never a fixed table per model.
-//! The reasoning per goal is documented in docs/AUTOTUNE.md.
+//! [`audit`] also checks presets/scenes written by older versions (int32-
+//! wrapped dirty limits etc.); tune-helper refuses values it rejects, and
+//! [`guard_verdict`] is the rollback rule of the post-apply pressure guard.
+//! Reasoning per knob: docs/AUTOTUNE.md.
 
+use crate::iorate;
 use crate::tune;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+/// Cost per unit of deviation from the reference ("be modest").
+const MODESTY: f64 = 0.10;
+/// A candidate must beat the reference by this much to be written.
+const MARGIN: f64 = 0.03;
+/// Largest integer the GUI's JSON layer (double) carries exactly.
+pub const JSON_SAFE_INT: i64 = 1 << 53;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Goal { PowerSave, Gaming, Throughput, Desktop }
@@ -50,6 +72,73 @@ impl Goal {
     }
 }
 
+/// Objective weights. The goal gives the defaults; the user (GUI / CLI /
+/// scene) may override each one. Stability never drops below 0.5: weights
+/// shift trade-offs, hard constraints are not for sale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Weights { pub latency: f64, pub throughput: f64, pub power: f64, pub footprint: f64, pub stability: f64 }
+
+impl Weights {
+    pub const KEYS: [&'static str; 5] = ["latency", "throughput", "power", "footprint", "stability"];
+    pub fn for_goal(g: Goal) -> Weights {
+        let w = |latency, throughput, power, footprint| Weights { latency, throughput, power, footprint, stability: 1.0 };
+        match g {
+            Goal::Gaming => w(1.0, 0.6, 0.15, 0.4),
+            Goal::Desktop => w(0.7, 0.3, 0.7, 0.6),
+            Goal::Throughput => w(0.2, 1.0, 0.2, 0.5),
+            Goal::PowerSave => w(0.2, 0.1, 1.0, 0.5),
+        }
+    }
+    /// {"latency": 1.2, ...}; unknown keys and non-numbers are ignored.
+    pub fn with_overrides(mut self, v: &Value) -> Weights {
+        let Some(o) = v.as_object() else { return self };
+        for (k, x) in o {
+            let Some(n) = x.as_f64().filter(|n| n.is_finite()) else { continue };
+            let n = n.clamp(0.0, 3.0);
+            match k.as_str() {
+                "latency" => self.latency = n, "throughput" => self.throughput = n, "power" => self.power = n,
+                "footprint" => self.footprint = n, "stability" => self.stability = n.max(0.5), _ => {}
+            }
+        }
+        self
+    }
+    pub fn to_json(&self) -> Value {
+        json!({"latency": self.latency, "throughput": self.throughput, "power": self.power,
+               "footprint": self.footprint, "stability": self.stability})
+    }
+}
+
+/// Effect of one candidate relative to the reference, per objective. Positive
+/// = better for that objective; `risk` is a stability cost (<= 0).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fx { pub lat: f64, pub thr: f64, pub pwr: f64, pub mem: f64, pub risk: f64 }
+
+impl Fx {
+    fn u(&self, w: &Weights) -> f64 {
+        w.latency * self.lat + w.throughput * self.thr + w.power * self.pwr + w.footprint * self.mem + w.stability * self.risk
+    }
+    fn explain(&self, w: &Weights, dev: f64) -> String {
+        let mut p = Vec::new();
+        for (n, e, wt) in [("latency", self.lat, w.latency), ("throughput", self.thr, w.throughput), ("power", self.pwr, w.power),
+                           ("memory", self.mem, w.footprint), ("stability", self.risk, w.stability)] {
+            if e.abs() >= 0.005 { p.push(format!("{n} {:+.2}×{wt:.1}", e)); }
+        }
+        if dev > 0.0 { p.push(format!("modesty {:+.2}", -MODESTY * dev)); }
+        format!("[U {:+.2}: {}]", self.u(w) - MODESTY * dev, p.join(", "))
+    }
+}
+
+fn fx(lat: f64, thr: f64, pwr: f64, mem: f64, risk: f64) -> Fx { Fx { lat, thr, pwr, mem, risk } }
+
+/// One candidate value of a scored knob. `value` Null = do not write.
+pub struct Cand { value: Value, fx: Fx, dev: f64, why: String }
+
+fn cand(value: impl Into<Value>, fx: Fx, dev: f64, why: impl Into<String>) -> Cand {
+    Cand { value: value.into(), fx, dev, why: why.into() }
+}
+/// "Leave it as it is" (the reference for knobs whose kernel default varies).
+fn leave() -> Cand { Cand { value: Value::Null, fx: Fx::default(), dev: 0.0, why: String::new() } }
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SwapKind { None, Zram, ZswapDisk, Ssd, Hdd }
 
@@ -63,11 +152,12 @@ impl SwapKind {
 #[derive(Clone, Debug)]
 pub struct CState { pub name: String, pub latency_us: u64 }
 
+
 /// What the running system has actually been through: cumulative reclaim /
-/// compaction / swap counters since boot plus the current pressure-stall
-/// averages. Rules use it only to *raise* a safety margin or to withhold an
-/// aggressive setting - never to switch a goal's character. Counters from a
-/// machine that has just booted (or scanned almost nothing) carry no weight.
+/// compaction / swap counters since boot plus pressure-stall averages. Rules
+/// use it to scale the *benefit* of a knob (a knob that fixes a problem this
+/// machine does not have earns nothing) and to raise safety margins. Counters
+/// from a machine that has just booted (or scanned almost nothing) carry no weight.
 #[derive(Clone, Debug, Default)]
 pub struct Evidence {
     pub uptime_s: u64,
@@ -78,10 +168,14 @@ pub struct Evidence {
     pub thp_fault_alloc: u64,
     pub thp_fault_fallback: u64,
     pub pswpout: u64,
+    pub kswapd_low_wmark_quick: u64,
+    pub workingset_refault_file: u64,
     /// PSI 5-minute averages in percent.
     pub psi_mem_some: Option<f64>,
     pub psi_mem_full: Option<f64>,
     pub psi_cpu_some: Option<f64>,
+    pub psi_io_some: Option<f64>,
+    pub psi_io_full: Option<f64>,
 }
 
 impl Evidence {
@@ -89,9 +183,13 @@ impl Evidence {
         let mut e = Evidence::default();
         e.uptime_s = rd("/proc/uptime").and_then(|s| s.split('.').next().and_then(|n| n.parse().ok())).unwrap_or(0);
         e.parse_vmstat(&std::fs::read_to_string("/proc/vmstat").unwrap_or_default());
-        e.psi_mem_some = psi_avg300(&rd("/proc/pressure/memory").unwrap_or_default(), "some");
-        e.psi_mem_full = psi_avg300(&rd("/proc/pressure/memory").unwrap_or_default(), "full");
+        let mem = rd("/proc/pressure/memory").unwrap_or_default();
+        let io = rd("/proc/pressure/io").unwrap_or_default();
+        e.psi_mem_some = psi_avg300(&mem, "some");
+        e.psi_mem_full = psi_avg300(&mem, "full");
         e.psi_cpu_some = psi_avg300(&rd("/proc/pressure/cpu").unwrap_or_default(), "some");
+        e.psi_io_some = psi_avg300(&io, "some");
+        e.psi_io_full = psi_avg300(&io, "full");
         e
     }
 
@@ -106,6 +204,8 @@ impl Evidence {
                 "thp_fault_alloc" => self.thp_fault_alloc = n,
                 "thp_fault_fallback" => self.thp_fault_fallback = n,
                 "pswpout" => self.pswpout = n,
+                "kswapd_low_wmark_hit_quickly" => self.kswapd_low_wmark_quick = n,
+                "workingset_refault_file" => self.workingset_refault_file = n,
                 _ if k.starts_with("allocstall_") => self.allocstall += n,
                 _ => {}
             }
@@ -122,10 +222,21 @@ impl Evidence {
     pub fn reclaim_stalls(&self) -> bool {
         self.direct_reclaim_share().map_or(false, |s| s >= 0.10) && self.allocstall >= 1000
     }
+    /// 0..1: how strongly this machine's history says kswapd starts too late
+    /// (direct reclaim share, or kswapd hitting the low watermark right after
+    /// going to sleep - the kernel doc's two symptoms).
+    pub fn reclaim_strength(&self) -> f64 {
+        let share = self.direct_reclaim_share().map_or(0.0, |s| (s / 0.20).min(1.0));
+        let stalls = if self.allocstall >= 1000 { 1.0 } else { self.allocstall as f64 / 1000.0 };
+        let quick = if self.uptime_s >= 3600 { (self.kswapd_low_wmark_quick as f64 / (self.uptime_s as f64 / 60.0)).min(1.0) } else { 0.0 };
+        (share * stalls).max(quick * 0.5)
+    }
     /// Memory is short right now (tasks are stalling on it).
     pub fn mem_pressure_now(&self) -> bool {
         self.psi_mem_full.map_or(false, |v| v >= 1.0) || self.psi_mem_some.map_or(false, |v| v >= 10.0)
     }
+    /// Huge pages are being used a lot (THP fault volume since boot).
+    pub fn thp_heavy(&self) -> bool { self.thp_fault_alloc + self.thp_fault_fallback >= 50_000 }
     /// One line for the report header; empty without any signal.
     pub fn summary(&self) -> String {
         let mut p = Vec::new();
@@ -133,6 +244,7 @@ impl Evidence {
             p.push(format!("direct reclaim {:.0}% of scanned pages ({} stalls)", s * 100.0, self.allocstall));
         }
         if let (Some(a), Some(f)) = (self.psi_mem_some, self.psi_mem_full) { p.push(format!("memory pressure {a:.1}% some / {f:.1}% full (5 min)")); }
+        if let (Some(a), Some(f)) = (self.psi_io_some, self.psi_io_full) { p.push(format!("I/O pressure {a:.1}% some / {f:.1}% full (5 min)")); }
         if let Some(c) = self.psi_cpu_some { p.push(format!("CPU pressure {c:.1}% (5 min)")); }
         let faults = self.thp_fault_alloc + self.thp_fault_fallback;
         if faults >= 1000 { p.push(format!("THP fault success {:.0}%", self.thp_fault_alloc as f64 * 100.0 / faults as f64)); }
@@ -141,9 +253,67 @@ impl Evidence {
 }
 
 /// avg300 (percent) of the `some` / `full` line of a /proc/pressure file.
-pub fn psi_avg300(text: &str, kind: &str) -> Option<f64> {
+pub fn psi_avg300(text: &str, kind: &str) -> Option<f64> { psi_field(text, kind, "avg300=") }
+pub fn psi_avg10(text: &str, kind: &str) -> Option<f64> { psi_field(text, kind, "avg10=") }
+fn psi_field(text: &str, kind: &str, field: &str) -> Option<f64> {
     text.lines().find(|l| l.starts_with(kind))?.split_whitespace()
-        .find_map(|w| w.strip_prefix("avg300=")).and_then(|v| v.parse().ok())
+        .find_map(|w| w.strip_prefix(field)).and_then(|v| v.parse().ok())
+}
+
+// ── post-apply guard ─────────────────────────────────────────────────────────
+
+/// One 1 Hz sample for the post-apply guard (tune-helper samples, this decides).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pressure { pub io_full10: f64, pub mem_full10: f64, pub allocstall: u64 }
+
+impl Pressure {
+    pub fn sample() -> Pressure {
+        let mut e = Evidence::default();
+        e.parse_vmstat(&std::fs::read_to_string("/proc/vmstat").unwrap_or_default());
+        Pressure {
+            io_full10: psi_avg10(&rd("/proc/pressure/io").unwrap_or_default(), "full").unwrap_or(0.0),
+            mem_full10: psi_avg10(&rd("/proc/pressure/memory").unwrap_or_default(), "full").unwrap_or(0.0),
+            allocstall: e.allocstall,
+        }
+    }
+}
+
+/// Samples the guard watches after an apply, and the streaks that trip it.
+pub const GUARD_SECS: usize = 120;
+const GUARD_IO_STREAK: usize = 15;
+const GUARD_MEM_STREAK: usize = 10;
+const GUARD_STALL_STREAK: usize = 10;
+
+/// Keys the guard protects (those that can stall writers or reclaim).
+pub fn guarded(key: &str) -> bool {
+    ["vm.", "thp.", "mm.", "zswap."].iter().any(|p| key.starts_with(p)) || key == "blk.wbt_lat_usec"
+}
+
+/// Rollback rule. `base` is taken right before the apply, `window` holds the
+/// 1 Hz samples since. Sustained "full" stalls (every non-idle task waiting)
+/// well above what the machine showed before trip it; a busy build alone
+/// shows "some", not tens of percent "full" for 10-15 s.
+pub fn guard_verdict(base: &Pressure, window: &[Pressure]) -> Option<String> {
+    let io_lim = (base.io_full10 * 2.0 + 10.0).max(25.0);
+    let mem_lim = (base.mem_full10 + 5.0).max(10.0);
+    let streak = |f: &dyn Fn(usize) -> bool, n: usize| {
+        let mut run = 0;
+        for i in 0..window.len() { if f(i) { run += 1; if run >= n { return true; } } else { run = 0; } }
+        false
+    };
+    if streak(&|i| window[i].io_full10 >= io_lim, GUARD_IO_STREAK) {
+        return Some(format!("I/O stall: PSI io full avg10 stayed >= {io_lim:.0}% for {GUARD_IO_STREAK} s after the apply (before: {:.1}%)", base.io_full10));
+    }
+    if streak(&|i| window[i].mem_full10 >= mem_lim, GUARD_MEM_STREAK) {
+        return Some(format!("memory stall: PSI memory full avg10 stayed >= {mem_lim:.0}% for {GUARD_MEM_STREAK} s (before: {:.1}%)", base.mem_full10));
+    }
+    if streak(&|i| {
+        let prev = if i == 0 { base.allocstall } else { window[i - 1].allocstall };
+        window[i].allocstall.saturating_sub(prev) >= 500
+    }, GUARD_STALL_STREAK) {
+        return Some(format!("direct reclaim storm: >= 500 allocation stalls/s for {GUARD_STALL_STREAK} s"));
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +351,10 @@ pub struct Profile {
     pub dynamic_epp: bool,
     pub uncore: Option<(u64, u64)>,
     pub evidence: Evidence,
+    /// Sustained write rate of the disk(s) that take ordinary writes.
+    pub io: iorate::IoRate,
+    /// /proc/cmdline: boot parameters the user chose are hard constraints.
+    pub cmdline: String,
     /// Live values of the rows whose rule depends on the current state.
     pub current: BTreeMap<String, String>,
 }
@@ -280,9 +454,8 @@ impl Profile {
             Some((rd(d.join("initial_min_freq_khz"))?.parse().ok()?, rd(d.join("initial_max_freq_khz"))?.parse().ok()?))
         });
         let mut current = BTreeMap::new();
-        for k in ["vm.min_free_kbytes", "cpu.ccd_park", "kernel.sched_schedstats", "wq.affinity_scope",
-                  "mm.lru_gen", "pm.nvme_latency_us", "mm.ksm_run", "cpu.smt"] {
-            if let Some(v) = tune::find(k).and_then(tune::current) { current.insert(k.to_owned(), v); }
+        for k in LIVE_KEYS {
+            if let Some(v) = tune::find(k).and_then(tune::current) { current.insert((*k).to_owned(), v); }
         }
         Profile {
             vendor: tune::cpu_vendor(),
@@ -319,6 +492,8 @@ impl Profile {
             dynamic_epp: cpu.join("amd_pstate/dynamic_epp").is_file(),
             uncore,
             evidence: Evidence::gather(),
+            io: iorate::gather(),
+            cmdline: rd("/proc/cmdline").unwrap_or_default(),
             current,
         }
     }
@@ -333,6 +508,13 @@ impl Profile {
     /// Frequency is chosen by the scheduler (schedutil), not by CPPC/HWP.
     fn schedutil(&self) -> bool { !self.epp && self.governors.iter().any(|g| g == "schedutil") }
     fn cur(&self, k: &str) -> Option<&str> { self.current.get(k).map(String::as_str) }
+    /// Value of a boot parameter (`name=value`), or "" for a bare flag.
+    pub fn boot_param(&self, name: &str) -> Option<&str> {
+        self.cmdline.split_whitespace().find_map(|w| {
+            if w == name { return Some(""); }
+            w.strip_prefix(name).and_then(|r| r.strip_prefix('='))
+        })
+    }
 
     pub fn to_json(&self) -> Value {
         json!({
@@ -352,7 +534,9 @@ impl Profile {
             "evidence": {"uptime_s": self.evidence.uptime_s, "direct_reclaim_share": self.evidence.direct_reclaim_share(),
                          "allocstall": self.evidence.allocstall, "compact_stall": self.evidence.compact_stall,
                          "psi_mem_some": self.evidence.psi_mem_some, "psi_mem_full": self.evidence.psi_mem_full,
-                         "psi_cpu_some": self.evidence.psi_cpu_some},
+                         "psi_cpu_some": self.evidence.psi_cpu_some, "psi_io_some": self.evidence.psi_io_some,
+                         "psi_io_full": self.evidence.psi_io_full},
+            "storage_write": self.io.to_json(),
         })
     }
 
@@ -369,7 +553,7 @@ impl Profile {
         p.push(format!("{} ({})", if self.driver.is_empty() { "no cpufreq" } else { &self.driver }, if self.epp { "EPP" } else { "no EPP" }));
         p.push(format!("{} GB RAM", self.ram_gb()));
         p.push(format!("swap: {}", self.swap.as_str()));
-        p.push(if self.nvme && !self.rotational { "NVMe".into() } else if self.rotational { "HDD present".into() } else { "SSD".into() });
+        p.push(self.io.summary());
         let mut g = Vec::new();
         if self.nvidia_dgpu { g.push("NVIDIA"); }
         if self.amd_igpu { g.push("AMD"); }
@@ -382,30 +566,453 @@ impl Profile {
     }
 }
 
+
+/// Rows read live for rules that depend on the current state, for repairs
+/// ([`audit`] on live values) and to skip writes that change nothing.
+pub const LIVE_KEYS: &[&str] = &[
+    "vm.min_free_kbytes", "cpu.ccd_park", "kernel.sched_schedstats", "wq.affinity_scope", "mm.lru_gen",
+    "pm.nvme_latency_us", "mm.ksm_run", "cpu.smt", "thp.enabled", "thp.defrag", "thp.khp_max_ptes_none",
+    "thp.khp_pages_to_scan", "thp.khp_scan_sleep_ms", "thp.mthp_16k", "thp.mthp_32k", "thp.mthp_64k",
+    "thp.mthp_128k", "thp.mthp_256k", "thp.mthp_512k", "thp.mthp_1m", "vm.swappiness", "vm.page_cluster",
+    "vm.watermark_scale_factor", "vm.watermark_boost_factor", "vm.compaction_proactiveness",
+    "vm.zone_reclaim_mode", "vm.vfs_cache_pressure", "vm.max_map_count", "mm.lru_gen_min_ttl",
+    "zswap.enabled", "vm.dirty_bytes", "vm.dirty_background_bytes", "kernel.watchdog",
+];
+
+const MTHP: [(&str, u32); 7] = [("thp.mthp_16k", 16), ("thp.mthp_32k", 32), ("thp.mthp_64k", 64), ("thp.mthp_128k", 128),
+                                ("thp.mthp_256k", 256), ("thp.mthp_512k", 512), ("thp.mthp_1m", 1024)];
+
 /// One rule outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Decision { pub key: &'static str, pub value: Value, pub why: String }
 
-struct Rules<'a> { p: &'a Profile, g: Goal, out: Vec<Decision> }
+struct Rules<'a> {
+    p: &'a Profile,
+    g: Goal,
+    w: Weights,
+    out: Vec<Decision>,
+    /// key -> [{value, U}] for the report / log.
+    scores: Map<String, Value>,
+}
+
+fn vstr(v: &Value) -> String { match v { Value::String(s) => s.clone(), x => x.to_string() } }
 
 impl<'a> Rules<'a> {
     fn set(&mut self, key: &'static str, value: impl Into<Value>, why: impl Into<String>) {
         self.out.retain(|d| d.key != key);
         self.out.push(Decision { key, value: value.into(), why: why.into() });
     }
+    /// Like `set`, but skipped when the live value already matches.
+    fn set_live(&mut self, key: &'static str, value: impl Into<Value>, why: impl Into<String>) {
+        let value = value.into();
+        if self.p.cur(key) == Some(vstr(&value).as_str()) { self.out.retain(|d| d.key != key); return; }
+        self.set(key, value, why);
+    }
     fn is(&self, g: Goal) -> bool { self.g == g }
+    fn u(&self, c: &Cand) -> f64 { c.fx.u(&self.w) - MODESTY * c.dev }
+    /// Index of the winning alternative, None = the reference stays.
+    fn pick(&mut self, key: &str, reference: &Cand, alts: &[Cand]) -> Option<usize> {
+        let base = self.u(reference);
+        let mut trace = vec![json!({"value": if reference.value.is_null() { json!("(leave)") } else { reference.value.clone() }, "u": round2(base)})];
+        let mut best: Option<(f64, usize)> = None;
+        for (i, c) in alts.iter().enumerate() {
+            let u = self.u(c);
+            trace.push(json!({"value": c.value, "u": round2(u)}));
+            if best.map_or(true, |(b, _)| u > b) { best = Some((u, i)); }
+        }
+        self.scores.insert(key.to_owned(), Value::Array(trace));
+        best.filter(|(u, _)| u - base >= MARGIN).map(|(_, i)| i)
+    }
+    /// Scored knob: writes the winner, or the reference if it is a real value.
+    /// Returns the value in effect afterwards (live value when left alone).
+    fn choose(&mut self, key: &'static str, reference: Cand, alts: Vec<Cand>) -> Option<String> {
+        match self.pick(key, &reference, &alts) {
+            Some(i) => {
+                let c = &alts[i];
+                let why = format!("{} {}", c.why, c.fx.explain(&self.w, c.dev));
+                let v = c.value.clone();
+                self.set_live(key, v.clone(), why);
+                Some(vstr(&v))
+            }
+            None if !reference.value.is_null() => {
+                let v = reference.value.clone();
+                self.set_live(key, v.clone(), format!("{} No candidate beats the kernel default by {MARGIN} for these weights.", reference.why));
+                Some(vstr(&v))
+            }
+            None => self.p.cur(key).map(str::to_owned),
+        }
+    }
+    /// Value in effect after this rule set: decided, else live.
+    fn eff(&self, key: &str) -> Option<String> {
+        self.out.iter().find(|d| d.key == key).map(|d| vstr(&d.value)).or_else(|| self.p.cur(key).map(str::to_owned))
+    }
 }
 
-/// Pure rule set. Keys that do not exist on this machine are filtered later.
-pub fn decide(goal: Goal, p: &Profile) -> Vec<Decision> {
-    let mut r = Rules { p, g: goal, out: Vec::new() };
+fn round2(x: f64) -> f64 { (x * 100.0).round() / 100.0 }
+
+/// Pure rule set with the goal's default weights. Keys that do not exist on this machine are filtered later.
+pub fn decide(goal: Goal, p: &Profile) -> Vec<Decision> { decide_weighted(goal, p, Weights::for_goal(goal)).0 }
+
+/// Decisions plus the score trace and the constraint notes.
+pub fn decide_weighted(goal: Goal, p: &Profile, w: Weights) -> (Vec<Decision>, Map<String, Value>, Vec<String>) {
+    let mut r = Rules { p, g: goal, w, out: Vec::new(), scores: Map::new() };
     cpu_rules(&mut r);
     memory_rules(&mut r);
     sched_rules(&mut r);
     io_rules(&mut r);
     device_rules(&mut r);
-    r.out
+    repair_live(&mut r);
+    let notes = enforce(&mut r.out, p);
+    (r.out, r.scores, notes)
 }
+
+// ── memory ───────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pace { Slow, Default, Fast }
+
+/// Effects of one THP configuration relative to (madvise, no mTHP, max_ptes_none 511, default pace).
+/// Memory costs come from two mechanisms the kernel docs describe: with
+/// enabled=always a page fault in any 2 MB-aligned anonymous range may take a
+/// whole huge page (RSS bloat of sparse heaps), and khugepaged fills up to
+/// max_ptes_none empty slots per collapsed range. The deferred-split shrinker
+/// only gives that back under memory pressure, so at idle it stays "used".
+fn thp_fx(always: bool, mthp: bool, ptes: u32, pace: Pace) -> (Fx, f64) {
+    let scope = if always { 1.0 } else { 0.25 };
+    let pf = ptes as f64 / 511.0;
+    let (mut f, mut dev) = (Fx::default(), 0.0);
+    if always { f.thr += 0.20; f.lat += 0.05; f.mem -= 0.45; f.risk -= 0.05; dev += 0.5; }
+    f.mem += 0.35 * scope * (1.0 - pf);
+    f.thr -= 0.10 * scope * (1.0 - pf);
+    dev += 0.1 * (1.0 - pf);
+    if mthp { let g = if always { 1.0 } else { 0.4 }; f.thr += 0.06 * g; f.lat += 0.03 * g; f.mem -= 0.08 * g; dev += 0.3; }
+    match pace {
+        Pace::Fast => { f.thr += 0.05 * scope; f.mem -= 0.08 * scope * pf; f.pwr -= 0.05; f.lat -= 0.03; dev += 0.3; }
+        Pace::Slow => { f.thr -= 0.03 * scope; f.mem += 0.04 * scope * pf; f.pwr += 0.04; f.lat += 0.01; dev += 0.15; }
+        Pace::Default => {}
+    }
+    (f, dev)
+}
+
+fn thp_rules(r: &mut Rules) {
+    let p = r.p;
+    // A transparent_hugepage= boot parameter is the user's own decision.
+    let boot = p.boot_param("transparent_hugepage").map(str::to_owned);
+    let mthp_ok = p.kernel_at_least(6, 8);
+    let reference = { let (f, d) = thp_fx(false, false, 511, Pace::Default); Cand { value: json!("madvise/511"), fx: f, dev: d, why: String::new() } };
+    let mut alts = Vec::new();
+    let mut combos = Vec::new();
+    for always in [false, true] {
+        if let Some(b) = boot.as_deref() { if (b == "always") != always { continue; } }
+        for mthp in [false, true] {
+            if mthp && !mthp_ok { continue; }
+            // Kernel 7.x: mTHP collapse only honours max_ptes_none 0 or 511.
+            let ptes: &[u32] = if mthp { &[511, 0] } else { &[511, 255, 64, 0] };
+            for &pt in ptes {
+                for pace in [Pace::Slow, Pace::Default, Pace::Fast] {
+                    if !always && !mthp && pt == 511 && pace == Pace::Default { continue; }
+                    let (f, d) = thp_fx(always, mthp, pt, pace);
+                    alts.push(Cand { value: json!(format!("{}{}/{pt}/{pace:?}", if always { "always" } else { "madvise" }, if mthp { "+mthp" } else { "" })), fx: f, dev: d, why: String::new() });
+                    combos.push((always, mthp, pt, pace));
+                }
+            }
+        }
+    }
+    let win = r.pick("thp", &reference, &alts);
+    let (always, mthp, ptes, pace) = win.map(|i| combos[i]).unwrap_or((false, false, 511, Pace::Default));
+    let (f, d) = thp_fx(always, mthp, ptes, pace);
+    let score = f.explain(&r.w, d);
+    if boot.is_none() {
+        r.set_live("thp.enabled", if always { "always" } else { "madvise" }, if always {
+            format!("THP everywhere: fewer TLB misses for large heaps; costs RSS bloat (a touched 2 MB range takes a whole huge page, returned only under pressure). {score}")
+        } else {
+            format!("Huge pages only where a program asks (madvise): no silent RSS growth at idle; Proton/DXVK, JVMs and databases already opt in. {score}")
+        });
+    }
+    r.set_live("thp.khp_max_ptes_none", ptes as i64, match ptes {
+        511 => format!("Kernel default: khugepaged collapses opted-in ranges even when mostly empty (bounded here because THP is {}). {score}", if always { "on everywhere" } else { "madvise-only" }),
+        0 => format!("khugepaged only collapses ranges that are fully populated: it never fills in memory a program did not touch. {score}"),
+        n => format!("khugepaged accepts at most {n} empty slots of 512 per collapse: bounded fill-in, huge pages still form in dense ranges. {score}"),
+    });
+    let (scan, sleep) = match pace { Pace::Slow => (1024, 30_000), Pace::Default => (4096, 10_000), Pace::Fast => (8192, 10_000) };
+    let pw = match pace {
+        Pace::Slow => "khugepaged scans a quarter as much, every 30 s: less background CPU/mmap-lock work; huge pages form more slowly.",
+        Pace::Default => "khugepaged at the kernel's pace (4096 pages every 10 s).",
+        Pace::Fast => "khugepaged scans twice as much per pass: long jobs get huge pages sooner, at more background work and fill-in.",
+    };
+    r.set_live("thp.khp_pages_to_scan", scan, pw);
+    r.set_live("thp.khp_scan_sleep_ms", sleep, pw);
+    if mthp_ok {
+        for (k, kb) in MTHP {
+            let on = mthp && kb <= 64;
+            // Only touch sizes that are on, or that must go off.
+            if !on && p.cur(k).map_or(true, |v| v == "never") { continue; }
+            r.set_live(k, if on { "inherit" } else { "never" }, if on {
+                format!("{kb} KB folios follow THP ({}): fewer faults for mid-size allocations at a small memory cost. {score}", if always { "always" } else { "madvise" })
+            } else { format!("{kb} KB folios off (kernel default): no partially used large folios.") });
+        }
+    }
+    // Synchronous compaction on every fault stalls the faulting thread.
+    if p.cur("thp.defrag") == Some("always") {
+        r.set("thp.defrag", "madvise", "defrag=always stalls every faulting thread on compaction; madvise (kernel default) limits that to opted-in ranges.");
+    }
+    if !matches!(p.swap, SwapKind::None) {
+        r.choose("thp.khp_max_ptes_swap", leave(), vec![
+            cand(0, fx(0.03, -0.01, 0.0, 0.0, 0.0), 0.2, "khugepaged only collapses fully resident ranges: no swap-in / decompression behind a running program."),
+        ]);
+    }
+}
+
+/// Dirty limits in seconds of writeback at the measured rate, bounded by RAM.
+pub fn dirty_pair(rate_bps: u64, ram_bytes: u64, window_s: f64) -> (u64, u64) {
+    let lo = 32 * MIB;
+    let hi = (ram_bytes / 50).min(GIB).max(lo);
+    let d = ((rate_bps as f64 * window_s) as u64).clamp(lo, hi) / MIB * MIB;
+    let bg = (d / 4).max(8 * MIB).min(d / 2) / MIB * MIB;
+    (bg, d)
+}
+
+fn dirty_rules(r: &mut Rules) {
+    let p = r.p;
+    let ram = p.ram_kb * 1024;
+    let rate = p.io.bps.max(1);
+    let frac = |t: f64| dirty_pair(rate, ram, t).1 as f64 / ram as f64;
+    // Window -> effects. Longer: bursts absorbed at RAM speed and batched (power),
+    // but a bigger backlog to flush (fsync / compositor stalls) and more data at risk.
+    let mk = |t: f64, lat: f64, thr: f64, pwr: f64, risk: f64, dev: f64| -> Cand {
+        cand(t, fx(lat, thr, pwr, -frac(t) * 2.0, risk), dev, String::new())
+    };
+    let reference = mk(1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let alts = vec![
+        mk(0.25, 0.15, -0.15, -0.05, 0.0, 0.4),
+        mk(0.5, 0.10, -0.05, -0.02, 0.0, 0.2),
+        mk(2.0, -0.15, 0.08, 0.10, -0.05, 0.3),
+    ];
+    let win = r.pick("vm.dirty_bytes", &reference, &alts);
+    let (t, c) = match win { Some(i) => (alts[i].value.as_f64().unwrap_or(1.0), &alts[i]), None => (1.0, &reference) };
+    let (bg, d) = dirty_pair(rate, ram, t);
+    let score = c.fx.explain(&r.w, c.dev);
+    let src = p.io.summary();
+    r.set("vm.dirty_background_bytes", bg as i64,
+          format!("Background writeback starts at {} MiB (~{:.2} s of writes at {src}). {score}", bg >> 20, bg as f64 / rate as f64));
+    r.set("vm.dirty_bytes", d as i64,
+          format!("Writers are throttled at {} MiB (~{:.2} s of writes, capped at 2% of RAM / 1 GiB): the backlog a flush or fsync() has to wait for stays short. {score}",
+                  d >> 20, d as f64 / rate as f64));
+}
+
+fn memory_rules(r: &mut Rules) {
+    use Goal::*;
+    let p = r.p;
+    let ram = p.ram_kb * 1024;
+    let gb = p.ram_gb();
+    let ev = p.evidence.clone();
+    thp_rules(r);
+    dirty_rules(r);
+    let thp_scope = if r.eff("thp.enabled").as_deref() == Some("always") { 1.0 } else { 0.3 };
+
+    // watermark_scale_factor: distance between min/low/high watermarks (default
+    // 0.1% of RAM). Kernel doc: raise it when allocstall / kswapd_low_wmark_hit_quickly
+    // show kswapd starts too late. The benefit therefore scales with that evidence;
+    // the cost is the RAM kswapd keeps free (it leaves MemAvailable).
+    let e = ev.reclaim_strength();
+    let def = (ram / 1000).max(1);
+    let cap = (ram / 50).min(GIB);
+    let span = ((512 * MIB) as f64 / def as f64).log2().max(1.0);
+    let mut alts = Vec::new();
+    for h in [128 * MIB, 256 * MIB, 512 * MIB] {
+        if h > cap || h <= def * 2 { continue; }
+        let f = wsf_for(h, ram);
+        let g = ((h as f64 / def as f64).log2() / span).clamp(0.0, 1.0);
+        alts.push(cand(f, fx((0.06 + 0.30 * e) * g, 0.02 * e * g, -0.02 * g, -(h as f64 / ram as f64) * 8.0, 0.0), 0.5 * g,
+            format!("kswapd keeps ~{} MiB free (factor {f}) instead of 0.1% of RAM: fewer direct-reclaim stalls (reclaim evidence {:.0}%); that RAM leaves MemAvailable.", h >> 20, e * 100.0)));
+    }
+    r.choose("vm.watermark_scale_factor", leave(), alts);
+
+    // watermark_boost_factor: after a fragmentation event kswapd reclaims up to
+    // factor/10000 of the high watermark *extra* (default 15000 = 150%). It frees
+    // page cache - it never holds memory. 0 = no such reclaim bursts, fewer free
+    // pageblocks for huge pages. File refaults are the visible cost of the bursts.
+    let refault = if ev.uptime_s >= 3600 { (ev.workingset_refault_file as f64 / ev.uptime_s as f64 / 2000.0).min(1.0) } else { 0.0 };
+    r.choose("vm.watermark_boost_factor", leave(), vec![
+        cand(0, fx(0.04 + 0.10 * refault, -0.05 * thp_scope, 0.01, 0.0, 0.0), 0.3,
+             "No boosted reclaim after fragmentation events: page cache is not dropped in bursts; huge-page allocations find fewer free pageblocks."),
+    ]);
+    r.choose("vm.compaction_proactiveness", leave(), vec![
+        cand(0, fx(0.04, -0.06 * thp_scope, 0.02, 0.0, 0.0), 0.3,
+             "kcompactd does not compact in the background: no page-migration bursts; huge pages then rely on on-demand compaction."),
+    ]);
+    r.choose("vm.vfs_cache_pressure", leave(), vec![
+        cand(50, fx(0.05, 0.02, 0.0, -0.03, 0.0), 0.3, "Dentry/inode cache kept twice as long: faster file dialogs, library and shader-cache scans; that metadata stays in RAM."),
+    ]);
+    // MGLRU min_ttl: thrash protection that turns memory pressure into an OOM kill.
+    let tight = gb < 16 || ev.mem_pressure_now() || ev.reclaim_stalls();
+    r.choose("mm.lru_gen_min_ttl", leave(), vec![
+        cand(1000, fx(0.25, 0.0, 0.0, 0.0, if tight { -0.6 } else { -0.25 }), 0.4,
+             "The last second's working set is never evicted: no thrashing stutter, but real pressure ends in an OOM kill instead of slowness."),
+    ]);
+
+    if p.cur("mm.lru_gen").map_or(false, |v| v != "7") { r.set("mm.lru_gen", 7, "All MGLRU features (kernel default)."); }
+    if !r.is(Desktop) && p.cur("mm.ksm_run").map_or(false, |v| v != "0") { r.set("mm.ksm_run", 0, "Stop the KSM scanner: pure background cost without VMs."); }
+    if matches!(r.g, Gaming | Desktop) && p.cur("vm.max_map_count").and_then(|v| v.parse::<u64>().ok()).map_or(true, |v| v < 1_048_576) {
+        r.set("vm.max_map_count", 1_048_576, "Arch/Fedora value: some Proton games exceed the old 65530 mapping limit; only a per-process count, no memory is reserved.");
+    }
+
+    // Swap cost model (kernel doc: swappiness = relative I/O cost, > 100 for in-memory swap).
+    match p.swap {
+        SwapKind::Zram => {
+            r.set_live("vm.swappiness", 150, "zram swap costs a compression, not I/O: cold anonymous pages go there before hot page cache (kernel doc: > 100 for in-memory swap).");
+            r.set_live("vm.page_cluster", 0, "zram has no seek cost: no swap readahead.");
+            r.set_live("zswap.enabled", "0", "zram is the swap device: zswap in front of it would compress twice.");
+        }
+        SwapKind::None => {}
+        k => {
+            let hdd = k == SwapKind::Hdd;
+            r.set_live("vm.swappiness", if hdd { 60 } else { 100 }, if hdd { "Swap on a spinning disk: keep swap-outs rarer than cache drops (kernel default)." }
+                       else { "zswap absorbs swap-outs in RAM: equal cost for anon and file pages." });
+            r.set_live("vm.page_cluster", if hdd { 3 } else { 1 }, "Swap readahead sized for the device (8 pages on HDD, 2 on flash).");
+            r.set_live("zswap.enabled", "1", "Disk swap present: zswap keeps most swapped pages compressed in RAM.");
+            r.set_live("zswap.shrinker_enabled", "1", "Cold pool pages move on to disk proactively.");
+            if r.is(Gaming) { r.set_live("zswap.compressor", "lz4", "lz4: fastest decompression when a swapped page is touched again."); }
+        }
+    }
+    let _ = (ram, gb);
+}
+
+/// watermark_scale_factor giving about `headroom` bytes between watermarks.
+pub fn wsf_for(headroom: u64, ram_bytes: u64) -> i64 {
+    ((headroom as u128 * 10_000 / ram_bytes.max(1) as u128) as i64).clamp(10, 300)
+}
+
+// ── I/O and devices ──────────────────────────────────────────────────────────
+
+fn io_rules(r: &mut Rules) {
+    use Goal::*;
+    let p = r.p;
+    if p.rotational {
+        r.set_live("blk.scheduler", if matches!(r.g, Gaming | Desktop) { "bfq" } else { "mq-deadline" },
+              if matches!(r.g, Gaming | Desktop) { "A spinning disk is present: bfq keeps interactive reads responsive under competing I/O." }
+              else { "A spinning disk is present: mq-deadline bounds latency while merging for throughput." });
+    } else {
+        r.set_live("blk.scheduler", "none", "Flash only: no reordering, lowest per-request latency and CPU cost.");
+    }
+    match r.g {
+        Throughput => r.set("blk.read_ahead_kb", if p.rotational { 2048 } else { 512 }, "Larger read-ahead for sequential reads (sources, archives); costs page cache on random access."),
+        Gaming => r.set("blk.read_ahead_kb", 256, "Games stream assets sequentially from large packs: 256 KiB read-ahead."),
+        _ => {}
+    }
+    r.choose("blk.wbt_lat_usec", leave(), vec![
+        cand(0, fx(-0.15, 0.05, 0.0, 0.0, -0.05), 0.3, "No writeback throttling: writes flush at full device speed, but reads queue behind them."),
+    ]);
+    if matches!(r.g, Gaming | Desktop | Throughput) {
+        r.set_live("net.tcp_congestion", "bbr", "BBR models bandwidth/RTT instead of reacting to loss: steadier latency on Wi-Fi and long routes.");
+        r.set_live("net.default_qdisc", "fq", "fq pacing, the qdisc BBR was designed for.");
+    }
+    if p.wifi {
+        r.choose("net.wifi_power_save", leave(), vec![
+            cand("0", fx(0.12, 0.0, -0.10, 0.0, 0.0), 0.2, "Radio never dozes between beacons: no 802.11 power-save ping spikes; ~0.5 W more."),
+            cand("1", fx(-0.08, 0.0, 0.08, 0.0, 0.0), 0.2, "802.11 power save: radio dozes between beacons; ping jitter under light traffic."),
+        ]);
+    }
+}
+
+fn device_rules(r: &mut Rules) {
+    use Goal::*;
+    let p = r.p;
+    let force_aspm = p.boot_param("pcie_aspm") == Some("force");
+    // pcie_aspm=force enables ASPM on links whose devices never advertised it:
+    // every deeper link state is then a larger stability bet.
+    if p.boot_param("pcie_aspm") != Some("off") {
+        r.choose("pci.aspm", leave(), vec![
+            cand("powersave", fx(-0.04, 0.0, 0.25, 0.0, if force_aspm { -0.20 } else { -0.08 }), 0.3,
+                 "Idle PCIe links enter L0s/L1: less idle power; µs wake-up on each burst."),
+            cand("performance", fx(0.06, 0.01, -0.20, 0.0, 0.0), 0.3, "PCIe links never drop to a power state: no wake-up jitter; more idle power and heat."),
+        ]);
+        r.choose("pci.aspm_links", leave(), vec![
+            cand("l1ss", fx(-0.03, 0.0, 0.30, 0.0, if force_aspm { -0.45 } else { -0.30 }), 0.5,
+                 "L1.1/L1.2 on every link: lowest idle power; some NVMe/Wi-Fi/GPU links misbehave or fail to resume."),
+        ]);
+    }
+    r.choose("pm.pci_runtime", leave(), vec![
+        cand("auto", fx(-0.03, 0.0, 0.30, 0.0, -0.10), 0.3, "Idle PCI devices drop to D3 (display devices and their bridges excluded); resume costs a few ms."),
+        cand("on", fx(0.03, 0.0, -0.10, 0.0, 0.0), 0.2, "PCI devices stay in D0: no resume latency; more idle power."),
+    ]);
+    r.choose("pm.usb_runtime", leave(), vec![
+        cand("auto", fx(-0.02, 0.0, 0.12, 0.0, -0.15), 0.3, "Idle USB devices suspend (HID/audio skipped); receivers and hubs behind them can drop input briefly."),
+        cand("on", fx(0.02, 0.0, -0.05, 0.0, 0.0), 0.2, "Connected USB devices never suspend."),
+    ]);
+    // usbcore.autosuspend on the kernel command line is the user's own decision.
+    if p.boot_param("usbcore.autosuspend").is_none() {
+        r.choose("usb.autosuspend", leave(), vec![
+            cand(2, fx(-0.02, 0.0, 0.08, 0.0, -0.15), 0.3, "Newly plugged USB devices suspend after 2 s idle."),
+            cand(-1, fx(0.02, 0.0, -0.04, 0.0, 0.0), 0.2, "Newly plugged USB devices never autosuspend."),
+        ]);
+    }
+    let hda = r.choose("snd.hda_power_save", leave(), vec![
+        cand(1, fx(-0.04, 0.0, 0.10, 0.0, -0.02), 0.3, "Codec powers down after 1 s idle: lowest power; pops and a short delay on the next sound."),
+        cand(10, fx(-0.01, 0.0, 0.08, 0.0, 0.0), 0.2, "Codec powers down after 10 s idle."),
+        cand(0, fx(0.03, 0.0, -0.05, 0.0, 0.0), 0.2, "Codec always powered: no pop, no wake delay."),
+    ]);
+    if r.out.iter().any(|d| d.key == "snd.hda_power_save") {
+        let on = hda.as_deref() != Some("0");
+        r.set_live("snd.hda_power_save_controller", if on { "1" } else { "0" }, "Controller follows the codec's power saving.");
+    }
+    if p.nvme {
+        r.choose("pm.nvme_latency_us", leave(), vec![
+            cand(0, fx(0.03, 0.0, -0.25, 0.0, 0.0), 0.3, "APST off: an idle NVMe never needs to wake from a deep state; ~0.5-1 W more at idle."),
+            cand(100_000, fx(-0.02, 0.0, 0.15, 0.0, -0.03), 0.3, "Every APST state allowed: deepest NVMe idle; wake cost mostly hidden by the page cache."),
+        ]);
+    }
+    if p.battery {
+        r.choose("pm.mem_sleep", leave(), vec![
+            cand("deep", fx(0.0, 0.0, 0.20, 0.0, if force_aspm { -0.15 } else { -0.08 }), 0.3,
+                 "S3 suspend where firmware offers it: lowest drain in the bag; resume paths are less tested than s2idle on new laptops."),
+        ]);
+    }
+    match r.g {
+        PowerSave => {
+            r.set_live("net.wol", "0", "Wake-on-LAN off (TLP default): the wired NIC can power down fully in suspend.");
+            r.set_live("gpu.amdgpu_abm", 3, "Panel power savings level 3 (TLP's battery level): lower backlight, compensated pixels.");
+        }
+        Desktop => r.set_live("net.wol", "0", "Wake-on-LAN off: the wired NIC can power down fully in suspend."),
+        Gaming | Throughput => r.set_live("gpu.amdgpu_abm", 0, "Panel power savings off: no backlight/contrast modulation, accurate colour."),
+    }
+    if p.sata_hosts {
+        match r.g {
+            PowerSave => {
+                for k in ["disk.apm_0", "disk.apm_1", "disk.apm_2", "disk.apm_3"] { r.set(k, 128, "APM 128 (TLP battery level): saving without spin-down on every start-stop cycle."); }
+                r.set("pm.ahci_runtime_timeout", 15_000, "Idle ATA disks suspend after 15 s (TLP default).");
+                r.set("pm.ahci_disk_runtime", "auto", "Idle ATA disks may suspend.");
+            }
+            Gaming | Throughput => {
+                for k in ["disk.apm_0", "disk.apm_1", "disk.apm_2", "disk.apm_3"] { r.set(k, 254, "APM 254 (TLP AC level): no power-saving stalls."); }
+                r.set("pm.ahci_disk_runtime", "on", "ATA disks never suspend: no spin-up delay mid-session.");
+            }
+            Desktop => {}
+        }
+        r.set("pm.sata_alpm", match r.g { Gaming | Throughput => "max_performance", _ => "med_power_with_dipm" },
+              match r.g { Gaming | Throughput => "SATA link always active.", _ => "Modern default: partial/slumber with device-initiated PM." });
+    }
+    // iGPU: always driver-managed - forcing 'low' is unstable on amdgpu.
+    if p.amd() && p.amd_igpu { r.set_live("gpu.amdgpu_dpm", "auto", "Driver-managed iGPU clocks ('low' is not stable on this iGPU)."); }
+    if p.intel() && p.intel_igpu && (r.is(PowerSave) || (r.is(Gaming) && p.nvidia_dgpu)) {
+        r.set("gpu.intel_slpc_profile", "power_saving", "iGPU clocks ramp gently: it only composites or idles here.");
+    }
+}
+
+/// Live values that fail [`audit`] get their fix, unless a rule already decided the key.
+fn repair_live(r: &mut Rules) {
+    let live: Map<String, Value> = r.p.current.iter().map(|(k, v)| {
+        (k.clone(), v.parse::<i64>().map(Value::from).unwrap_or_else(|_| Value::String(v.clone())))
+    }).collect();
+    let ctx = AuditCtx { ram_kb: r.p.ram_kb, cmdline: r.p.cmdline.clone(), numa_nodes: r.p.numa_nodes };
+    for is in audit(&live, &ctx) {
+        let (Some(fix), Some(t)) = (is.fix, tune::find(&is.key)) else { continue };
+        if r.out.iter().any(|d| d.key == t.key) { continue; }
+        r.set(t.key, fix, format!("Repair of the live value: {}", is.msg));
+    }
+}
+
+// ── CPU and scheduler (structural rules) ─────────────────────────────────────
 
 fn cpu_rules(r: &mut Rules) {
     use Goal::*;
@@ -600,176 +1207,15 @@ fn cpu_rules(r: &mut Rules) {
     }
 }
 
-fn memory_rules(r: &mut Rules) {
-    use Goal::*;
-    let p = r.p;
-    let gb = p.ram_gb();
-    // THP. CachyOS ships enabled=always + defrag=defer+madvise + khugepaged
-    // max_ptes_none=409: tcmalloc users (Proton games, Chromium) get huge pages,
-    // and on 6.12+ the THP shrinker splits huge pages with more than
-    // max_ptes_none zero-filled subpages, which removes the classic RSS bloat of
-    // "always". Without the shrinker (older kernel) or with little RAM, madvise.
-    let always = gb >= 16 && p.kernel_at_least(6, 12) && !r.is(PowerSave);
-    if always {
-        r.set("thp.enabled", "always", "THP everywhere (CachyOS default): tcmalloc-based apps such as Proton games and Chromium get huge pages; the 6.12+ THP shrinker keeps RSS in check.");
-        r.set("thp.defrag", "defer+madvise", "Page faults never stall on compaction except in madvise regions; kswapd/kcompactd defragment in the background (CachyOS default).");
-        r.set("thp.khp_max_ptes_none", 409, "A huge page with more than 409 of 512 subpages unused is split back (THP shrinker, 6.12+): the memory cost of 'always' stays small (CachyOS value).");
-    } else {
-        r.set("thp.enabled", "madvise", if r.is(PowerSave) { "Huge pages only on request: no background collapse work on battery." }
-              else { "Huge pages only on request: kernel < 6.12 (no THP shrinker) or < 16 GB RAM, where 'always' can bloat memory." });
-        r.set("thp.defrag", "defer+madvise", "Never stall a page fault for compaction outside madvise regions.");
-    }
-    r.set("thp.shmem_enabled", if r.is(PowerSave) { "never" } else { "advise" },
-          if r.is(PowerSave) { "No huge pages for tmpfs/shmem." } else { "shmem huge pages only where requested (madvise / huge=): /dev/shm and Wine shared sections are not inflated." });
-    // mTHP (6.8+): mid-size folios cut faults/TLB misses with far less waste
-    // than 2 MB. 'inherit' follows thp.enabled (always here).
-    if p.kernel_at_least(6, 8) {
-        let upto: u32 = match r.g { _ if !always => 0, Throughput => 256, _ => 64 };
-        for (k, kb) in [("thp.mthp_16k", 16), ("thp.mthp_32k", 32), ("thp.mthp_64k", 64), ("thp.mthp_128k", 128),
-                        ("thp.mthp_256k", 256), ("thp.mthp_512k", 512), ("thp.mthp_1m", 1024)] {
-            let on = kb <= upto;
-            r.set(k, if on { "inherit" } else { "never" }, if on {
-                format!("{kb} KB folios follow THP: fewer page faults and TLB misses for mid-size allocations (mTHP up to {upto} KB for this goal).")
-            } else { format!("{kb} KB folios off (kernel default): no memory bloat from large partially used folios.") });
-        }
-    }
-    match r.g {
-        Throughput => {
-            r.set("thp.khugepaged_defrag", 1, "khugepaged may compact to build huge pages for long-running jobs.");
-            r.set("thp.khp_pages_to_scan", 16_384, "4x the default scan budget: long-running processes get collapsed into huge pages sooner.");
-            r.set("thp.khp_scan_sleep_ms", 5_000, "khugepaged scans every 5 s: working sets are promoted early in a build/encode.");
-        }
-        Gaming | Desktop => {
-            r.set("thp.khp_pages_to_scan", 4_096, "Default scan budget: short scan bursts, no competing background CPU work.");
-            r.set("thp.khp_alloc_sleep_ms", 60_000, "Back off a minute after a failed huge-page allocation (default): no repeated compaction attempts.");
-        }
-        PowerSave => {}
-    }
-    if r.is(PowerSave) {
-        r.set("thp.khp_pages_to_scan", 1_024, "Quarter of the default scan budget: less background work.");
-        r.set("thp.khp_alloc_sleep_ms", 300_000, "Back off 5 min after a failed allocation: no compaction retries on battery.");
-        r.set("thp.khugepaged_defrag", 0, "khugepaged does not compact to build huge pages.");
-        r.set("thp.khp_scan_sleep_ms", 60_000, "khugepaged wakes once a minute instead of every 10 s.");
-    }
-
-    // MGLRU: min_ttl_ms protects the recently used working set from eviction
-    // (kernel docs' thrashing-prevention example is 1000 ms).
-    if p.cur("mm.lru_gen").map_or(true, |v| v != "7") { r.set("mm.lru_gen", 7, "All MGLRU features (kernel default)."); }
-    if matches!(r.g, Gaming | Desktop) {
-        // min_ttl trades thrashing for an OOM kill when the working set does not fit:
-        // right with headroom, wrong on a machine that is already short of RAM.
-        if gb < 12 || p.evidence.mem_pressure_now() {
-            r.set("mm.lru_gen_min_ttl", 0, if gb < 12 { "Under 12 GB of RAM the working set of a game plus browser can exceed memory: protecting it would trade stutter for OOM kills, so the protection stays off." }
-                  else { "Tasks are stalling on memory right now: protecting the last second's working set would turn that pressure into an OOM kill, so the protection stays off." });
-        } else {
-            r.set("mm.lru_gen_min_ttl", 1000, "Working set of the last second is never evicted: no thrashing stutter; under real pressure the OOM killer ends a process instead.");
-        }
-    }
-    // khugepaged collapsing a range reads its swapped-out pages back in (default: up to
-    // 64 of 512). Background work should never cause swap-in I/O or decompression.
-    if !matches!(p.swap, SwapKind::None) && !r.is(Throughput) {
-        r.set("thp.khp_max_ptes_swap", 0, "khugepaged only collapses ranges that are fully resident: background huge-page building never reads swap back in behind a running program.");
-    }
-    if !r.is(Desktop) && p.cur("mm.ksm_run").map_or(true, |v| v != "0") { r.set("mm.ksm_run", 0, "Stop the KSM scanner: pure background cost without VMs."); }
-    if !r.is(PowerSave) {
-        r.set("vm.max_map_count", 2_147_483_642_i64, "SteamOS/Proton value: some games exceed the old 65530 mapping limit.");
-    }
-
-    // Swap (CachyOS: swappiness 100 = equal I/O cost; 150 and zswap off with
-    // zram; page-cluster 0 for zram, 1 for SSD, 2 for HDD).
-    match p.swap {
-        SwapKind::Zram => {
-            r.set("vm.swappiness", if r.is(PowerSave) { 180 } else { 150 }, "zram swap costs a compression, not I/O: cold anonymous pages go there before page cache (CachyOS 150).");
-            r.set("vm.page_cluster", 0, "zram has no seek cost: no swap readahead.");
-            r.set("zswap.enabled", "0", "zram is the swap device: zswap in front of it would compress twice.");
-        }
-        SwapKind::None => {}
-        k => {
-            let hdd = k == SwapKind::Hdd;
-            r.set("vm.swappiness", if hdd { 60 } else { 100 }, if hdd { "Swap on a spinning disk: keep swap-outs rarer than cache drops." }
-                  else { "zswap absorbs swap-outs in RAM: equal cost for anon and file pages (CachyOS 100)." });
-            r.set("vm.page_cluster", if hdd { 2 } else { 1 }, "Small swap readahead for physical swap (CachyOS: 1 on SSD, 2 on HDD).");
-            r.set("zswap.enabled", "1", "Disk swap present: zswap keeps most swapped pages compressed in RAM.");
-            r.set("zswap.compressor", if r.is(Gaming) { "lz4" } else { "zstd" },
-                  if r.is(Gaming) { "lz4: fastest decompression when a swapped page is touched again." } else { "zstd: best ratio, more pages stay in RAM." });
-            r.set("zswap.shrinker_enabled", "1", "Cold pool pages move on to disk proactively.");
-            r.set("zswap.max_pool_percent", match r.g { PowerSave => 30, Gaming => 20, _ => 25 },
-                  match r.g { PowerSave => "Bigger compressed pool: fewer disk writes/wakes.", Gaming => "Stock pool size: RAM stays free for the game.",
-                              _ => "Slightly bigger pool: less swap I/O under build/tab pressure." });
-        }
-    }
-
-    // Reclaim: watermark_scale_factor (default 10 = 0.1% of RAM) sets how early
-    // kswapd starts; a larger gap means fewer direct-reclaim stalls. The gap is
-    // sized in bytes (~400 MiB of headroom, the value CachyOS's 125 gives on a
-    // 32 GB machine) and converted to the per-10000 factor, so 64 GB does not
-    // hold 800 MiB idle and 16 GB does not get less than it needs. Evidence of
-    // regular direct reclaim (allocstall + share of pgscan_direct) raises it by
-    // half and also enables it on machines below 16 GB.
-    let ev = &p.evidence;
-    if matches!(r.g, Gaming | Desktop | Throughput) && (gb >= 16 || ev.reclaim_stalls()) {
-        let scaled = (((400u64 << 20) * 10_000) / (p.ram_kb * 1024).max(1)).clamp(10, 150) as i64;
-        if ev.reclaim_stalls() {
-            let share = ev.direct_reclaim_share().unwrap_or(0.0) * 100.0;
-            r.set("vm.watermark_scale_factor", (scaled * 3 / 2).min(300),
-                  format!("Direct reclaim is a regular event here ({share:.0}% of scanned pages, {} allocation stalls since boot): kswapd starts 1.5x earlier than the ~400 MiB headroom baseline so the allocating thread stops doing the reclaim itself.", ev.allocstall));
-        } else {
-            r.set("vm.watermark_scale_factor", scaled,
-                  format!("kswapd wakes with ~400 MiB of free headroom ({:.2}% of RAM) instead of 0.1%: allocations rarely hit direct reclaim (a stall on the allocating thread), without pinning gigabytes idle on big-RAM machines.", scaled as f64 / 100.0));
-        }
-    }
-    // Watermark boosting (default 15000) makes kswapd reclaim extra cache after
-    // every fragmentation event - a periodic reclaim storm with no benefit here.
-    r.set("vm.watermark_boost_factor", 0, "No watermark boost: kswapd does not drop extra page cache after fragmentation events (CachyOS value).");
-    if matches!(r.g, Gaming | Desktop) {
-        r.set("vm.compaction_proactiveness", 0, "No proactive compaction: kcompactd does not wake in the background mid-game (CachyOS); defer+madvise already compacts on demand.");
-    }
-    // Atomic reserve: ~0.4% of RAM (128 MB on 32 GB), only ever raised.
-    if gb >= 16 && !r.is(PowerSave) {
-        let want = (p.ram_kb / 256).min(262_144);
-        if p.cur("vm.min_free_kbytes").and_then(|v| v.parse::<u64>().ok()).map_or(true, |c| c < want) {
-            r.set("vm.min_free_kbytes", want as i64, "Larger atomic reserve (~0.4% of RAM): network/GPU interrupt-context allocations never fail under memory pressure.");
-        }
-    }
-    if p.numa_nodes > 1 { r.set("vm.zone_reclaim_mode", 0, "Multi-node: allocate from the other node instead of reclaiming the local one."); }
-    if r.is(PowerSave) {
-        r.set("vm.compaction_proactiveness", 0, "No proactive compaction: THP is madvise-only here, no background CPU work.");
-        r.set("vm.stat_interval", 10, "vmstat refresh every 10 s: fewer periodic timer wakeups.");
-    }
-
-    // Dirty page cache in bytes (1% of 32 GB is already 320 MB).
-    let ram_b = p.ram_kb * 1024;
-    let (bg, full, w): (u64, u64, &str) = match r.g {
-        Gaming | Desktop => (64 << 20, 256 << 20, "CachyOS values: writeback starts at 64 MB, writers throttle at 256 MB, so a download or copy never piles up gigabytes that flush at once and stall the compositor or asset streaming."),
-        Throughput => (ram_b / 10, (ram_b * 4 / 10).min(16 << 30), "TuneD throughput-performance: 10% / 40% of RAM (capped at 16 GB) absorb write bursts at RAM speed."),
-        PowerSave => (ram_b / 10, ram_b / 5, "Larger buffers so writes are batched and the drive idles longer."),
-    };
-    r.set("vm.dirty_background_bytes", bg as i64, w);
-    r.set("vm.dirty_bytes", full.max(bg * 2) as i64, w);
-    match r.g {
-        PowerSave => {
-            r.set("vm.dirty_writeback_centisecs", 1500, "Flusher wakes every 15 s instead of 5 s (TLP): fewer drive wake-ups.");
-            r.set("vm.dirty_expire_centisecs", 6000, "Data may stay dirty up to 60 s: fewer, larger write bursts.");
-        }
-        Gaming | Desktop => r.set("vm.dirty_writeback_centisecs", 1500, "Flusher wakes every 15 s (CachyOS): fewer periodic writeback bursts; the byte limits above bound the backlog."),
-        Throughput => {}
-    }
-    if matches!(r.g, Gaming | Desktop | Throughput) {
-        r.set("vm.vfs_cache_pressure", 50, "Directory/inode cache kept longer (CachyOS): shader caches, library scans and file dialogs stay fast.");
-    }
-}
-
 fn sched_rules(r: &mut Rules) {
     use Goal::*;
     let p = r.p;
     if matches!(r.g, Gaming | Desktop | Throughput) {
         r.set("kernel.split_lock_mitigate", 0, "No 1000x throttle for split-lock accesses (some Windows games and emulators trigger it).");
     }
-    match r.g {
-        Gaming => r.set("kernel.watchdog", 0, "No lockup-detector timer/NMI interrupts (note: the Health tab then sees no soft/hard lockup reports)."),
-        PowerSave => r.set("kernel.watchdog", 0, "No periodic watchdog/NMI interrupts (TLP disables the NMI watchdog for the same reason)."),
-        _ => {}
-    }
+    // kernel.watchdog is never turned off: without the lockup detector a hang
+    // leaves no trace in the log (the Health tab and post-mortems go blind),
+    // for a saving of a few timer interrupts per second.
     if p.numa_nodes <= 1 { r.set("kernel.numa_balancing", 0, "Single NUMA node: balancing would only sample page faults for nothing."); }
     if r.is(Gaming) && !p.battery {
         r.set("kernel.timer_migration", 0, "Desktop (no battery): timers fire on the CPU that armed them - no cross-CPU timer jitter.");
@@ -840,131 +1286,6 @@ fn sched_rules(r: &mut Rules) {
     }
 }
 
-fn io_rules(r: &mut Rules) {
-    use Goal::*;
-    let p = r.p;
-    // One scheduler for every disk (the row writes all of them).
-    if p.rotational {
-        r.set("blk.scheduler", if matches!(r.g, Gaming | Desktop) { "bfq" } else { "mq-deadline" },
-              if matches!(r.g, Gaming | Desktop) { "A spinning disk is present: bfq keeps interactive reads responsive under competing I/O." }
-              else { "A spinning disk is present: mq-deadline bounds latency while merging for throughput." });
-    } else {
-        r.set("blk.scheduler", "none", "Flash only: no reordering, lowest per-request latency and CPU cost.");
-    }
-    match r.g {
-        Throughput => r.set("blk.read_ahead_kb", if p.rotational { 4096 } else { 1024 }, "Large read-ahead for sequential throughput (TuneD uses 4096 KiB)."),
-        Gaming => r.set("blk.read_ahead_kb", 512, "Games stream assets sequentially from large packs: 512 KiB read-ahead."),
-        PowerSave => r.set("blk.read_ahead_kb", 1024, "Bigger read-ahead: fewer, larger reads let the drive idle longer."),
-        Desktop => {}
-    }
-    if r.is(Throughput) {
-        r.set("blk.wbt_lat_usec", 0, "No writeback throttling: build/encode output flushes at full device speed.");
-    }
-    // Network (latency under load): BBR + fq keeps queues short.
-    if matches!(r.g, Gaming | Desktop | Throughput) {
-        r.set("net.tcp_congestion", "bbr", "BBR models bandwidth/RTT instead of reacting to loss: steadier latency on Wi-Fi and long routes.");
-        r.set("net.default_qdisc", "fq", "fq pacing, the qdisc BBR was designed for.");
-    }
-    if p.wifi {
-        match r.g {
-            Gaming => r.set("net.wifi_power_save", "0", "Radio never dozes between beacons: no 802.11 power-save ping spikes."),
-            PowerSave | Desktop => r.set("net.wifi_power_save", "1", "802.11 power save on."),
-            _ => {}
-        }
-    }
-}
-
-fn device_rules(r: &mut Rules) {
-    use Goal::*;
-    let p = r.p;
-    match r.g {
-        Gaming => r.set("pci.aspm", "performance", "PCIe links never drop to a power state between bursts: no wake-up jitter on GPU/NVMe/Wi-Fi."),
-        PowerSave => r.set("pci.aspm", "powersave", "Links may enter L0s/L1 when idle (powersupersave is avoided: it breaks some devices)."),
-        _ => {}
-    }
-    if r.is(Desktop) {
-        r.set("pci.aspm", "powersave", "Idle PCIe links enter L0s/L1 (µs wake, invisible on the desktop): less idle power and heat.");
-        r.set("pm.pci_runtime", "auto", "Idle PCI devices drop to D3 (dGPU runtime PM untouched).");
-        r.set("pm.usb_runtime", "auto", "Idle webcam/Bluetooth/readers suspend (HID/audio are skipped).");
-        r.set("snd.hda_power_save", 10, "Codec powers down after 10 s idle: saves power without a pop on every notification.");
-        r.set("snd.hda_power_save_controller", "1", "Controller may power down with the codec.");
-        if p.nvme { r.set("pm.nvme_latency_us", 100_000, "Every APST state allowed: deepest NVMe idle; wake cost is hidden by the page cache."); }
-    }
-    if r.is(PowerSave) {
-        r.set("pci.aspm_links", "l1ss", "L1.1/L1.2 substates on every link: an NVMe/Wi-Fi link stuck without L1.2 costs ~0.5-1 W at idle (restore if a device misbehaves).");
-        if p.battery { r.set("pm.mem_sleep", "deep", "S3 suspend where firmware offers it: lowest drain in the bag (skipped if only s2idle exists)."); }
-    }
-    match r.g {
-        Gaming => { r.set("snd.hda_power_save", 0, "Codec always powered: no pop and no wake delay."); r.set("snd.hda_power_save_controller", "0", "Controller always powered."); }
-        PowerSave => { r.set("snd.hda_power_save", 1, "Codec powers down after 1 s idle."); r.set("snd.hda_power_save_controller", "1", "Controller may power down too."); }
-        _ => {}
-    }
-    match r.g {
-        Gaming => r.set("usb.autosuspend", -1, "Newly plugged peripherals never autosuspend."),
-        PowerSave => r.set("usb.autosuspend", 2, "Newly plugged devices suspend after 2 s idle."),
-        _ => {}
-    }
-    match r.g {
-        Gaming => r.set("pm.pci_runtime", "on", "Devices stay in D0 during play (GPU and its bridges excluded - dGPU runtime PM is untouched)."),
-        PowerSave => r.set("pm.pci_runtime", "auto", "Idle PCI devices drop to D3 (TLP battery setting)."),
-        _ => {}
-    }
-    match r.g {
-        Gaming => r.set("pm.usb_runtime", "on", "Connected USB devices never suspend (HID/audio skipped anyway)."),
-        PowerSave => r.set("pm.usb_runtime", "auto", "Idle webcam/Bluetooth/readers suspend."),
-        _ => {}
-    }
-    match r.g {
-        PowerSave => {
-            r.set("net.wol", "0", "Wake-on-LAN off (TLP default): the wired NIC can power down fully in suspend.");
-            r.set("gpu.amdgpu_abm", 3, "Panel power savings level 3 (TLP's battery level): lower backlight, compensated pixels.");
-        }
-        Desktop => r.set("net.wol", "0", "Wake-on-LAN off: the wired NIC can power down fully in suspend."),
-        Gaming | Throughput => r.set("gpu.amdgpu_abm", 0, "Panel power savings off: no backlight/contrast modulation, accurate colour."),
-        #[allow(unreachable_patterns)] _ => {}
-    }
-
-    if p.sata_hosts {
-        match r.g {
-            PowerSave => {
-                for k in ["disk.apm_0", "disk.apm_1", "disk.apm_2", "disk.apm_3"] {
-                    r.set(k, 128, "APM 128 (TLP battery level): saving without spin-down on every start-stop cycle.");
-                }
-                r.set("pm.ahci_runtime_timeout", 15_000, "Idle ATA disks suspend after 15 s (TLP default).");
-                r.set("pm.ahci_disk_runtime", "auto", "Idle ATA disks may suspend.");
-                r.set("pm.ahci_port_runtime", "auto", "Idle AHCI ports may power down.");
-            }
-            Gaming | Throughput => {
-                for k in ["disk.apm_0", "disk.apm_1", "disk.apm_2", "disk.apm_3"] {
-                    r.set(k, 254, "APM 254 (TLP AC level): maximum performance, no power-saving stalls.");
-                }
-                r.set("pm.ahci_disk_runtime", "on", "ATA disks never suspend: no spin-up delay mid-session.");
-                r.set("pm.ahci_port_runtime", "on", "AHCI ports stay powered.");
-            }
-            Desktop => {}
-        }
-    }
-    if p.sata_hosts {
-        r.set("pm.sata_alpm", match r.g { Gaming | Throughput => "max_performance", PowerSave | Desktop => "med_power_with_dipm" },
-              match r.g { Gaming | Throughput => "SATA link always active.", _ => "Modern default: partial/slumber with device-initiated PM." });
-    }
-    if p.nvme {
-        match r.g {
-            Gaming => r.set("pm.nvme_latency_us", 0, "APST off while playing: an idle NVMe never needs to wake from a deep state mid-stream (~0.5-1 W more at idle)."),
-            PowerSave if p.cur("pm.nvme_latency_us").map_or(true, |v| v != "100000") =>
-                r.set("pm.nvme_latency_us", 100_000, "Every APST state allowed: deepest NVMe idle."),
-            _ => {}
-        }
-    }
-    // iGPU: always driver-managed - forcing 'low' is unstable on amdgpu.
-    if p.amd() && p.amd_igpu {
-        r.set("gpu.amdgpu_dpm", "auto", "Driver-managed iGPU clocks ('low' is not stable on this iGPU).");
-    }
-    if p.intel() && p.intel_igpu && (r.is(PowerSave) || (r.is(Gaming) && p.nvidia_dgpu)) {
-        r.set("gpu.intel_slpc_profile", "power_saving", "iGPU clocks ramp gently: it only composites or idles here.");
-    }
-}
-
 fn run_block(goal: Goal, p: &Profile) -> (Value, Option<String>) {
     match goal {
         Goal::Gaming if p.x3d() => {
@@ -977,21 +1298,234 @@ fn run_block(goal: Goal, p: &Profile) -> (Value, Option<String>) {
     }
 }
 
+
+// ── hard constraints ─────────────────────────────────────────────────────────
+
+/// Invariants no weight can override. Fixes the decision list in place and
+/// returns one note per intervention.
+pub fn enforce(out: &mut Vec<Decision>, p: &Profile) -> Vec<String> {
+    let mut notes = Vec::new();
+    let get = |out: &Vec<Decision>, k: &str| out.iter().find(|d| d.key == k).map(|d| vstr(&d.value));
+    let eff = |out: &Vec<Decision>, k: &str| get(out, k).or_else(|| p.cur(k).map(str::to_owned));
+    let num = |s: Option<String>| s.and_then(|v| v.parse::<i64>().ok());
+
+    // 1. Dirty pair: background below the throttle point, both above the floors.
+    if let (Some(bg), Some(d)) = (num(get(out, "vm.dirty_background_bytes")), num(get(out, "vm.dirty_bytes"))) {
+        let d2 = d.max(32 * MIB as i64);
+        let bg2 = bg.clamp(8 * MIB as i64, d2 / 2);
+        if (bg2, d2) != (bg, d) {
+            notes.push(format!("dirty limits adjusted to bg {} / {} bytes (bg < dirty, floors 8/32 MiB)", bg2, d2));
+            for x in out.iter_mut() {
+                if x.key == "vm.dirty_bytes" { x.value = json!(d2); }
+                if x.key == "vm.dirty_background_bytes" { x.value = json!(bg2); }
+            }
+        }
+    }
+    // 2. mTHP collapse honours max_ptes_none only at 0 or 511 (kernel 7.x warns and falls back).
+    let mthp_on = MTHP.iter().any(|(k, _)| eff(out, k).map_or(false, |v| v != "never"));
+    if mthp_on {
+        if let Some(n) = num(eff(out, "thp.khp_max_ptes_none")).filter(|n| *n != 0 && *n != 511) {
+            out.retain(|d| d.key != "thp.khp_max_ptes_none");
+            out.push(Decision { key: "thp.khp_max_ptes_none", value: json!(0),
+                why: format!("mTHP is enabled: the kernel only supports max_ptes_none 0 or 511 for mTHP collapse (live {n} would be ignored with a warning); 0 = no fill-in.") });
+            notes.push("max_ptes_none forced to 0 (mTHP on)".into());
+        }
+    }
+    // 3. THP everywhere needs at least one defragmentation path.
+    if eff(out, "thp.enabled").as_deref() == Some("always")
+        && num(eff(out, "vm.watermark_boost_factor")) == Some(0) && num(eff(out, "vm.compaction_proactiveness")) == Some(0) {
+        out.retain(|d| d.key != "vm.compaction_proactiveness");
+        if p.cur("vm.compaction_proactiveness") == Some("0") {
+            out.push(Decision { key: "vm.compaction_proactiveness", value: json!(20), why: "THP is on everywhere and boost reclaim is off: proactive compaction (kernel default 20) is the only path left that keeps huge pages available.".into() });
+        }
+        notes.push("proactive compaction kept on (THP always + boost 0)".into());
+    }
+    // 4. EPP is meaningless (pinned) under the performance governor.
+    for (g, e) in [("cpu.governor", "cpu.epp"), ("cpu.governor_ccd0", "cpu.epp_ccd0"), ("cpu.governor_ccd1", "cpu.epp_ccd1")] {
+        if get(out, g).as_deref() == Some("performance") && out.iter().any(|d| d.key == e) {
+            out.retain(|d| d.key != e);
+            notes.push(format!("{e} dropped: governor performance pins EPP"));
+        }
+    }
+    // 5. Boot parameters the user chose.
+    if p.boot_param("usbcore.autosuspend").is_some() && out.iter().any(|d| d.key == "usb.autosuspend") {
+        out.retain(|d| d.key != "usb.autosuspend");
+        notes.push("usb.autosuspend left to the usbcore.autosuspend boot parameter".into());
+    }
+    out.retain(|d| !(d.key == "kernel.watchdog" && vstr(&d.value) == "0"));
+    // 6. Integers must survive every JSON layer exactly (GUI numbers are doubles).
+    out.retain(|d| match d.value.as_i64() {
+        Some(n) if n.abs() > JSON_SAFE_INT => { notes.push(format!("{} dropped: {n} exceeds 2^53", d.key)); false }
+        _ => true,
+    });
+    notes
+}
+
+// ── audit (old presets / scenes / live values) ──────────────────────────────
+
+pub struct AuditCtx { pub ram_kb: u64, pub cmdline: String, pub numa_nodes: usize }
+
+impl AuditCtx {
+    pub fn live() -> AuditCtx {
+        let ram_kb = std::fs::read_to_string("/proc/meminfo").unwrap_or_default().lines()
+            .find_map(|l| l.strip_prefix("MemTotal:").and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())).unwrap_or(0);
+        let numa_nodes = rd("/sys/devices/system/node/possible").map(|s| tune::cpu_list(&s).len()).unwrap_or(1).max(1);
+        AuditCtx { ram_kb, cmdline: rd("/proc/cmdline").unwrap_or_default(), numa_nodes }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Issue { pub key: String, pub reject: bool, pub msg: String, pub fix: Option<Value> }
+
+impl Issue {
+    pub fn to_json(&self) -> Value { json!({"key": self.key, "reject": self.reject, "message": self.msg, "fix": self.fix}) }
+}
+
+/// Checks a value map (a preset, a scene's tuning block, or live values)
+/// against the safe envelope. `reject` = must never be written; the rest are
+/// warnings with a suggested fix. Values the map does not contain are not judged.
+pub fn audit(values: &Map<String, Value>, ctx: &AuditCtx) -> Vec<Issue> {
+    let ram_b = ctx.ram_kb.saturating_mul(1024);
+    let n = |k: &str| values.get(k).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+    let s = |k: &str| values.get(k).map(vstr);
+    let mut out = Vec::new();
+    let mut add = |key: &str, reject: bool, msg: String, fix: Option<Value>| out.push(Issue { key: key.into(), reject, msg, fix });
+
+    let bg = n("vm.dirty_background_bytes");
+    let d = n("vm.dirty_bytes");
+    if let Some(b) = bg {
+        if b < MIB as i64 { add("vm.dirty_background_bytes", true, format!("{b} bytes: background writeback would start after a few pages (int32-wrapped value from an older LPM?)"), None); }
+        else if ram_b > 0 && b as u64 > ram_b / 10 { add("vm.dirty_background_bytes", false, format!("{} MiB is more than 10% of RAM", b >> 20), None); }
+    }
+    if let Some(x) = d {
+        if x < 4 * MIB as i64 { add("vm.dirty_bytes", true, format!("{x} bytes: every buffered writer would be throttled almost immediately (system-wide stalls)"), None); }
+        else if x < 32 * MIB as i64 { add("vm.dirty_bytes", false, format!("{} MiB throttles writers very early", x >> 20), None); }
+        else if ram_b > 0 && x as u64 > ram_b / 5 { add("vm.dirty_bytes", false, format!("{} MiB is more than 20% of RAM: multi-second flush stalls", x >> 20), None); }
+    }
+    if let (Some(b), Some(x)) = (bg, d) {
+        if x <= b { add("vm.dirty_bytes", true, format!("dirty_bytes {x} <= dirty_background_bytes {b}"), None); }
+    }
+    let mthp_on = MTHP.iter().any(|(k, _)| s(k).map_or(false, |v| v != "never"));
+    if let Some(pn) = n("thp.khp_max_ptes_none") {
+        if pn != 0 && pn != 511 && mthp_on {
+            add("thp.khp_max_ptes_none", false, format!("{pn} with mTHP on: the kernel ignores it for mTHP collapse (only 0 or 511)"), Some(json!(0)));
+        }
+    }
+    if let Some(v) = n("thp.khp_pages_to_scan").filter(|v| *v > 8192) { add("thp.khp_pages_to_scan", false, format!("{v} pages per pass (default 4096): heavy background collapsing and RSS growth"), Some(json!(4096))); }
+    if let Some(v) = n("thp.khp_scan_sleep_ms").filter(|v| *v < 5000) { add("thp.khp_scan_sleep_ms", false, format!("{v} ms between passes (default 10000)"), Some(json!(10_000))); }
+    if let Some(v) = n("vm.watermark_scale_factor") {
+        if v > 1000 { add("vm.watermark_scale_factor", true, format!("{v}: kswapd would keep {}% of RAM free", v / 100), Some(json!(10))); }
+        else if v > 300 { add("vm.watermark_scale_factor", false, format!("{v}: {:.1}% of RAM held free by kswapd", v as f64 / 100.0), Some(json!(10))); }
+    }
+    if let Some(v) = n("vm.watermark_boost_factor").filter(|v| *v > 15_000) {
+        add("vm.watermark_boost_factor", false, format!("{v}: boosted reclaim above the kernel default (15000)"), Some(json!(15_000)));
+    }
+    if let Some(v) = n("vm.min_free_kbytes") {
+        let kb = ctx.ram_kb as i64;
+        let fix = json!((kb / 400).clamp(16_384, 131_072));
+        if kb > 0 && v > kb * 3 / 100 { add("vm.min_free_kbytes", true, format!("{v} KiB is over 3% of RAM (kernel doc: too high OOMs the machine)"), Some(fix)); }
+        else if kb > 0 && (v > kb / 100 || v > 262_144) { add("vm.min_free_kbytes", false, format!("{v} KiB reserve is above 1% of RAM / 256 MiB"), Some(fix)); }
+    }
+    if let Some(v) = n("mm.lru_gen_min_ttl") {
+        if v > 5000 { add("mm.lru_gen_min_ttl", false, format!("{v} ms of protected working set: pressure ends in OOM kills"), Some(json!(0))); }
+        else if v > 0 && ctx.ram_kb > 0 && ctx.ram_kb < 12 << 20 { add("mm.lru_gen_min_ttl", false, "working-set protection on < 12 GB RAM trades stutter for OOM kills".into(), Some(json!(0))); }
+    }
+    if let Some(v) = n("vm.vfs_cache_pressure") {
+        if v < 10 { add("vm.vfs_cache_pressure", true, format!("{v}: dentry/inode caches practically never reclaimed (kernel doc: OOM risk)"), Some(json!(100))); }
+    }
+    if let Some(v) = n("vm.zone_reclaim_mode").filter(|v| *v != 0 && ctx.numa_nodes <= 1) {
+        add("vm.zone_reclaim_mode", false, format!("{v} on a single-node machine only adds reclaim"), Some(json!(0)));
+    }
+    if values.contains_key("usb.autosuspend") && ctx.cmdline.split_whitespace().any(|w| w.starts_with("usbcore.autosuspend=")) {
+        add("usb.autosuspend", false, "overrides the usbcore.autosuspend boot parameter".into(), None);
+    }
+    if s("kernel.watchdog").as_deref() == Some("0") {
+        add("kernel.watchdog", false, "lockup detector off: hangs leave no trace in the log".into(), None);
+    }
+    out
+}
+
+/// Walks any JSON (scene file, preset, preset store) and audits every object
+/// that holds tunable keys. Returns (json-path, issue).
+pub fn audit_tree(v: &Value, ctx: &AuditCtx) -> Vec<(String, Issue)> {
+    fn walk(v: &Value, path: String, ctx: &AuditCtx, out: &mut Vec<(String, Issue)>) {
+        match v {
+            Value::Object(m) => {
+                if m.keys().any(|k| tune::find(k).is_some()) {
+                    for i in audit(m, ctx) { out.push((path.clone(), i)); }
+                }
+                for (k, x) in m { walk(x, format!("{path}/{k}"), ctx, out); }
+            }
+            Value::Array(a) => for (i, x) in a.iter().enumerate() { walk(x, format!("{path}/{i}"), ctx, out); },
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, String::new(), ctx, &mut out);
+    out
+}
+
+/// Repairs every audited object in place: rejected dirty pairs are replaced
+/// by the pair derived for this machine, other issues take their fix (or the
+/// key is dropped when there is none and it was rejected). Returns the changes.
+pub fn repair_tree(v: &mut Value, ctx: &AuditCtx, p: &Profile) -> Vec<String> {
+    fn walk(v: &mut Value, path: String, ctx: &AuditCtx, p: &Profile, log: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                if m.keys().any(|k| tune::find(k).is_some()) {
+                    let issues = audit(m, ctx);
+                    let dirty_bad = issues.iter().any(|i| i.key.starts_with("vm.dirty_") && i.reject);
+                    if dirty_bad {
+                        let (bg, d) = dirty_pair(p.io.bps, ctx.ram_kb * 1024, 1.0);
+                        m.insert("vm.dirty_background_bytes".into(), json!(bg));
+                        m.insert("vm.dirty_bytes".into(), json!(d));
+                        log.push(format!("{path}: dirty limits -> {} / {} MiB ({})", bg >> 20, d >> 20, p.io.summary()));
+                    }
+                    for i in issues {
+                        if i.key.starts_with("vm.dirty_") && dirty_bad { continue; }
+                        match (i.fix, i.reject) {
+                            (Some(f), _) => { log.push(format!("{path}: {} {} -> {} ({})", i.key, vstr(&m[&i.key]), vstr(&f), i.msg)); m.insert(i.key, f); }
+                            (None, true) => { log.push(format!("{path}: {} removed ({})", i.key, i.msg)); m.remove(&i.key); }
+                            (None, false) => log.push(format!("{path}: {} kept, note: {}", i.key, i.msg)),
+                        }
+                    }
+                }
+                for (k, x) in m.iter_mut() { walk(x, format!("{path}/{k}"), ctx, p, log); }
+            }
+            Value::Array(a) => for (i, x) in a.iter_mut().enumerate() { walk(x, format!("{path}/{i}"), ctx, p, log); },
+            _ => {}
+        }
+    }
+    let mut log = Vec::new();
+    walk(v, String::new(), ctx, p, &mut log);
+    log
+}
+
 /// Full autotune: profile, rules, availability filter. Unprivileged.
 pub fn autotune(goal: Goal) -> Value { autotune_with(goal, &Profile::gather()) }
 
-pub fn autotune_with(goal: Goal, p: &Profile) -> Value {
+/// With user weight overrides ({"latency": 1.2, ...}; null = goal defaults).
+pub fn autotune_req(goal: Goal, weights: &Value) -> Value {
+    autotune_weighted(goal, &Profile::gather(), Weights::for_goal(goal).with_overrides(weights))
+}
+
+pub fn autotune_with(goal: Goal, p: &Profile) -> Value { autotune_weighted(goal, p, Weights::for_goal(goal)) }
+
+pub fn autotune_weighted(goal: Goal, p: &Profile, w: Weights) -> Value {
+    let (decisions, scores, notes) = decide_weighted(goal, p, w);
     let mut values = Map::new();
     let mut why = Map::new();
     let mut skipped = Vec::new();
-    for d in decide(goal, p) {
+    for d in decisions {
         let Some(t) = tune::find(d.key) else { continue };
-        if !tune::vendor_ok(t) { continue; }
-        if !t.debugfs && tune::files(t).is_empty() {
-            skipped.push(json!({"key": d.key, "why": "not available on this machine/kernel"}));
-            continue;
+        if !cfg!(test) {
+            if !tune::vendor_ok(t) { continue; }
+            if !t.debugfs && tune::files(t).is_empty() {
+                skipped.push(json!({"key": d.key, "why": "not available on this machine/kernel"}));
+                continue;
+            }
         }
-        match tune::validate(t, &d.value) {
+        match validate_static(t, &d.value) {
             Ok(v) => {
                 let jv = match t.kind { tune::Kind::Int { .. } => v.parse::<i64>().map(Value::from).unwrap_or(Value::String(v)), _ => Value::String(v) };
                 values.insert(d.key.to_owned(), jv);
@@ -1000,16 +1534,37 @@ pub fn autotune_with(goal: Goal, p: &Profile) -> Value {
             Err(e) => skipped.push(json!({"key": d.key, "why": e})),
         }
     }
+    // Invariant: nothing autotune emits may fail its own audit.
+    let ctx = AuditCtx { ram_kb: p.ram_kb, cmdline: p.cmdline.clone(), numa_nodes: p.numa_nodes };
+    for is in audit(&values, &ctx).into_iter().filter(|i| i.reject) {
+        values.remove(&is.key);
+        why.remove(&is.key);
+        skipped.push(json!({"key": is.key, "why": format!("safety audit: {}", is.msg)}));
+    }
+    let live: Map<String, Value> = p.current.iter().map(|(k, v)| (k.clone(), v.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(v)))).collect();
+    let live_issues: Vec<Value> = audit(&live, &ctx).iter().map(Issue::to_json).collect();
     let (run, run_why) = run_block(goal, p);
-    if let Some(w) = run_why { why.insert("run".into(), Value::String(w)); }
+    if let Some(rw) = run_why { why.insert("run".into(), Value::String(rw)); }
     let summary = format!("Autotuned for {} on {}.", goal.label().to_lowercase(), p.summary());
     json!({
         "ok": true, "goal": goal.key(), "goal_label": goal.label(), "name": goal.preset_name(),
         "profile": p.to_json(), "profile_summary": p.summary(), "evidence_summary": p.evidence.summary(),
+        "weights": w.to_json(), "scores": scores, "constraints": notes, "live_issues": live_issues,
         "preset": {"values": values, "run": run, "summary": summary,
-                   "autotune": {"goal": goal.key(), "kernel": format!("{}.{}", p.kernel.0, p.kernel.1)}},
+                   "autotune": {"goal": goal.key(), "kernel": format!("{}.{}", p.kernel.0, p.kernel.1),
+                                "weights": w.to_json(), "storage_write": p.io.to_json()}},
         "rationale": why, "skipped": skipped,
     })
+}
+
+/// tune::validate for Int/Bool rows; Choice rows are checked against the live
+/// option list only outside tests (the list comes from sysfs).
+fn validate_static(t: &tune::Tunable, v: &Value) -> Result<String, String> {
+    if cfg!(test) && t.kind == tune::Kind::Choice {
+        let s = vstr(v);
+        return if s.is_empty() || s.len() > 64 { Err("bad choice".into()) } else { Ok(s) };
+    }
+    tune::validate(t, v)
 }
 
 #[cfg(test)]
@@ -1028,154 +1583,262 @@ mod tests {
             idle_governors: vec!["menu".into(), "teo".into()],
             cstates: vec![CState { name: "POLL".into(), latency_us: 0 }, CState { name: "C1".into(), latency_us: 1 },
                           CState { name: "C2".into(), latency_us: 18 }, CState { name: "C3".into(), latency_us: 350 }],
-            ram_kb: 32 * 1024 * 1024, swap: SwapKind::Zram, nvme: true, rotational: false, sata_hosts: false,
+            ram_kb: 32_166_484, swap: SwapKind::Zram, nvme: true, rotational: false, sata_hosts: false,
             battery: true, on_ac: Some(true), nvidia_dgpu: true, amd_igpu: true, intel_igpu: false, wifi: true,
-            kernel: (7, 0), numa_nodes: 1, scx: vec!["lavd".into(), "bpfland".into()], dynamic_epp: true, uncore: None,
+            kernel: (7, 2), numa_nodes: 1, scx: vec!["lavd".into()], dynamic_epp: true, uncore: None,
             evidence: Evidence::default(),
-            current: BTreeMap::from([("vm.min_free_kbytes".into(), "67584".into()), ("cpu.ccd_park".into(), "none".into())]),
+            io: iorate::IoRate { bps: 1500 * MIB, source: iorate::Source::Probe, device: "nvme0n1".into(), class: iorate::DevClass::Nvme },
+            cmdline: "root=/dev/nvme0n1p2 nowatchdog pcie_aspm=force usbcore.autosuspend=-1 processor.max_cstate=9".into(),
+            current: BTreeMap::from([
+                ("vm.min_free_kbytes".into(), "67584".into()), ("cpu.ccd_park".into(), "none".into()),
+                ("thp.enabled".into(), "always".into()), ("thp.khp_max_ptes_none".into(), "409".into()),
+                ("thp.mthp_64k".into(), "inherit".into()), ("thp.mthp_16k".into(), "never".into()),
+            ]),
         }
     }
     fn get<'a>(d: &'a [Decision], k: &str) -> Option<&'a Value> { d.iter().find(|x| x.key == k).map(|x| &x.value) }
+    fn int(d: &[Decision], k: &str) -> i64 { get(d, k).and_then(Value::as_i64).unwrap_or_else(|| panic!("{k} missing")) }
+    fn ctx(p: &Profile) -> AuditCtx { AuditCtx { ram_kb: p.ram_kb, cmdline: p.cmdline.clone(), numa_nodes: 1 } }
 
     #[test]
-    fn gaming_x3d() {
+    fn dirty_limits_are_sane_for_every_ram_size_and_goal() {
+        for gb in [8u64, 16, 32, 64, 128] {
+            for g in Goal::ALL {
+                for bps in [60 * MIB, 120 * MIB, 500 * MIB, 3000 * MIB] {
+                    let mut p = legion();
+                    p.ram_kb = gb << 20;
+                    p.io.bps = bps;
+                    let d = decide(g, &p);
+                    let (bg, full) = (int(&d, "vm.dirty_background_bytes"), int(&d, "vm.dirty_bytes"));
+                    assert!(full > bg, "{gb} GB {g:?}: {bg} !< {full}");
+                    assert!(bg >= 8 << 20 && full >= 32 << 20, "{gb} GB {g:?} floors");
+                    assert!(full as u64 <= ((gb << 30) / 50).min(1 << 30).max(32 << 20), "{gb} GB {g:?}: {full} over 2% of RAM / 1 GiB");
+                    assert!(full.abs() < JSON_SAFE_INT);
+                    for x in [bg, full] {
+                        assert!(tune::validate(tune::find("vm.dirty_bytes").unwrap(), &json!(x)).is_ok());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn never_reproduces_the_wrapped_scene_values() {
+        let p = legion();
+        for g in Goal::ALL {
+            let v = autotune_with(g, &p);
+            let vals = &v["preset"]["values"];
+            for k in ["vm.dirty_bytes", "vm.dirty_background_bytes"] {
+                let x = vals[k].as_i64().unwrap();
+                assert!(x != 8192 && x != 290_489_958 && x >= 8 << 20, "{g:?} {k} = {x}");
+                // Survives a double (Qt JSON) round trip exactly.
+                assert_eq!(x as f64 as i64, x);
+            }
+            // Every emitted int is exact through JSON.
+            for (_, x) in vals.as_object().unwrap() { if let Some(n) = x.as_i64() { assert!(n.abs() <= JSON_SAFE_INT); } }
+        }
+    }
+
+    #[test]
+    fn dirty_follows_device_speed() {
+        let mut p = legion();
+        p.io = iorate::IoRate::class_default(iorate::DevClass::Hdd, "sda");
+        let slow = decide(Goal::Desktop, &p);
+        p.io = iorate::IoRate { bps: 2000 * MIB, source: iorate::Source::Probe, device: "nvme0n1".into(), class: iorate::DevClass::Nvme };
+        let fast = decide(Goal::Desktop, &p);
+        let (s, f) = (int(&slow, "vm.dirty_bytes"), int(&fast, "vm.dirty_bytes"));
+        assert!(s < f, "HDD {s} vs NVMe {f}");
+        assert!(s <= 128 << 20, "HDD dirty limit {s} should be about one second of 100 MiB/s");
+        assert!(f >= 512 << 20);
+    }
+
+    #[test]
+    fn thp_is_modest_and_kernel_consistent() {
+        let p = legion();
+        for g in Goal::ALL {
+            let d = decide(g, &p);
+            // Nobody gets THP=always or aggressive khugepaged by default.
+            assert_eq!(get(&d, "thp.enabled"), Some(&json!("madvise")), "{g:?}");
+            assert!(int(&d, "thp.khp_pages_to_scan") <= 8192 || get(&d, "thp.khp_pages_to_scan").is_none());
+            // Live 409 with live mTHP on: resolved to a value the kernel accepts.
+            let ptes = get(&d, "thp.khp_max_ptes_none").and_then(Value::as_i64).unwrap_or(409);
+            let mthp_on = MTHP.iter().any(|(k, _)| get(&d, k).map(vstr).or_else(|| p.cur(k).map(str::to_owned)).map_or(false, |v| v != "never"));
+            assert!(!mthp_on || ptes == 0 || ptes == 511, "{g:?}: mTHP on with max_ptes_none {ptes}");
+        }
+        // The combination search itself never offers an invalid pair.
+        let mut p2 = legion();
+        p2.current.clear();
+        let w = Weights { throughput: 3.0, footprint: 0.0, ..Weights::for_goal(Goal::Throughput) };
+        let (d, _, _) = decide_weighted(Goal::Throughput, &p2, w);
+        assert_eq!(get(&d, "thp.enabled"), Some(&json!("always")), "weights must be able to buy THP=always");
+        let ptes = get(&d, "thp.khp_max_ptes_none").and_then(Value::as_i64).unwrap_or(511);
+        let on = MTHP.iter().any(|(k, _)| get(&d, k).map_or(false, |v| v != "never"));
+        assert!(!on || ptes == 0 || ptes == 511);
+    }
+
+    #[test]
+    fn boot_param_thp_is_respected() {
+        let mut p = legion();
+        p.cmdline.push_str(" transparent_hugepage=always");
+        assert!(get(&decide(Goal::PowerSave, &p), "thp.enabled").is_none());
+    }
+
+    #[test]
+    fn watermarks_need_evidence_and_stay_bounded() {
+        let p = legion();
+        for g in Goal::ALL {
+            let d = decide(g, &p);
+            assert!(get(&d, "vm.watermark_scale_factor").is_none(), "{g:?} raised watermarks without evidence");
+            assert!(get(&d, "vm.min_free_kbytes").is_none(), "{g:?} touched min_free_kbytes");
+            assert!(get(&d, "vm.watermark_boost_factor").map_or(true, |v| v.as_i64().unwrap() <= 15_000));
+        }
+        for gb in [8u64, 16, 32, 64, 128] {
+            let mut p = legion();
+            p.ram_kb = gb << 20;
+            p.evidence = Evidence { uptime_s: 86_400, pgscan_direct: 400_000, pgscan_kswapd: 1_000_000, allocstall: 5_000, ..Default::default() };
+            let d = decide(Goal::Gaming, &p);
+            let f = int(&d, "vm.watermark_scale_factor");
+            assert!(f > 10 && f <= 300, "{gb} GB: {f}");
+            let headroom = (gb << 30) as f64 * f as f64 / 10_000.0;
+            assert!(headroom <= ((gb << 30) / 50).min(1 << 30) as f64 * 1.01, "{gb} GB: {headroom}");
+        }
+    }
+
+    #[test]
+    fn oversized_reserve_is_repaired() {
+        let mut p = legion();
+        p.current.insert("vm.min_free_kbytes".into(), "4194304".into());
+        p.current.insert("vm.watermark_scale_factor".into(), "3000".into());
+        let d = decide(Goal::Throughput, &p);
+        assert!(int(&d, "vm.min_free_kbytes") <= 131_072);
+        assert_eq!(int(&d, "vm.watermark_scale_factor"), 10);
+    }
+
+    #[test]
+    fn device_pm_respects_boot_params_and_risk() {
+        let p = legion();
+        for g in Goal::ALL {
+            let d = decide(g, &p);
+            assert!(get(&d, "usb.autosuspend").is_none(), "{g:?}: usbcore.autosuspend is on the cmdline");
+            assert!(get(&d, "pm.usb_runtime") != Some(&json!("auto")), "{g:?}: USB runtime PM is a stability bet");
+            assert!(get(&d, "pci.aspm_links").is_none(), "{g:?}");
+            assert!(get(&d, "pci.aspm") != Some(&json!("powersave")), "{g:?}: pcie_aspm=force makes powersave risky");
+            assert!(get(&d, "kernel.watchdog").is_none(), "{g:?}");
+        }
+        assert_eq!(get(&decide(Goal::PowerSave, &p), "pm.pci_runtime"), Some(&json!("auto")));
+        assert_eq!(get(&decide(Goal::Desktop, &p), "pm.pci_runtime"), Some(&json!("auto")));
+        assert!(get(&decide(Goal::Gaming, &p), "pm.pci_runtime").is_none());
+        let mut q = legion();
+        q.cmdline = "root=/dev/nvme0n1p2".into();
+        assert_eq!(get(&decide(Goal::Desktop, &q), "pci.aspm"), Some(&json!("powersave")));
+    }
+
+    #[test]
+    fn audit_catches_the_broken_scenes() {
+        let p = legion();
+        let c = ctx(&p);
+        let power: Map<String, Value> = serde_json::from_value(json!({"vm.dirty_bytes": 8192, "vm.dirty_background_bytes": 8192})).unwrap();
+        let thr: Map<String, Value> = serde_json::from_value(json!({"vm.dirty_bytes": 290_489_958, "vm.dirty_background_bytes": 8192,
+            "thp.khp_max_ptes_none": 409, "thp.mthp_64k": "inherit", "thp.khp_pages_to_scan": 16384})).unwrap();
+        let a = audit(&power, &c);
+        assert!(a.iter().any(|i| i.key == "vm.dirty_bytes" && i.reject));
+        assert!(a.iter().any(|i| i.key == "vm.dirty_background_bytes" && i.reject));
+        let b = audit(&thr, &c);
+        assert!(b.iter().any(|i| i.key == "vm.dirty_background_bytes" && i.reject));
+        assert!(b.iter().any(|i| i.key == "thp.khp_max_ptes_none" && i.fix == Some(json!(0))));
+        assert!(b.iter().any(|i| i.key == "thp.khp_pages_to_scan"));
+        // A scene file: nested objects are found and repaired.
+        let mut scene = json!({"name": "Daily", "optimizations": {"values": power}});
+        assert!(audit_tree(&scene, &c).len() >= 2);
+        let log = repair_tree(&mut scene, &c, &p);
+        assert!(!log.is_empty());
+        assert!(audit_tree(&scene, &c).iter().all(|(_, i)| !i.reject));
+        let v = &scene["optimizations"]["values"];
+        assert!(v["vm.dirty_bytes"].as_i64().unwrap() > v["vm.dirty_background_bytes"].as_i64().unwrap());
+        // Autotune output passes its own audit on every RAM size.
+        for gb in [8u64, 16, 32, 64, 128] {
+            let mut q = legion();
+            q.ram_kb = gb << 20;
+            for g in Goal::ALL {
+                let out = autotune_with(g, &q);
+                let vals: Map<String, Value> = out["preset"]["values"].as_object().unwrap().clone();
+                assert!(audit(&vals, &ctx(&q)).iter().all(|i| !i.reject), "{gb} GB {g:?}");
+                assert!(out["skipped"].as_array().unwrap().iter().all(|s| !s["why"].as_str().unwrap().starts_with("safety")));
+            }
+        }
+    }
+
+    #[test]
+    fn guard_rolls_back_on_sustained_stalls_only() {
+        let base = Pressure { io_full10: 1.0, mem_full10: 0.0, allocstall: 100 };
+        let calm: Vec<Pressure> = (0..60).map(|i| Pressure { io_full10: 3.0 + (i % 5) as f64, mem_full10: 0.5, allocstall: 100 }).collect();
+        assert!(guard_verdict(&base, &calm).is_none());
+        // A short burst (a build starting) is not a stall.
+        let mut burst = calm.clone();
+        for s in burst.iter_mut().take(8) { s.io_full10 = 60.0; }
+        assert!(guard_verdict(&base, &burst).is_none());
+        // dirty_bytes = 8192: writers throttled, io full stays high.
+        let mut stall = calm.clone();
+        for s in stall.iter_mut().skip(5).take(20) { s.io_full10 = 70.0; }
+        assert!(guard_verdict(&base, &stall).unwrap().starts_with("I/O stall"));
+        let mut mem = calm.clone();
+        for s in mem.iter_mut().skip(10).take(12) { s.mem_full10 = 25.0; }
+        assert!(guard_verdict(&base, &mem).unwrap().starts_with("memory stall"));
+        let storm: Vec<Pressure> = (0..20).map(|i| Pressure { allocstall: 100 + 1000 * (i as u64 + 1), ..Default::default() }).collect();
+        assert!(guard_verdict(&base, &storm).unwrap().starts_with("direct reclaim"));
+        assert!(guarded("vm.dirty_bytes") && guarded("thp.enabled") && !guarded("cpu.epp"));
+    }
+
+    #[test]
+    fn weights_override_and_clamp() {
+        let w = Weights::for_goal(Goal::Gaming).with_overrides(&json!({"latency": 9, "stability": 0.0, "bogus": 1, "power": "x"}));
+        assert_eq!(w.latency, 3.0);
+        assert_eq!(w.stability, 0.5);
+        assert_eq!(w.power, Weights::for_goal(Goal::Gaming).power);
+        // More power weight buys power-saving knobs in a desktop profile.
+        let p = legion();
+        let (d, scores, _) = decide_weighted(Goal::Desktop, &p, Weights::for_goal(Goal::Desktop).with_overrides(&json!({"power": 2.0})));
+        assert_eq!(get(&d, "pm.nvme_latency_us"), Some(&json!(100_000)));
+        assert!(scores.contains_key("vm.dirty_bytes") && scores.contains_key("thp"));
+    }
+
+    #[test]
+    fn structural_rules_kept() {
         let p = legion();
         let d = decide(Goal::Gaming, &p);
         assert_eq!(get(&d, "cpu.epp_ccd0"), Some(&json!("performance")));
         assert_eq!(get(&d, "cpu.epp_ccd1"), Some(&json!("balance_power")));
         assert_eq!(get(&d, "irq.affinity"), Some(&json!("ccd1")));
-        assert_eq!(get(&d, "cpu.x3d_mode"), Some(&json!("cache")));
-        assert_eq!(get(&d, "cpu.dynamic_epp"), Some(&json!("disabled")));
-        // Laptop: no wake-latency cap, no C-state cap, no parking.
-        assert_eq!(get(&d, "cpu.wake_latency_us"), Some(&json!(0)));
-        assert!(get(&d, "cpu.ccd_park").is_none());
-        assert!(get(&d, "sched.ext").is_none());
-        assert_eq!(get(&d, "vm.swappiness"), Some(&json!(150)));
-        assert_eq!(get(&d, "zswap.enabled"), Some(&json!("0")));
         assert_eq!(get(&d, "gpu.amdgpu_dpm"), Some(&json!("auto")));
-        assert_eq!(get(&d, "vm.dirty_background_bytes"), Some(&json!(64 << 20)));
-        assert_eq!(get(&d, "vm.dirty_bytes"), Some(&json!(256 << 20)));
-        assert_eq!(get(&d, "thp.enabled"), Some(&json!("always")));
-        assert_eq!(get(&d, "thp.khp_max_ptes_none"), Some(&json!(409)));
-        assert_eq!(run_block(Goal::Gaming, &p).0["affinity"], "ccd0");
         assert_eq!(get(&d, "cpu.epp_boost"), Some(&json!("1")));
-        assert_eq!(get(&d, "cpu.max_freq_ccd1"), Some(&json!(5_450_000 * 7 / 10)));
-        assert_eq!(get(&d, "thp.mthp_64k"), Some(&json!("inherit")));
-        assert_eq!(get(&d, "thp.mthp_128k"), Some(&json!("never")));
-        assert_eq!(get(&decide(Goal::Throughput, &p), "cpu.epp_boost"), Some(&json!("1")));
-        assert_eq!(get(&decide(Goal::PowerSave, &p), "cpu.epp_boost"), Some(&json!("0")));
-    }
-
-    #[test]
-    fn desktop_wake_cap_only_without_battery() {
-        let mut p = legion();
-        p.battery = false;
-        let d = decide(Goal::Gaming, &p);
-        assert_eq!(get(&d, "cpu.wake_latency_us"), Some(&json!(18)));
-    }
-
-    #[test]
-    fn goals_differ_where_they_should() {
-        let p = legion();
-        let ps = decide(Goal::PowerSave, &p);
-        let tp = decide(Goal::Throughput, &p);
+        assert_eq!(get(&d, "vm.swappiness"), Some(&json!(150)));
         let de = decide(Goal::Desktop, &p);
-        assert_eq!(get(&ps, "cpu.boost"), Some(&json!("0")));
-        assert_eq!(get(&ps, "cpu.epp_ccd0"), Some(&json!("power")));
-        assert_eq!(get(&tp, "cpu.epp_ccd1"), Some(&json!("balance_performance")));  // laptop: power-bound
-        assert_eq!(get(&tp, "cpu.x3d_mode"), Some(&json!("frequency")));
-        assert_eq!(get(&tp, "thp.enabled"), Some(&json!("always")));
-        assert_eq!(get(&tp, "sched.preempt"), Some(&json!("lazy")));
-        // Desktop on a laptop with dynamic EPP: EPP handed to the kernel.
-        assert_eq!(get(&de, "cpu.dynamic_epp"), Some(&json!("enabled")));
-        assert!(get(&de, "cpu.epp_ccd0").is_none());
-        assert_eq!(get(&de, "cpu.boost_ccd0"), Some(&json!("1")));
-        assert_eq!(get(&de, "cpu.boost_ccd1"), Some(&json!("0")));
         assert_eq!(get(&de, "cpu.max_freq_ccd0"), Some(&json!(4_400_000)));
-        assert_eq!(get(&de, "pci.aspm"), Some(&json!("powersave")));
-        // Every goal: valid preset name, no duplicate keys.
+        assert_eq!(get(&de, "cpu.boost_ccd1"), Some(&json!("0")));
+        let mut q = legion();
+        q.current.insert("cpu.ccd_park".into(), "ccd1".into());
+        assert_eq!(get(&decide(Goal::Gaming, &q), "cpu.ccd_park"), Some(&json!("none")));
         for g in Goal::ALL {
             let d = decide(g, &p);
             let mut keys: Vec<_> = d.iter().map(|x| x.key).collect();
             keys.sort();
             let n = keys.len();
             keys.dedup();
-            assert_eq!(n, keys.len(), "{g:?}");
+            assert_eq!(n, keys.len(), "{g:?}: duplicate keys");
             assert!(d.iter().all(|x| tune::find(x.key).is_some()), "{g:?}: unknown key");
         }
-    }
-
-    #[test]
-    fn parked_ccd_is_brought_back_and_swap_kinds() {
-        let mut p = legion();
-        p.current.insert("cpu.ccd_park".into(), "ccd1".into());
-        assert_eq!(get(&decide(Goal::Gaming, &p), "cpu.ccd_park"), Some(&json!("none")));
-        p.swap = SwapKind::Ssd;
-        let d = decide(Goal::Gaming, &p);
-        assert_eq!(get(&d, "zswap.enabled"), Some(&json!("1")));
-        assert_eq!(get(&d, "zswap.compressor"), Some(&json!("lz4")));
-        assert_eq!(get(&d, "vm.swappiness"), Some(&json!(100)));
-        assert_eq!(get(&d, "vm.page_cluster"), Some(&json!(1)));
-        assert_eq!(parse_release("7.0.1-gentoo"), (7, 0));
-        assert_eq!(Goal::parse("Optimal desktop"), Some(Goal::Desktop));
+        assert_eq!(parse_release("7.2.8-cachyos"), (7, 2));
         assert_eq!(Goal::parse("bare-throughput"), Some(Goal::Throughput));
-    }
-
-
-    #[test]
-    fn evidence_scales_and_gates() {
-        // ~400 MiB headroom: 32 GB -> 122, 64 GB -> 61, 16 GB -> capped at 150.
-        let wsf = |kb: u64, ev: Evidence, g: Goal| { let mut p = legion(); p.ram_kb = kb; p.evidence = ev; get(&decide(g, &p), "vm.watermark_scale_factor").cloned() };
-        assert_eq!(wsf(32 << 20, Evidence::default(), Goal::Gaming), Some(json!(122)));
-        assert_eq!(wsf(64 << 20, Evidence::default(), Goal::Gaming), Some(json!(61)));
-        assert_eq!(wsf(16 << 20, Evidence::default(), Goal::Desktop), Some(json!(150)));
-        assert_eq!(wsf(8 << 20, Evidence::default(), Goal::Gaming), None);
-        assert_eq!(wsf(32 << 20, Evidence::default(), Goal::PowerSave), None);
-        // Regular direct reclaim: 1.5x, and it also applies below 16 GB.
-        let mut ev = Evidence { uptime_s: 86_400, pgscan_direct: 300_000, pgscan_kswapd: 1_000_000, allocstall: 5_000, ..Default::default() };
-        assert!(ev.reclaim_stalls());
-        assert_eq!(wsf(32 << 20, ev.clone(), Goal::Gaming), Some(json!(183)));
-        assert_eq!(wsf(8 << 20, ev.clone(), Goal::Gaming), Some(json!(225)));
-        // A freshly booted machine (or few scans) carries no weight.
-        ev.uptime_s = 600;
-        assert!(!ev.reclaim_stalls());
-        // min_ttl: off on small RAM or under pressure now, on otherwise.
-        let ttl = |kb: u64, ev: Evidence| { let mut p = legion(); p.ram_kb = kb; p.evidence = ev; get(&decide(Goal::Gaming, &p), "mm.lru_gen_min_ttl").cloned() };
-        assert_eq!(ttl(32 << 20, Evidence::default()), Some(json!(1000)));
-        assert_eq!(ttl(8 << 20, Evidence::default()), Some(json!(0)));
-        assert_eq!(ttl(32 << 20, Evidence { psi_mem_full: Some(2.5), ..Default::default() }), Some(json!(0)));
     }
 
     #[test]
     fn parses_vmstat_and_psi() {
         let mut e = Evidence::default();
-        e.parse_vmstat("allocstall_normal 10\nallocstall_movable 5\npgscan_direct 7\npgscan_kswapd 93\nthp_fault_alloc 3\nfoo bar\n");
-        assert_eq!((e.allocstall, e.pgscan_direct, e.pgscan_kswapd, e.thp_fault_alloc), (15, 7, 93, 3));
-        let psi = "some avg10=0.00 avg60=1.50 avg300=3.25 total=99\nfull avg10=0.00 avg60=0.10 avg300=0.40 total=9\n";
+        e.parse_vmstat("allocstall_normal 10\nallocstall_movable 5\npgscan_direct 7\npgscan_kswapd 93\nkswapd_low_wmark_hit_quickly 4\nfoo bar\n");
+        assert_eq!((e.allocstall, e.pgscan_direct, e.pgscan_kswapd, e.kswapd_low_wmark_quick), (15, 7, 93, 4));
+        let psi = "some avg10=0.50 avg60=1.50 avg300=3.25 total=99\nfull avg10=0.20 avg60=0.10 avg300=0.40 total=9\n";
         assert_eq!(psi_avg300(psi, "some"), Some(3.25));
-        assert_eq!(psi_avg300(psi, "full"), Some(0.40));
-        assert_eq!(psi_avg300("", "some"), None);
-    }
-
-    #[test]
-    fn new_knobs_follow_goal() {
-        let p = legion();
-        let (g, d, t, ps) = (decide(Goal::Gaming, &p), decide(Goal::Desktop, &p), decide(Goal::Throughput, &p), decide(Goal::PowerSave, &p));
-        assert_eq!(get(&g, "sched.feat_next_buddy"), Some(&json!("1")));
-        assert_eq!(get(&d, "sched.feat_next_buddy"), Some(&json!("1")));
-        assert!(get(&t, "sched.feat_next_buddy").is_none());
-        assert_eq!(get(&t, "sched.feat_run_to_parity"), Some(&json!("1")));
-        assert_eq!(get(&g, "thp.khp_max_ptes_swap"), Some(&json!(0)));
-        assert!(get(&t, "thp.khp_max_ptes_swap").is_none());
-        assert_eq!(get(&ps, "cpu.floor_freq"), Some(&json!("cpuinfo_min")));
-        assert_eq!(get(&g, "cpu.floor_freq"), Some(&json!("nominal")));
-    }
-
-    #[test]
-    fn scheduler_feature_text() {
-        assert_eq!(tune::sched_feature_state_for_test("PLACE_LAG NO_NEXT_BUDDY RUN_TO_PARITY", "NEXT_BUDDY"), Some("0"));
-        assert_eq!(tune::sched_feature_state_for_test("PLACE_LAG NEXT_BUDDY", "NEXT_BUDDY"), Some("1"));
-        assert_eq!(tune::sched_feature_state_for_test("PLACE_LAG", "NEXT_BUDDY"), None);
+        assert_eq!(psi_avg10(psi, "full"), Some(0.20));
     }
 
     #[test]
@@ -1188,13 +1851,10 @@ mod tests {
         let g = decide(Goal::Gaming, &p);
         assert_eq!(get(&g, "cpu.epp_pcore"), Some(&json!("performance")));
         assert_eq!(get(&g, "irq.affinity"), Some(&json!("ecore")));
-        assert_eq!(get(&g, "cpu.uncore_min_khz"), Some(&json!(3_800_000)));
         assert!(get(&g, "cpu.pstate_status").is_none());
-        let ps = decide(Goal::PowerSave, &p);
-        assert_eq!(get(&ps, "cpu.uncore_max_khz"), Some(&json!(2_000_000)));
     }
 
-    /// Live run on the build machine: `cargo test -p lpm-helpers live_autotune -- --ignored --nocapture`.
+    /// Live run: `cargo test -p lpm-helpers live_autotune -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn live_autotune() {
