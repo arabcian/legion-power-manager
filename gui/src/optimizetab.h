@@ -21,6 +21,7 @@ class QLabel;
 class QLineEdit;
 class QPushButton;
 class QSpinBox;
+class Int64SpinBox;
 class QTabWidget;
 class QTimer;
 
@@ -58,7 +59,7 @@ private:
         QCheckBox *include = nullptr;
         QLabel *name = nullptr, *cur = nullptr;
         QComboBox *combo = nullptr;
-        QSpinBox *spin = nullptr;
+        Int64SpinBox *spin = nullptr;  // 64-bit: dirty limits exceed INT_MAX
         QPushButton *revert = nullptr;
     };
 
@@ -96,6 +97,9 @@ private:
     // Autotune: tune-helper {"op":"autotune"} profiles the hardware and
     // returns a preset for the chosen base (see lpm_helpers::autotune).
     void runAutotune();
+    /// Per-goal objective weights (QSettings autotune/weights/<goal>); empty = goal defaults.
+    QJsonObject autotuneWeights(const QString &goal) const;
+    void editAutotuneWeights();
     void showAutotuneReport(const QJsonObject &d, const QStringList &notLoaded);
 
     void applySelected();

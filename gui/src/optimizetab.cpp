@@ -39,7 +39,10 @@
 #include <QSet>
 #include <QSpacerItem>
 #include <QSpinBox>
-#include <QSpinBox>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QSettings>
+#include "int64spinbox.h"
 #include <QStandardPaths>
 #include <QTabWidget>
 #include <QTimer>
@@ -360,9 +363,15 @@ void OptimizeTab::buildUi() {
                                         "storage, battery, GPUs, kernel) and check every row with the value the chosen base calls for.\n"
                                         "Nothing is written until you press Apply checked; Save turns it into a preset."));
     connect(autoBtn_, &QPushButton::clicked, this, &OptimizeTab::runAutotune);
+    auto *weightsBtn = new QPushButton(QStringLiteral("Weights…"));
+    weightsBtn->setToolTip(QStringLiteral("How much this base values latency, throughput, power, memory footprint and stability.\n"
+                                          "Autotune writes a setting only when its expected gain under these weights beats leaving it alone;\n"
+                                          "hard safety limits cannot be bought with weights."));
+    connect(weightsBtn, &QPushButton::clicked, this, &OptimizeTab::editAutotuneWeights);
     autoRow->addWidget(autoLbl);
     autoRow->addWidget(autoGoal_);
     autoRow->addWidget(autoBtn_);
+    autoRow->addWidget(weightsBtn);
     autoRow->addWidget(muted(QStringLiteral("hardware-aware preset, reviewed before anything is applied")), 1);
     pl->addLayout(autoRow, 2, 0, 1, 8);
     root->addWidget(pbox);
@@ -790,7 +799,7 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
             r.cur->setTextInteractionFlags(Qt::TextSelectableByMouse);
             QWidget *editor;
             if (r.kind == "int") {
-                r.spin = new QSpinBox;
+                r.spin = new Int64SpinBox;
                 r.spin->setMinimumWidth(170);
                 r.spin->setAccelerated(true);
                 // Keyboard tracking off means valueChanged only fires on Enter/focus-out,
@@ -800,14 +809,14 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
                 // closes that gap without touching on every keystroke.
                 r.spin->setKeyboardTracking(false);
                 editor = r.spin;
-                connect(r.spin, &QSpinBox::valueChanged, this, [this, key] {
+                connect(r.spin, &Int64SpinBox::valueChanged, this, [this, key] {
                     if (Row *x = row(key)) { x->touched = true; x->include->setChecked(true); markRow(*x); }
                 });
                 // valueChanged doesn't fire if focus is lost without the number actually
                 // changing (e.g. typed it, then re-typed the same value) - editingFinished
                 // still does, and touched must be true the moment focus leaves or the next
                 // poll's updateRow (midEdit now false) would treat it as never-edited.
-                connect(r.spin, &QSpinBox::editingFinished, this, [this, key] {
+                connect(r.spin, &Int64SpinBox::editingFinished, this, [this, key] {
                     if (Row *x = row(key)) x->touched = true;
                 });
             } else {
@@ -924,7 +933,7 @@ void OptimizeTab::updateRow(Row &r, const QJsonObject &o) {
             // "current" and availability update underneath for when they blur out.
         } else {
             const QSignalBlocker b(r.spin);
-            r.spin->setRange(int(std::clamp<qint64>(r.min, INT_MIN, INT_MAX)), int(std::clamp<qint64>(r.max, INT_MIN, INT_MAX)));
+            r.spin->setRange(r.min, r.max);
             if (!setEditorValue(r, want)) setEditorValue(r, r.current);
         }
     }
@@ -978,7 +987,7 @@ bool OptimizeTab::setEditorValue(Row &r, const QString &v0) {
         const qint64 n = v.toLongLong(&ok);
         if (!ok || n < r.min || n > r.max) return false;
         const QSignalBlocker b(r.spin);
-        r.spin->setValue(int(n));
+        r.spin->setValue(n);
         return true;
     }
     if (r.combo) {
@@ -1298,8 +1307,64 @@ void OptimizeTab::runAutotune() {
     });
     QTimer::singleShot(AUTOTUNE_TIMEOUT_MS, p, [guard] { if (guard && guard->state() != QProcess::NotRunning) guard->kill(); });
     p->start(helperPath(), {});
-    p->write(QJsonDocument(QJsonObject{{"op", "autotune"}, {"goal", goal}}).toJson(QJsonDocument::Compact));
+    QJsonObject req{{"op", "autotune"}, {"goal", goal}};
+    if (const QJsonObject w = autotuneWeights(goal); !w.isEmpty()) req["weights"] = w;
+    p->write(QJsonDocument(req).toJson(QJsonDocument::Compact));
     p->closeWriteChannel();
+}
+
+// Mirror of lpm_helpers::autotune::Weights::for_goal (only used to prefill the editor).
+static QList<double> defaultWeights(const QString &goal) {
+    if (goal == QLatin1String("gaming")) return {1.0, 0.6, 0.15, 0.4, 1.0};
+    if (goal == QLatin1String("throughput")) return {0.2, 1.0, 0.2, 0.5, 1.0};
+    if (goal == QLatin1String("powersave")) return {0.2, 0.1, 1.0, 0.5, 1.0};
+    return {0.7, 0.3, 0.7, 0.6, 1.0};
+}
+static const char *const WEIGHT_KEYS[] = {"latency", "throughput", "power", "footprint", "stability"};
+
+QJsonObject OptimizeTab::autotuneWeights(const QString &goal) const {
+    const QByteArray raw = QSettings().value(QStringLiteral("autotune/weights/") + goal).toByteArray();
+    return QJsonDocument::fromJson(raw).object();
+}
+
+void OptimizeTab::editAutotuneWeights() {
+    const QString goal = autoGoal_->currentData().toString();
+    const QList<double> def = defaultWeights(goal);
+    const QJsonObject cur = autotuneWeights(goal);
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Autotune weights — %1").arg(autoGoal_->currentText()));
+    auto *form = new QFormLayout(&dlg);
+    form->addRow(muted(QStringLiteral("0 = ignore this objective, 1 = the goal's normal emphasis, up to 3.\n"
+                                      "Stability cannot go below 0.5. Saved per goal.")));
+    const QStringList labels = {QStringLiteral("Latency / smoothness"), QStringLiteral("Throughput"), QStringLiteral("Power / heat"),
+                                QStringLiteral("Memory footprint"), QStringLiteral("Stability")};
+    QList<QDoubleSpinBox *> boxes;
+    for (int i = 0; i < 5; ++i) {
+        auto *b = new QDoubleSpinBox;
+        b->setRange(i == 4 ? 0.5 : 0.0, 3.0);
+        b->setSingleStep(0.1);
+        b->setDecimals(2);
+        b->setValue(cur.contains(WEIGHT_KEYS[i]) ? cur.value(WEIGHT_KEYS[i]).toDouble() : def[i]);
+        form->addRow(labels[i], b);
+        boxes << b;
+    }
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel | QDialogButtonBox::RestoreDefaults);
+    connect(bb->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, &dlg, [&] { for (int i = 0; i < 5; ++i) boxes[i]->setValue(def[i]); });
+    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(bb);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QJsonObject w;
+    bool custom = false;
+    for (int i = 0; i < 5; ++i) {
+        w[WEIGHT_KEYS[i]] = boxes[i]->value();
+        custom |= qAbs(boxes[i]->value() - def[i]) > 1e-6;
+    }
+    const QString key = QStringLiteral("autotune/weights/") + goal;
+    if (custom) QSettings().setValue(key, QJsonDocument(w).toJson(QJsonDocument::Compact));
+    else QSettings().remove(key);
+    showStatus(custom ? QStringLiteral("Custom weights saved for %1; run Autotune to use them.").arg(autoGoal_->currentText())
+                      : QStringLiteral("%1 uses its default weights.").arg(autoGoal_->currentText()), theme::OK, 6000);
 }
 
 void OptimizeTab::showAutotuneReport(const QJsonObject &d, const QStringList &notLoaded) {
@@ -1326,6 +1391,23 @@ void OptimizeTab::showAutotuneReport(const QJsonObject &d, const QStringList &no
         v->addWidget(evl);
     }
 
+    {
+        QStringList w;
+        const QJsonObject wo = d.value(QStringLiteral("weights")).toObject();
+        for (const char *k : WEIGHT_KEYS) w << QStringLiteral("%1 %2").arg(QLatin1String(k)).arg(wo.value(k).toDouble(), 0, 'f', 2);
+        QStringList extra;
+        for (const auto &c : d.value(QStringLiteral("constraints")).toArray()) extra << QStringLiteral("constraint: ") + c.toString();
+        for (const auto &i : d.value(QStringLiteral("live_issues")).toArray()) {
+            const QJsonObject o = i.toObject();
+            extra << QStringLiteral("live %1: %2").arg(o.value("key").toString(), o.value("message").toString());
+        }
+        auto *wl = new QLabel(QStringLiteral("<b>Weights</b>&nbsp; %1%2").arg(w.join(QStringLiteral(" · ")).toHtmlEscaped(),
+            extra.isEmpty() ? QString() : QStringLiteral("<br>") + extra.join(QStringLiteral("<br>")).toHtmlEscaped()));
+        wl->setWordWrap(true);
+        wl->setTextFormat(Qt::RichText);
+        wl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        v->addWidget(wl);
+    }
     auto *table = new QTableWidget(0, 4);
     table->setHorizontalHeaderLabels({QStringLiteral("Group"), QStringLiteral("Setting"), QStringLiteral("Value"), QStringLiteral("Why (for this machine)")});
     table->verticalHeader()->hide();
@@ -1433,6 +1515,9 @@ void OptimizeTab::applyValues(const QJsonObject &values, const QString &preset) 
         QString msg = QStringLiteral("Applied: %1 file(s) written").arg(written);
         if (skipped) msg += QStringLiteral(", %1 not available").arg(skipped);
         if (refused) msg += QStringLiteral(", %1 refused by the kernel (IRQ/PCI, expected)").arg(refused);
+        if (res.contains(QStringLiteral("guard")))
+            msg += QStringLiteral(" · pressure guard watching %1 memory/writeback setting(s) for %2 s")
+                       .arg(res.value("guard").toObject().value("keys").toArray().size()).arg(res.value("guard").toObject().value("seconds").toInt());
         showStatus(msg, errors.isEmpty() ? theme::OK : theme::WARN, 10000);
         if (!errors.isEmpty()) QMessageBox::warning(this, "Apply", "Some settings failed:\n\n" + errors.join('\n'));
         for (Row &r : rows_) r.touched = false;

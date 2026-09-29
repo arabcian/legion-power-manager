@@ -26,6 +26,7 @@ add_executable(legion-power-manager
     src/vfcurvewidget.cpp src/vfcurvewidget.h
     src/nvidiatab.cpp    src/nvidiatab.h
     src/optimizetab.cpp  src/optimizetab.h
+    src/int64spinbox.cpp src/int64spinbox.h
     src/tray.cpp         src/tray.h
     src/scenes.cpp       src/scenes.h
     src/scenestab.cpp    src/scenestab.h
@@ -160,3 +161,13 @@ install(FILES data/legion-power-manager.desktop DESTINATION ${CMAKE_INSTALL_DATA
 install(FILES data/legion-power-manager-autostart.desktop DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/xdg/autostart
         RENAME legion-power-manager.desktop)
 install(FILES data/legion-power-manager.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+
+# GUI unit tests (64-bit editor path). Off by default; ctest runs them.
+option(LPM_BUILD_TESTS "Build GUI unit tests" OFF)
+if(LPM_BUILD_TESTS)
+    enable_testing()
+    add_executable(lpm-gui-tests tests/int64spinbox_test.cpp src/int64spinbox.cpp src/int64spinbox.h)
+    target_link_libraries(lpm-gui-tests PRIVATE Qt6::Widgets)
+    target_compile_definitions(lpm-gui-tests PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME int64spinbox COMMAND lpm-gui-tests)
+endif()

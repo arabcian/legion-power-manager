@@ -193,11 +193,11 @@ QToolButton { background: transparent; border: 1px solid transparent; border-rad
 QToolButton:hover { background: @BG3; }
 
 /* ── inputs: recessed wells; the frame lights up only on focus ── */
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @WELL; color: @FG; border: 1px solid @BORDER_SOFT;
+QLineEdit, QSpinBox, QDoubleSpinBox, Int64SpinBox, QComboBox { background: @WELL; color: @FG; border: 1px solid @BORDER_SOFT;
   border-radius: 6px; padding: 2px 7px; min-height: 18px; selection-background-color: @ACCENT_SOFT; selection-color: @FG; }
-QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover { border-color: @BORDER; }
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QComboBox:on { border-color: @ACCENT_SOFT; }
-QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled { background: transparent; color: @MUTED; border-color: @BORDER_SOFT; }
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, Int64SpinBox:hover, QComboBox:hover { border-color: @BORDER; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, Int64SpinBox:focus, QComboBox:focus, QComboBox:on { border-color: @ACCENT_SOFT; }
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, Int64SpinBox:disabled, QComboBox:disabled { background: transparent; color: @MUTED; border-color: @BORDER_SOFT; }
 QLineEdit:read-only { background: @BG1; }
 QPlainTextEdit, QTextEdit { background: @WELL; color: @FG; border: 1px solid @BORDER_SOFT; border-radius: 8px;
   padding: 5px 7px; selection-background-color: @ACCENT_SOFT; }
@@ -208,19 +208,19 @@ QComboBox::down-arrow:disabled { image: url(:/theme/chev-down-off.png); }
 QComboBox QAbstractItemView { background: @BG2; color: @FG; border: 1px solid @BORDER; border-radius: 8px; padding: 4px;
   selection-background-color: @BG4; selection-color: @FG; outline: none; }
 QComboBox QAbstractItemView::item { min-height: 22px; padding: 0 6px; border-radius: 5px; }
-QSpinBox, QDoubleSpinBox { padding-right: 18px; }
-QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right;
+QSpinBox, QDoubleSpinBox, Int64SpinBox { padding-right: 18px; }
+QSpinBox::up-button, QDoubleSpinBox, Int64SpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right;
   width: 17px; border: none; border-top-right-radius: 6px; background: transparent; }
-QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right;
+QSpinBox::down-button, QDoubleSpinBox, Int64SpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right;
   width: 17px; border: none; border-bottom-right-radius: 6px; background: transparent; }
 QSpinBox::up-button:hover, QSpinBox::down-button:hover,
-QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: @BG3; }
-QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url(:/theme/chev-up.png); width: 8px; height: 8px; }
-QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: url(:/theme/chev-down.png); width: 8px; height: 8px; }
+QDoubleSpinBox, Int64SpinBox::up-button:hover, QDoubleSpinBox, Int64SpinBox::down-button:hover { background: @BG3; }
+QSpinBox::up-arrow, QDoubleSpinBox, Int64SpinBox::up-arrow { image: url(:/theme/chev-up.png); width: 8px; height: 8px; }
+QSpinBox::down-arrow, QDoubleSpinBox, Int64SpinBox::down-arrow { image: url(:/theme/chev-down.png); width: 8px; height: 8px; }
 QSpinBox::up-arrow:disabled, QSpinBox::up-arrow:off,
-QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:off { image: url(:/theme/chev-up-off.png); }
+QDoubleSpinBox, Int64SpinBox::up-arrow:disabled, QDoubleSpinBox, Int64SpinBox::up-arrow:off { image: url(:/theme/chev-up-off.png); }
 QSpinBox::down-arrow:disabled, QSpinBox::down-arrow:off,
-QDoubleSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:off { image: url(:/theme/chev-down-off.png); }
+QDoubleSpinBox, Int64SpinBox::down-arrow:disabled, QDoubleSpinBox, Int64SpinBox::down-arrow:off { image: url(:/theme/chev-down-off.png); }
 QPlainTextEdit#terminal { background: @WELL; color: @FG_DIM; border: 1px solid @BORDER_SOFT; border-radius: 8px; font-family: monospace; }
 
 /* ── lists and tables ── */
