@@ -28,6 +28,22 @@ const Palette PALETTES[] = {
         "#eceff4", "#d8dee9", "#8a93a6", "#88c0d0", "#5e8a99", "#a3be8c", "#ebcb8b", "#bf616a", "#7d4148", "#81a1c1", "#b48ead"}},
     {"catppuccin", "Catppuccin Mocha", {"#181825", "#1e1e2e", "#262637", "#313244", "#45475a", "#11111b", "#3b3d52", "#2a2b3c",
         "#cdd6f4", "#bac2de", "#7f849c", "#cba6f7", "#8a6fb3", "#a6e3a1", "#f9e2af", "#f38ba8", "#8b4a60", "#89b4fa", "#f5c2e7"}},
+    {"horizon", "Horizon", {"#16171d", "#1c1e26", "#232530", "#2e303e", "#393b4d", "#121318", "#3d3f52", "#272936",
+        "#fdf0ed", "#d5d8da", "#6c6f93", "#e95678", "#93384b", "#29d398", "#fab795", "#f43e5c", "#8a2536", "#26bbd9", "#ee64ac"}},
+    {"oxocarbon", "Oxocarbon", {"#0f0f0f", "#161616", "#1e1e1e", "#262626", "#393939", "#0b0b0b", "#353535", "#222222",
+        "#f2f4f8", "#dde1e6", "#8d8d8d", "#42be65", "#2a7a41", "#08bdba", "#f1c21b", "#ee5396", "#8a2f56", "#78a9ff", "#be95ff"}},
+    {"monokai-pro", "Monokai Pro", {"#19181a", "#221f22", "#2d2a2e", "#363337", "#403e41", "#151416", "#444145", "#2f2c30",
+        "#fcfcfa", "#c1c0c0", "#939293", "#ffd866", "#a88f45", "#a9dc76", "#fc9867", "#ff6188", "#9a3b55", "#78dce8", "#ab9df2"}},
+    {"rose-pine", "Rosé Pine", {"#13111c", "#191724", "#1f1d2e", "#26233a", "#312e48", "#100e17", "#403d52", "#21202e",
+        "#e0def4", "#908caa", "#6e6a86", "#ebbcba", "#9a7a79", "#9ccfd8", "#f6c177", "#eb6f92", "#8f4259", "#569fba", "#c4a7e7"}},
+    {"kanagawa-dragon", "Kanagawa Dragon", {"#0d0c0c", "#181616", "#201d1d", "#282727", "#393836", "#0a0909", "#403e3b", "#242222",
+        "#c5c9c5", "#a6a69c", "#737c73", "#b6927b", "#7a6252", "#87a987", "#c4b28a", "#c4746e", "#7a4541", "#8ba4b0", "#a292a3"}},
+    {"everforest", "Everforest", {"#232a2e", "#2d353b", "#343f44", "#3d484d", "#475258", "#1e2326", "#4f585e", "#384147",
+        "#d3c6aa", "#9da9a0", "#7a8478", "#a7c080", "#6d7e52", "#83c092", "#dbbc7f", "#e67e80", "#8a4b4c", "#7fbbb3", "#d699b6"}},
+    {"ayu-mirage", "Ayu Mirage", {"#171b24", "#1f2430", "#242936", "#2a3040", "#343b4d", "#141820", "#3a4152", "#2a303c",
+        "#cccac2", "#b3b1ad", "#707a8c", "#ffcc66", "#a88744", "#d5ff80", "#ffad66", "#f28779", "#8f4f47", "#73d0ff", "#dfbfff"}},
+    {"synthwave", "Synthwave '84", {"#1b1628", "#241b2f", "#262335", "#2f2a42", "#3b3452", "#17121f", "#463d5e", "#2c2640",
+        "#ffffff", "#d6cfe4", "#848bbd", "#ff7edb", "#a34f8c", "#72f1b8", "#fede5d", "#fe4450", "#8f2830", "#36f9f6", "#b893ce"}},
     // Originals: Legion black with its red, and a cold blue-green night.
     {"crimson", "Crimson", {"#111112", "#18181a", "#1f1f22", "#28282c", "#333338", "#0c0c0d", "#2e2e33", "#222226",
         "#eeeeee", "#b8b8bc", "#87878e", "#e5484d", "#9c3236", "#7fc98f", "#f0c05a", "#ff7a59", "#8f4632", "#7aa7d9", "#b39ddb"}},
@@ -121,7 +137,10 @@ QTabWidget#mainTabs { background: @BG1; }
 QTabWidget#mainTabs::pane { border: none; border-top: 1px solid @BORDER_SOFT; background: @BG0; top: -1px; }
 QTabWidget#mainTabs::tab-bar { left: 36px; }
 QTabWidget#mainTabs > QTabBar { background: transparent; }
-QTabWidget#mainTabs > QTabBar::tab { padding: 10px 11px 8px 11px; margin: 0 1px; }
+QTabWidget#mainTabs > QTabBar::tab { background: @BG2; color: @MUTED; border: 1px solid @BORDER_SOFT; border-radius: 7px;
+  padding: 6px 8px; margin: 6px 2px; }
+QTabWidget#mainTabs > QTabBar::tab:hover:!selected { background: @BG3; color: @FG_DIM; border-color: @BORDER; }
+QTabWidget#mainTabs > QTabBar::tab:selected { background: @BG3; color: @FG; border-color: @ACCENT; }
 QLabel#appMark { background: transparent; }
 
 /* ── sub-tabs (inside a page): quieter, same grammar ── */
@@ -174,11 +193,11 @@ QToolButton { background: transparent; border: 1px solid transparent; border-rad
 QToolButton:hover { background: @BG3; }
 
 /* ── inputs: recessed wells; the frame lights up only on focus ── */
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: @WELL; color: @FG; border: 1px solid @BORDER_SOFT;
+QLineEdit, QSpinBox, QDoubleSpinBox, Int64SpinBox, QComboBox { background: @WELL; color: @FG; border: 1px solid @BORDER_SOFT;
   border-radius: 6px; padding: 2px 7px; min-height: 18px; selection-background-color: @ACCENT_SOFT; selection-color: @FG; }
-QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover { border-color: @BORDER; }
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QComboBox:on { border-color: @ACCENT_SOFT; }
-QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled { background: transparent; color: @MUTED; border-color: @BORDER_SOFT; }
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, Int64SpinBox:hover, QComboBox:hover { border-color: @BORDER; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, Int64SpinBox:focus, QComboBox:focus, QComboBox:on { border-color: @ACCENT_SOFT; }
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, Int64SpinBox:disabled, QComboBox:disabled { background: transparent; color: @MUTED; border-color: @BORDER_SOFT; }
 QLineEdit:read-only { background: @BG1; }
 QPlainTextEdit, QTextEdit { background: @WELL; color: @FG; border: 1px solid @BORDER_SOFT; border-radius: 8px;
   padding: 5px 7px; selection-background-color: @ACCENT_SOFT; }
@@ -189,19 +208,19 @@ QComboBox::down-arrow:disabled { image: url(:/theme/chev-down-off.png); }
 QComboBox QAbstractItemView { background: @BG2; color: @FG; border: 1px solid @BORDER; border-radius: 8px; padding: 4px;
   selection-background-color: @BG4; selection-color: @FG; outline: none; }
 QComboBox QAbstractItemView::item { min-height: 22px; padding: 0 6px; border-radius: 5px; }
-QSpinBox, QDoubleSpinBox { padding-right: 18px; }
-QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right;
+QSpinBox, QDoubleSpinBox, Int64SpinBox { padding-right: 18px; }
+QSpinBox::up-button, QDoubleSpinBox, Int64SpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right;
   width: 17px; border: none; border-top-right-radius: 6px; background: transparent; }
-QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right;
+QSpinBox::down-button, QDoubleSpinBox, Int64SpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right;
   width: 17px; border: none; border-bottom-right-radius: 6px; background: transparent; }
 QSpinBox::up-button:hover, QSpinBox::down-button:hover,
-QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: @BG3; }
-QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url(:/theme/chev-up.png); width: 8px; height: 8px; }
-QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image: url(:/theme/chev-down.png); width: 8px; height: 8px; }
+QDoubleSpinBox, Int64SpinBox::up-button:hover, QDoubleSpinBox, Int64SpinBox::down-button:hover { background: @BG3; }
+QSpinBox::up-arrow, QDoubleSpinBox, Int64SpinBox::up-arrow { image: url(:/theme/chev-up.png); width: 8px; height: 8px; }
+QSpinBox::down-arrow, QDoubleSpinBox, Int64SpinBox::down-arrow { image: url(:/theme/chev-down.png); width: 8px; height: 8px; }
 QSpinBox::up-arrow:disabled, QSpinBox::up-arrow:off,
-QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:off { image: url(:/theme/chev-up-off.png); }
+QDoubleSpinBox, Int64SpinBox::up-arrow:disabled, QDoubleSpinBox, Int64SpinBox::up-arrow:off { image: url(:/theme/chev-up-off.png); }
 QSpinBox::down-arrow:disabled, QSpinBox::down-arrow:off,
-QDoubleSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:off { image: url(:/theme/chev-down-off.png); }
+QDoubleSpinBox, Int64SpinBox::down-arrow:disabled, QDoubleSpinBox, Int64SpinBox::down-arrow:off { image: url(:/theme/chev-down-off.png); }
 QPlainTextEdit#terminal { background: @WELL; color: @FG_DIM; border: 1px solid @BORDER_SOFT; border-radius: 8px; font-family: monospace; }
 
 /* ── lists and tables ── */

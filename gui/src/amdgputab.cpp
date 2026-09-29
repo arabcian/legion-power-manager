@@ -667,7 +667,7 @@ void AmdGpuTab::saveProfile() {
     bool ok = false;
     const QString name = QInputDialog::getText(this, QStringLiteral("Save profile"), QStringLiteral("Name:"), QLineEdit::Normal,
                                                profileCombo_->currentText(), &ok).trimmed();
-    static const QRegularExpression valid(QStringLiteral("^[\\w .-]{1,40}$"));
+    static const QRegularExpression valid(QStringLiteral("^[\\w .-]{1,40}\\z"));
     if (!ok || name.isEmpty()) return;
     if (!valid.match(name).hasMatch() || name.startsWith('.')) { status(QStringLiteral("✗ Use letters, digits, space, . _ -"), theme::DANGER); return; }
     QFile f(profilesDir() + '/' + name + QStringLiteral(".json"));

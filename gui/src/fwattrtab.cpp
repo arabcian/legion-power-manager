@@ -1,3 +1,4 @@
+#include <memory>
 #include "fwattrtab.h"
 #include <QFileInfo>
 #include <QStandardPaths>
@@ -37,13 +38,13 @@ static QString gpuHelperPath() { return privileged::helperPath(QStringLiteral("l
 // Attributes lenovo-wmi-other lists with min=max=step=0: the kernel rejects any
 // sysfs write to them (EINVAL). They are written through \_SB.GZFD.WMAE instead.
 // Ranges: Dynamic Boost ceiling/floor 0..25 W (as Legion Space shows them);
-// cTGP deliberately left wide (0..250 sanity cap) for testing.
+// cTGP 5..150 until the helper reports this GPU model's own ceiling.
 // Lower bound 1, never 0: writing 0 makes the firmware treat the feature as off
 // and the kernel drops the attribute from sysfs (only a Windows power-profile
 // reset brought it back). The helpers refuse 0 as well.
 struct WmiKnob { const char *attr, *key; int lo, hi; };
 static const WmiKnob WMI_KNOBS[] = {
-    {"gpu_nv_ctgp", "ctgp", 1, 250},
+    {"gpu_nv_ctgp", "ctgp", 5, 150},
     {"gpu_nv_ppab", "boost_up", 1, 25},
     {"gpu_nv_cpu_boost", "boost_down", 1, 25},
 };
@@ -182,6 +183,17 @@ FwattrTab::FwattrTab(QWidget *parent) : QWidget(parent) {
                 {"boost_mhz", "Boost override (MHz)", "Max CPU boost clock override, added to stock fmax."},
                 {"curve_optimizer", "All-core CO", "Firmware all-core Curve Optimizer; negative = undervolt.\nRuntime per-core CO stays in the Ryzen tab."},
             };
+            // One Apply for all tunes: writes only the changed ones, in one helper call.
+            auto spins = std::make_shared<QList<std::pair<QString, QSpinBox *>>>();
+            auto *btn = new QPushButton("Apply");
+            btn->setObjectName("btnAccent");
+            btn->setEnabled(false);
+            btn->setToolTip("Stored in the BIOS, applied at the next boot. Asks for the administrator password.");
+            auto dirty = [spins, btn] {
+                bool any = false;
+                for (const auto &[k, sb] : *spins) any |= sb->value() != sb->property("stored").toInt();
+                btn->setEnabled(any);
+            };
             for (const auto &d : DEFS) {
                 if (!t.contains(d.key)) continue;
                 const QJsonObject v = t.value(d.key).toObject();
@@ -189,22 +201,29 @@ FwattrTab::FwattrTab(QWidget *parent) : QWidget(parent) {
                 auto *sb = new QSpinBox;
                 sb->setRange(v.value("min").toInt(), v.value("max").toInt());
                 sb->setValue(v.value("value").toInt());
+                sb->setProperty("stored", sb->value());
                 sb->setToolTip(d.tip);
-                auto *btn = new QPushButton("Set");
-                btn->setFixedWidth(46);
-                btn->setToolTip("Stored in the BIOS, applied at the next boot. Asks for the administrator password.");
-                const QString key = d.key;
-                connect(btn, &QPushButton::clicked, this, [this, sb, btn, key, note] {
-                    btn->setEnabled(false);
-                    privileged::run(privileged::helperPath(privileged::FIRMWARE_HELPER),
-                                    QJsonObject{{"op", "set_fw_oc"}, {"key", key}, {"value", sb->value()}}, this,
-                                    [btn, note, key](const privileged::Result &r) {
-                        btn->setEnabled(true);
-                        note->setText(r.ok() ? key + QStringLiteral(" saved — reboot to apply") : key + QStringLiteral(" failed: ") + r.message());
-                    }, privileged::FIRMWARE_TIMEOUT_MS);
-                });
-                ol->addWidget(lbl); ol->addWidget(sb); ol->addWidget(btn); ol->addSpacing(8);
+                connect(sb, &QSpinBox::valueChanged, this, dirty);
+                spins->append({QString::fromLatin1(d.key), sb});
+                ol->addWidget(lbl); ol->addWidget(sb); ol->addSpacing(8);
             }
+            connect(btn, &QPushButton::clicked, this, [this, spins, btn, note, dirty] {
+                QJsonObject vals;
+                for (const auto &[k, sb] : *spins)
+                    if (sb->value() != sb->property("stored").toInt()) vals[k] = sb->value();
+                if (vals.isEmpty()) return;
+                btn->setEnabled(false);
+                privileged::run(privileged::helperPath(privileged::FIRMWARE_HELPER),
+                                QJsonObject{{"op", "set_fw_oc_many"}, {"values", vals}}, this,
+                                [spins, note, vals, dirty](const privileged::Result &r) {
+                    if (r.ok())
+                        for (const auto &[k, sb] : *spins) if (vals.contains(k)) sb->setProperty("stored", sb->value());
+                    note->setText(r.ok() ? QStringLiteral("%1 change(s) saved — reboot to apply").arg(vals.size())
+                                         : QStringLiteral("Failed: ") + r.message());
+                    dirty();
+                }, privileged::FIRMWARE_TIMEOUT_MS);
+            });
+            if (!spins->isEmpty()) ol->addWidget(btn);
             ol->addStretch(1);
             ol->addWidget(note);
             note->setText(mode == 0 ? QStringLiteral("OC is disabled in BIOS setup — values are ignored")
@@ -382,7 +401,7 @@ void FwattrTab::rebuild() {
                     "boost</b> are reported by the firmware without a valid range (min = max = 0), so the kernel refuses "
                     "to write them through sysfs. These three are written directly through the Lenovo WMI method "
                     "(<tt>\\_SB.GZFD.WMAE</tt>) with <tt>acpi_call</tt> and read back from it. Boost limits use 1–25 W (0 is never written: the firmware would drop the attribute); "
-                    "cTGP is left unclamped for testing — the GPU itself caps it (150 W on this model). "
+                    "cTGP range follows the GPU model: 5 W up to its vBIOS max power limit minus Dynamic Boost (150 W on an RTX 5080 Laptop). "
                     "Needs the <tt>acpi_call</tt> module.").arg(theme::PURPLE));
                 note->setTextFormat(Qt::RichText);
                 note->setWordWrap(true);
@@ -534,8 +553,14 @@ void FwattrTab::readWmi() {
             if (have) {
                 const int v = o.value("value").toInt();
                 row.info.current = v;
-                // cTGP can hold values above its (test) range; widen rather than clip the display.
-                if (v > row.spin->maximum()) { row.spin->setMaximum(v); if (row.slider) row.slider->setMaximum(v); }
+                // Range from the helper: for cTGP it follows the GPU model (vBIOS
+                // max power limit minus Dynamic Boost), cached while the dGPU sleeps.
+                if (o.contains("min") && o.contains("max")) {
+                    const int lo = std::max(1, o.value("min").toInt()), hi = std::max(lo, o.value("max").toInt());
+                    row.info.wmiMin = lo; row.info.wmiMax = hi;
+                    row.spin->setRange(lo, hi);
+                    if (row.slider) row.slider->setRange(lo, hi);
+                }
                 row.spin->setValue(v);
             }
             row.spin->setEnabled(have);

@@ -576,7 +576,8 @@ void IntelTab::setProfile(const QJsonObject &p) {
             hwpThreshold_->setValue(r.value("load").toObject().value("threshold").toDouble(0.8));
         } else {
             hwpAlgo_->setCurrentIndex(1);
-            const QJsonObject t = r.value("power").toArray().first().toObject();
+            const QJsonArray pw = r.value("power").toArray();
+            const QJsonObject t = pw.isEmpty() ? QJsonObject() : pw.first().toObject();
             hwpDomain_->setCurrentText(t.value("domain").toString("package"));
             hwpCmp_->setCurrentIndex(t.value("gt").toBool(true) ? 0 : 1);
             hwpWatts_->setValue(t.value("watts").toDouble());
@@ -998,7 +999,7 @@ void IntelTab::saveProfile() {
     const QString name = QInputDialog::getText(this, "Save Profile", "Profile name:", QLineEdit::Normal,
                                                profileCombo_->currentText(), &ok).trimmed();
     if (!ok) return;
-    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$"));
+    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}\\z"));
     if (!re.match(name).hasMatch()) {
         QMessageBox::warning(this, "Invalid Name", "Use 1-64 characters: letters, digits, space, underscore or hyphen.");
         return;

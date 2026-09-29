@@ -13,6 +13,10 @@
 #include <QClipboard>
 #include <QAbstractItemView>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QHeaderView>
+#include <QTableWidget>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -35,7 +39,10 @@
 #include <QSet>
 #include <QSpacerItem>
 #include <QSpinBox>
-#include <QSpinBox>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QSettings>
+#include "int64spinbox.h"
 #include <QStandardPaths>
 #include <QTabWidget>
 #include <QTimer>
@@ -43,15 +50,26 @@
 #include <algorithm>
 #include <climits>
 
-static constexpr int POLL_MS = 4000, DESCRIBE_TIMEOUT_MS = 8000, PKEXEC_TIMEOUT_MS = 120000;
+static constexpr int POLL_MS = 4000, DESCRIBE_TIMEOUT_MS = 8000, PKEXEC_TIMEOUT_MS = 120000, AUTOTUNE_TIMEOUT_MS = 20000;
 static constexpr qint64 MAX_PRESET_BYTES = 256 * 1024;
-static const char *GROUPS[] = {"CPU", "Memory", "Scheduler", "Storage", "Network", "Devices", "Stability"};
+static const char *GROUPS[] = {"CPU", "Memory", "Scheduler", "Storage", "Network", "Devices", "Power", "Stability"};
 static const QString GAMEMODE = QStringLiteral("/usr/bin/lpm-gamemode");
 // lpm-gamemode PRE/WRAP apply these curve profiles (exact name) when enabled.
 static const QString UNDERVOLT_PROFILE = QStringLiteral("GAMING");
 static const QString NVCURVE_PROFILES = QStringLiteral("/etc/nvcurve/profiles");
 
 static QString helperPath() { return privileged::helperPath(QStringLiteral("tune-helper")); }
+
+// Ops that can only put saved originals back or apply an *approved* preset by name go to tune-profile-helper;
+// raw values, the boot preset, the preset store and driver options go to tune-helper (install.sh security level 3
+// asks for the password there only).
+static QString helperForOp(const QString &op) {
+    static const QStringList profileOps{"snapshot", "apply_preset", "release", "prune", "restore", "restore_keys", "boost", "isolate_join", "tool"};
+    return privileged::helperPath(profileOps.contains(op) ? QStringLiteral("tune-profile-helper") : QStringLiteral("tune-helper"));
+}
+
+// Root-owned copy of a preset that tune-profile-helper / lpm-gamemode apply by name.
+static bool storeHas(const QString &name) { return QFile::exists(QStringLiteral("/etc/legion-power-manager/presets/") + name + QStringLiteral(".json")); }
 
 // ── built-in presets ────────────────────────────────────────────────────────
 // Templates only: values a machine does not offer are skipped on load. Keep
@@ -74,12 +92,12 @@ static const Builtin BUILTINS[] = {
         "kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
         "kernel.sched_autogroup":1,"kernel.cfs_bandwidth_slice_us":3000,
         "sched.preempt":"full","sched.base_slice_ns":1000000,"sched.migration_cost_ns":500000,"sched.nr_migrate":32,
-        "wq.power_efficient":"0","wq.cpumask":"frequency","irq.affinity":"frequency",
+        "wq.cpumask":"frequency","irq.affinity":"frequency",
         "blk.scheduler":"none","pci.aspm":"performance","pci.latency_timer":"tuned",
         "snd.hda_power_save":0,"snd.hda_power_save_controller":"0","usb.autosuspend":-1,"gpu.amdgpu_dpm":"low"},
       "run":{"nice":-5,"autogroup":true,"affinity":"cache"}})"},
     {"amd", "Competitive",
-     "Gaming X3D taken to the limit: frequency CCD parked, deep C-states off. Maximum determinism, most heat.",
+     "Gaming X3D taken to the limit: frequency CCD parked (in game mode emptied, not taken offline), deep C-states off. Maximum determinism, most heat.",
      R"({"values":{
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.boost":"1",
         "cpu.governor_ccd0":"powersave","cpu.governor_ccd1":"powersave","cpu.epp_ccd0":"performance","cpu.epp_ccd1":"balance_power",
@@ -87,8 +105,7 @@ static const Builtin BUILTINS[] = {
         "thp.enabled":"madvise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,"mm.lru_gen_min_ttl":1000,
         "mm.ksm_run":0,"vm.max_map_count":2147483642,"vm.swappiness":10,"vm.stat_interval":10,"vm.page_cluster":0,
         "kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,"kernel.timer_migration":0,
-        "sched.preempt":"full","sched.base_slice_ns":1000000,"wq.power_efficient":"0",
-        "blk.scheduler":"none","pci.aspm":"performance","snd.hda_power_save":0,"usb.autosuspend":-1,
+        "sched.preempt":"full","sched.base_slice_ns":1000000,"blk.scheduler":"none","pci.aspm":"performance","snd.hda_power_save":0,"usb.autosuspend":-1,
         "gpu.amdgpu_dpm":"low","cpu.ccd_park":"frequency"},
       "run":{"nice":-10,"autogroup":true,"affinity":"cache"}})"},
     {"amd", "Low latency desktop",
@@ -97,7 +114,7 @@ static const Builtin BUILTINS[] = {
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance",
         "cpu.min_freq":"lowest_nonlinear","thp.enabled":"madvise","thp.defrag":"defer+madvise",
         "mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,"vm.max_map_count":2147483642,"vm.page_cluster":0,
-        "kernel.split_lock_mitigate":0,"sched.preempt":"full","wq.power_efficient":"0","snd.hda_power_save":0},
+        "kernel.split_lock_mitigate":0,"sched.preempt":"full","snd.hda_power_save":0},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
     {"amd", "Compile throughput",
      "Long parallel builds (emerge, kernel): frequency CCD preferred, throughput preemption, bigger slices.",
@@ -121,7 +138,9 @@ static const Builtin BUILTINS[] = {
         "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"power","cpu.boost":"0",
         "cpu.min_freq":"cpuinfo_min","cpu.cstate_max":"all","pci.aspm":"powersupersave",
         "snd.hda_power_save":1,"snd.hda_power_save_controller":"1","usb.autosuspend":2,
-        "wq.power_efficient":"1","kernel.watchdog":1,"gpu.amdgpu_dpm":"auto","vm.stat_interval":10},
+        "kernel.watchdog":1,"gpu.amdgpu_dpm":"auto","vm.stat_interval":10,
+        "net.wol":"0","gpu.amdgpu_abm":3,
+        "pm.ahci_runtime_timeout":15000,"pm.ahci_disk_runtime":"auto","pm.ahci_port_runtime":"auto","disk.apm_0":128,"disk.apm_1":128},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
     // ── Intel (hybrid P/E-core) ──────────────────────────────────────────────
     {"intel", "Intel gaming hybrid",
@@ -137,7 +156,7 @@ static const Builtin BUILTINS[] = {
         "kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
         "kernel.sched_autogroup":1,"kernel.cfs_bandwidth_slice_us":3000,
         "sched.preempt":"full","sched.base_slice_ns":1000000,"sched.migration_cost_ns":500000,"sched.nr_migrate":32,
-        "wq.power_efficient":"0","wq.cpumask":"ecore","irq.affinity":"ecore",
+        "wq.cpumask":"ecore","irq.affinity":"ecore",
         "blk.scheduler":"none","pci.aspm":"performance","pci.latency_timer":"tuned",
         "snd.hda_power_save":0,"snd.hda_power_save_controller":"0","usb.autosuspend":-1,
         "gpu.intel_slpc_profile":"power_saving"},
@@ -150,8 +169,7 @@ static const Builtin BUILTINS[] = {
         "cpu.cstate_max":"1","thp.enabled":"madvise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,
         "mm.lru_gen_min_ttl":1000,"mm.ksm_run":0,"vm.max_map_count":2147483642,"vm.swappiness":10,"vm.stat_interval":10,
         "vm.page_cluster":0,"kernel.split_lock_mitigate":0,"kernel.watchdog":0,"kernel.numa_balancing":0,
-        "kernel.timer_migration":0,"sched.preempt":"full","sched.base_slice_ns":1000000,"wq.power_efficient":"0",
-        "wq.cpumask":"ecore","irq.affinity":"ecore","blk.scheduler":"none","pci.aspm":"performance",
+        "kernel.timer_migration":0,"sched.preempt":"full","sched.base_slice_ns":1000000,"wq.cpumask":"ecore","irq.affinity":"ecore","blk.scheduler":"none","pci.aspm":"performance",
         "snd.hda_power_save":0,"usb.autosuspend":-1,"gpu.intel_slpc_profile":"power_saving"},
       "run":{"nice":-10,"autogroup":true,"affinity":"pcore"}})"},
     {"intel", "Intel low latency desktop",
@@ -160,7 +178,7 @@ static const Builtin BUILTINS[] = {
         "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance","cpu.hwp_dynamic_boost":"1",
         "thp.enabled":"madvise","thp.defrag":"defer+madvise","mm.lru_gen":7,"mm.lru_gen_min_ttl":1000,
         "vm.max_map_count":2147483642,"vm.page_cluster":0,"kernel.split_lock_mitigate":0,"sched.preempt":"full",
-        "wq.power_efficient":"0","snd.hda_power_save":0},
+        "snd.hda_power_save":0},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
     {"intel", "Intel compile throughput",
      "Long parallel builds: every P- and E-core busy, balance_performance EPP, throughput preemption, bigger slices.",
@@ -177,8 +195,9 @@ static const Builtin BUILTINS[] = {
         "cpu.intel_pstate_status":"active","cpu.governor":"powersave","cpu.epp":"power","cpu.epp_pcore":"balance_power",
         "cpu.epp_ecore":"power","cpu.boost":"0","cpu.hwp_dynamic_boost":"0","cpu.min_freq":"cpuinfo_min",
         "cpu.cstate_max":"all","pci.aspm":"powersupersave","snd.hda_power_save":1,"snd.hda_power_save_controller":"1",
-        "usb.autosuspend":2,"wq.power_efficient":"1","kernel.watchdog":1,"gpu.intel_slpc_profile":"power_saving",
-        "vm.stat_interval":10},
+        "usb.autosuspend":2,"kernel.watchdog":1,"gpu.intel_slpc_profile":"power_saving",
+        "vm.stat_interval":10,"net.wol":"0",
+        "pm.ahci_runtime_timeout":15000,"pm.ahci_disk_runtime":"auto","pm.ahci_port_runtime":"auto","disk.apm_0":128,"disk.apm_1":128},
       "run":{"nice":0,"autogroup":true,"affinity":"none"}})"},
 };
 
@@ -201,7 +220,7 @@ static QJsonObject builtinObject(const Builtin &b) {
 
 /// Same rule as lpm-gamemode's valid_name().
 static bool validPresetName(const QString &n) {
-    static const QRegularExpression re(QStringLiteral(R"(^[\p{L}\p{N}][\p{L}\p{N} _.\-]{0,63}$)"));
+    static const QRegularExpression re(QStringLiteral(R"(^[\p{L}\p{N}][\p{L}\p{N} _.\-]{0,63}\z)"));
     return re.match(n).hasMatch() && !n.contains(QStringLiteral("..")) && n.toUtf8().size() <= 64;
 }
 
@@ -324,6 +343,37 @@ void OptimizeTab::buildUi() {
     bootLabel_ = muted({});
     bootLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     pl->addWidget(bootLabel_, 1, 5, 1, 3);
+
+    // Autotune: pick a base, the helper profiles the hardware and fills the rows.
+    auto *autoRow = new QHBoxLayout;
+    autoRow->setSpacing(6);
+    auto *autoLbl = new QLabel(QStringLiteral("Autotune for"));
+    autoGoal_ = new QComboBox;
+    autoGoal_->addItem(QStringLiteral("Power saving"), QStringLiteral("powersave"));
+    autoGoal_->addItem(QStringLiteral("Gaming (latency + throughput)"), QStringLiteral("gaming"));
+    autoGoal_->addItem(QStringLiteral("Bare throughput"), QStringLiteral("throughput"));
+    autoGoal_->addItem(QStringLiteral("Optimal desktop"), QStringLiteral("desktop"));
+    autoGoal_->setCurrentIndex(3);
+    autoGoal_->setToolTip(QStringLiteral("Power saving: battery life and low heat first.\n"
+                                         "Gaming: frame-time consistency and input latency, then throughput.\n"
+                                         "Bare throughput: most work per second for builds, encodes, compute.\n"
+                                         "Optimal desktop: responsive everyday use at sensible power."));
+    autoBtn_ = new QPushButton(QStringLiteral("⚙ Autotune"));
+    autoBtn_->setToolTip(QStringLiteral("Profile this machine (CPU topology, V-Cache/hybrid, cpufreq driver, C-state latencies, RAM, swap,\n"
+                                        "storage, battery, GPUs, kernel) and check every row with the value the chosen base calls for.\n"
+                                        "Nothing is written until you press Apply checked; Save turns it into a preset."));
+    connect(autoBtn_, &QPushButton::clicked, this, &OptimizeTab::runAutotune);
+    auto *weightsBtn = new QPushButton(QStringLiteral("Weights…"));
+    weightsBtn->setToolTip(QStringLiteral("How much this base values latency, throughput, power, memory footprint and stability.\n"
+                                          "Autotune writes a setting only when its expected gain under these weights beats leaving it alone;\n"
+                                          "hard safety limits cannot be bought with weights."));
+    connect(weightsBtn, &QPushButton::clicked, this, &OptimizeTab::editAutotuneWeights);
+    autoRow->addWidget(autoLbl);
+    autoRow->addWidget(autoGoal_);
+    autoRow->addWidget(autoBtn_);
+    autoRow->addWidget(weightsBtn);
+    autoRow->addWidget(muted(QStringLiteral("hardware-aware preset, reviewed before anything is applied")), 1);
+    pl->addLayout(autoRow, 2, 0, 1, 8);
     root->addWidget(pbox);
 
     groups_ = new QTabWidget;
@@ -607,6 +657,7 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
     bool topoChanged = topo != topology_;
     topology_ = topo;
     state_ = d.value("state").toObject();
+    isolation_ = d.value("isolation").toObject();  // same describe poll: no extra cost
     boot_ = d.value("boot").toObject();
     const QJsonArray rows = d.value("tunables").toArray();
 
@@ -623,21 +674,17 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
 
     // Affinity choices follow the live topology.
     if (affinity_ && (topoChanged || affinity_->count() == 0) && !affinity_->view()->isVisible()) {
-        const QString keep = affinity_->currentData().toString();
+        const QString keep = canonicalCcd(affinity_->currentData().toString());
         const QSignalBlocker b(affinity_);
         affinity_->clear();
         affinity_->addItem("none (scheduler decides)", "none");
         const QJsonArray ccds = topology_.value("ccds").toArray();
-        auto ccdText = [&](int i) {
-            for (const auto &c : ccds) if (c.toObject().value("index").toInt() == i)
-                return QStringLiteral("CCD%1: %2").arg(i).arg(c.toObject().value("cpus").toString());
-            return QStringLiteral("CCD%1").arg(i);
-        };
-        if (!topology_.value("cache_ccd").isNull()) affinity_->addItem("V-Cache CCD (" + ccdText(topology_.value("cache_ccd").toInt()) + ")", "cache");
-        if (!topology_.value("frequency_ccd").isNull()) affinity_->addItem("frequency CCD (" + ccdText(topology_.value("frequency_ccd").toInt()) + ")", "frequency");
+        // One entry per CCD, named by its role (no separate cache/frequency aliases).
+        const int cacheCcd = topology_.value("cache_ccd").toInt(-1), freqCcd = topology_.value("frequency_ccd").toInt(-1);
         if (ccds.size() > 1) for (const auto &c : ccds) {
             const int i = c.toObject().value("index").toInt();
-            affinity_->addItem(ccdText(i), QStringLiteral("ccd%1").arg(i));
+            const QString role = i == cacheCcd ? QStringLiteral(" V-Cache") : i == freqCcd ? QStringLiteral(" frequency") : QString();
+            affinity_->addItem(QStringLiteral("CCD%1%2 (%3)").arg(i).arg(role, c.toObject().value("cpus").toString()), QStringLiteral("ccd%1").arg(i));
         }
         if (const QJsonObject h = topology_.value("hybrid").toObject(); !h.isEmpty()) {
             affinity_->addItem("P-cores (" + h.value("pcores").toString() + ")", "pcore");
@@ -722,7 +769,7 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
         auto *grid = new QGridLayout(page);
         grid->setContentsMargins(8, 8, 8, 8);
         grid->setHorizontalSpacing(12);
-        grid->setVerticalSpacing(4);
+        grid->setVerticalSpacing(0);
         const char *heads[] = {"", "Setting", "Live value", "New value", ""};
         for (int c = 0; c < 5; ++c) {
             auto *h = new QLabel(QString::fromLatin1(heads[c]));
@@ -752,7 +799,7 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
             r.cur->setTextInteractionFlags(Qt::TextSelectableByMouse);
             QWidget *editor;
             if (r.kind == "int") {
-                r.spin = new QSpinBox;
+                r.spin = new Int64SpinBox;
                 r.spin->setMinimumWidth(170);
                 r.spin->setAccelerated(true);
                 // Keyboard tracking off means valueChanged only fires on Enter/focus-out,
@@ -762,14 +809,14 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
                 // closes that gap without touching on every keystroke.
                 r.spin->setKeyboardTracking(false);
                 editor = r.spin;
-                connect(r.spin, &QSpinBox::valueChanged, this, [this, key] {
+                connect(r.spin, &Int64SpinBox::valueChanged, this, [this, key] {
                     if (Row *x = row(key)) { x->touched = true; x->include->setChecked(true); markRow(*x); }
                 });
                 // valueChanged doesn't fire if focus is lost without the number actually
                 // changing (e.g. typed it, then re-typed the same value) - editingFinished
                 // still does, and touched must be true the moment focus leaves or the next
                 // poll's updateRow (midEdit now false) would treat it as never-edited.
-                connect(r.spin, &QSpinBox::editingFinished, this, [this, key] {
+                connect(r.spin, &Int64SpinBox::editingFinished, this, [this, key] {
                     if (Row *x = row(key)) x->touched = true;
                 });
             } else {
@@ -795,6 +842,17 @@ void OptimizeTab::buildRows(const QJsonArray &rows) {
             editor->setMaximumWidth(340);
             grid->addWidget(editor, line, 3);
             grid->addWidget(r.revert, line, 4);
+            // Zebra stripe behind every other row, so a setting and its editor
+            // across the wide gap read as one line. Layout itself is unchanged.
+            if (line % 2 == 0) {
+                auto *stripe = new QWidget;
+                stripe->setAttribute(Qt::WA_StyledBackground);
+                stripe->setStyleSheet(QStringLiteral("background: rgba(127,127,127,0.09); border-radius: 4px;"));
+                stripe->setAttribute(Qt::WA_TransparentForMouseEvents);
+                grid->addWidget(stripe, line, 0, 1, 5);
+                stripe->lower();
+            }
+            grid->setRowMinimumHeight(line, editor->sizeHint().height() + 6);  // keeps the old 4px spacing
             ++line;
             updateRow(r, rows[i].toObject());
             if (r.available) ++available;
@@ -875,7 +933,7 @@ void OptimizeTab::updateRow(Row &r, const QJsonObject &o) {
             // "current" and availability update underneath for when they blur out.
         } else {
             const QSignalBlocker b(r.spin);
-            r.spin->setRange(int(std::clamp<qint64>(r.min, INT_MIN, INT_MAX)), int(std::clamp<qint64>(r.max, INT_MIN, INT_MAX)));
+            r.spin->setRange(r.min, r.max);
             if (!setEditorValue(r, want)) setEditorValue(r, r.current);
         }
     }
@@ -906,13 +964,30 @@ QString OptimizeTab::editorValue(const Row &r) const {
     return {};
 }
 
-bool OptimizeTab::setEditorValue(Row &r, const QString &v) {
+/// Rows whose value is a CCD role (tune.rs maps the same three in validate).
+/// Other rows use "cache"/"frequency" as their own values (cpu.x3d_mode) and
+/// must not be rewritten to "ccdN".
+static bool isCcdRoleKey(const QString &key) {
+    return key == QLatin1String("wq.cpumask") || key == QLatin1String("irq.affinity") || key == QLatin1String("cpu.ccd_park");
+}
+
+/// Legacy "cache"/"frequency" (older presets, built-ins) → the CCD they are here.
+QString OptimizeTab::canonicalCcd(const QString &v) const {
+    if (v == QLatin1String("cache") || v == QLatin1String("frequency")) {
+        const int i = topology_.value(v == QLatin1String("cache") ? "cache_ccd" : "frequency_ccd").toInt(-1);
+        if (i >= 0) return QStringLiteral("ccd%1").arg(i);
+    }
+    return v;
+}
+
+bool OptimizeTab::setEditorValue(Row &r, const QString &v0) {
+    const QString v = r.combo && isCcdRoleKey(r.key) ? canonicalCcd(v0) : v0;
     if (r.spin) {
         bool ok = false;
         const qint64 n = v.toLongLong(&ok);
         if (!ok || n < r.min || n > r.max) return false;
         const QSignalBlocker b(r.spin);
-        r.spin->setValue(int(n));
+        r.spin->setValue(n);
         return true;
     }
     if (r.combo) {
@@ -956,9 +1031,15 @@ void OptimizeTab::updateStateBanner() {
         const QString preset = state_.value("preset").toString();
         banner_->setText(games > 0 ? QStringLiteral("Game mode active — %1 game(s) running").arg(games)
                                    : src == "boot" ? QStringLiteral("Boot preset active") : QStringLiteral("Tuning active"));
-        bannerDetail_->setText(QStringLiteral("%1%2 setting(s), %3 file(s) with saved originals. Restoring writes them back.")
+        QString part;
+        if (isolation_.value("active").toBool())
+            part = QStringLiteral("\nGame CPU partition: CPUs %1 (%2 process(es)) — the rest of the system runs on the other CCD.")
+                       .arg(isolation_.value("cpus").toString()).arg(isolation_.value("procs").toInt());
+        else if (games > 0 && isolation_.value("unsupported").isString())
+            part = QStringLiteral("\nNo game CPU partition: ") + isolation_.value("unsupported").toString();
+        bannerDetail_->setText(QStringLiteral("%1%2 setting(s), %3 file(s) with saved originals. Restoring writes them back.%4")
             .arg(preset.isEmpty() ? QString() : "Preset \"" + preset + "\" · ")
-            .arg(state_.value("keys").toArray().size()).arg(state_.value("saved_files").toInt()));
+            .arg(state_.value("keys").toArray().size()).arg(state_.value("saved_files").toInt()).arg(part));
     } else {
         banner_->setText("System at its original values");
         bannerDetail_->setText("Nothing changed by Legion Power Manager is in effect. Every change you apply is recorded and reversible.");
@@ -1058,7 +1139,8 @@ int OptimizeTab::loadPresetObject(const QJsonObject &p, QStringList *skipped) {
     }
     for (auto it = values.begin(); it != values.end(); ++it) {
         Row *r = row(it.key());
-        const QString v = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
+        const QString raw = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
+        const QString v = isCcdRoleKey(it.key()) ? canonicalCcd(raw) : raw;
         if (!r || !validFor(*r, v) || !setEditorValue(*r, v)) { if (skipped) *skipped << it.key(); continue; }
         r->touched = true;
         const QSignalBlocker b(r->include);
@@ -1070,7 +1152,7 @@ int OptimizeTab::loadPresetObject(const QJsonObject &p, QStringList *skipped) {
     if (nice_ && !run.isEmpty()) {
         nice_->setValue(std::clamp(run.value("nice").toInt(0), -20, 0));
         autogroup_->setChecked(run.value("autogroup").toBool(true));
-        const int i = affinity_->findData(run.value("affinity").toString("none"));
+        const int i = affinity_->findData(canonicalCcd(run.value("affinity").toString("none")));
         affinity_->setCurrentIndex(i < 0 ? 0 : i);
     }
     return n;
@@ -1122,7 +1204,9 @@ void OptimizeTab::saveAs() {
     }
     loadedPreset_ = name;
     reloadPresets(name);
-    showStatus(QStringLiteral("Saved \"%1\" (%2 settings)").arg(name).arg(values.size()), theme::OK);
+    approvePreset(name, values, [this, name, n = values.size()] {
+        showStatus(QStringLiteral("Saved \"%1\" (%2 settings)").arg(name).arg(n), theme::OK);
+    });
 }
 
 void OptimizeTab::deleteSelected() {
@@ -1139,6 +1223,7 @@ void OptimizeTab::deleteSelected() {
     }
     reloadPresets();
     updateLaunchPreview();
+    if (storeHas(name)) runOp({{"op", "preset_delete"}, {"name", name}}, QStringLiteral("Remove approved copy"), nullptr);
 }
 
 void OptimizeTab::useForGames() {
@@ -1155,7 +1240,11 @@ void OptimizeTab::useForGames() {
     if (!writeJsonFile(configFile(), cfg, &err)) { QMessageBox::critical(this, "Use for games", err); return; }
     reloadPresets(name);
     updateLaunchPreview();
-    showStatus(QStringLiteral("★ \"%1\" is now the game preset. Hook lpm-gamemode into Lutris/Steam (Game launch tab).").arg(name), theme::OK, 10000);
+    auto announce = [this, name] {
+        showStatus(QStringLiteral("★ \"%1\" is now the game preset. Hook lpm-gamemode into Lutris/Steam (Game launch tab).").arg(name), theme::OK, 10000);
+    };
+    // lpm-gamemode applies the root-owned approved copy, by name.
+    if (storeHas(name)) announce(); else approvePreset(name, p.value("values").toObject(), announce);
 }
 
 void OptimizeTab::setBoot() {
@@ -1177,6 +1266,223 @@ void OptimizeTab::clearBoot() {
     if (QMessageBox::question(this, "Clear boot preset", "Stop applying a preset at boot?") != QMessageBox::Yes) return;
     runOp({{"op", "set_boot"}, {"values", QJsonValue::Null}}, "Clear boot preset",
           [this](const QJsonObject &) { showStatus("Boot preset cleared.", theme::OK); });
+}
+
+// ── autotune ────────────────────────────────────────────────────────────────
+
+void OptimizeTab::runAutotune() {
+    if (autoRunning_ || busy_) return;
+    if (rows_.isEmpty()) { showStatus(QStringLiteral("The tunable list is not loaded yet."), theme::WARN); return; }
+    if (!QFileInfo(helperPath()).isExecutable()) { helperMissing_ = true; updateStateBanner(); return; }
+    const QString goal = autoGoal_->currentData().toString();
+    autoRunning_ = true;
+    autoBtn_->setEnabled(false);
+    showStatus(QStringLiteral("Profiling the hardware…"), theme::MUTED, 0);
+    // Read-only op: runs unprivileged, like describe.
+    auto *p = new QProcess(this);
+    QPointer<QProcess> guard(p);
+    connect(p, &QProcess::finished, this, [this, p, goal](int, QProcess::ExitStatus) {
+        autoRunning_ = false;
+        autoBtn_->setEnabled(!busy_);
+        const QByteArray out = p->readAllStandardOutput().trimmed();
+        p->deleteLater();
+        const QJsonObject d = QJsonDocument::fromJson(out.mid(out.lastIndexOf('\n') + 1)).object();
+        if (!d.value("ok").toBool()) {
+            showStatus(QStringLiteral("Autotune failed: %1").arg(d.value("error").toString(QStringLiteral("no answer from tune-helper"))), theme::DANGER, 10000);
+            return;
+        }
+        QStringList notLoaded;
+        const int n = loadPresetObject(d.value("preset").toObject(), &notLoaded);
+        loadedPreset_ = d.value("name").toString();
+        showStatus(QStringLiteral("Autotune · %1: %2 setting(s) checked. Review, then Apply checked or Save.")
+                       .arg(d.value("goal_label").toString()).arg(n), theme::OK, 12000);
+        showAutotuneReport(d, notLoaded);
+    });
+    connect(p, &QProcess::errorOccurred, this, [this, p](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        autoRunning_ = false;
+        autoBtn_->setEnabled(!busy_);
+        showStatus(QStringLiteral("tune-helper could not be started."), theme::DANGER);
+        p->deleteLater();
+    });
+    QTimer::singleShot(AUTOTUNE_TIMEOUT_MS, p, [guard] { if (guard && guard->state() != QProcess::NotRunning) guard->kill(); });
+    p->start(helperPath(), {});
+    QJsonObject req{{"op", "autotune"}, {"goal", goal}};
+    if (const QJsonObject w = autotuneWeights(goal); !w.isEmpty()) req["weights"] = w;
+    p->write(QJsonDocument(req).toJson(QJsonDocument::Compact));
+    p->closeWriteChannel();
+}
+
+// Mirror of lpm_helpers::autotune::Weights::for_goal (only used to prefill the editor).
+static QList<double> defaultWeights(const QString &goal) {
+    if (goal == QLatin1String("gaming")) return {1.0, 0.6, 0.15, 0.4, 1.0};
+    if (goal == QLatin1String("throughput")) return {0.2, 1.0, 0.2, 0.5, 1.0};
+    if (goal == QLatin1String("powersave")) return {0.2, 0.1, 1.0, 0.5, 1.0};
+    return {0.7, 0.3, 0.7, 0.6, 1.0};
+}
+static const char *const WEIGHT_KEYS[] = {"latency", "throughput", "power", "footprint", "stability"};
+
+QJsonObject OptimizeTab::autotuneWeights(const QString &goal) const {
+    const QByteArray raw = QSettings().value(QStringLiteral("autotune/weights/") + goal).toByteArray();
+    return QJsonDocument::fromJson(raw).object();
+}
+
+void OptimizeTab::editAutotuneWeights() {
+    const QString goal = autoGoal_->currentData().toString();
+    const QList<double> def = defaultWeights(goal);
+    const QJsonObject cur = autotuneWeights(goal);
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Autotune weights — %1").arg(autoGoal_->currentText()));
+    auto *form = new QFormLayout(&dlg);
+    form->addRow(muted(QStringLiteral("0 = ignore this objective, 1 = the goal's normal emphasis, up to 3.\n"
+                                      "Stability cannot go below 0.5. Saved per goal.")));
+    const QStringList labels = {QStringLiteral("Latency / smoothness"), QStringLiteral("Throughput"), QStringLiteral("Power / heat"),
+                                QStringLiteral("Memory footprint"), QStringLiteral("Stability")};
+    QList<QDoubleSpinBox *> boxes;
+    for (int i = 0; i < 5; ++i) {
+        auto *b = new QDoubleSpinBox;
+        b->setRange(i == 4 ? 0.5 : 0.0, 3.0);
+        b->setSingleStep(0.1);
+        b->setDecimals(2);
+        b->setValue(cur.contains(WEIGHT_KEYS[i]) ? cur.value(WEIGHT_KEYS[i]).toDouble() : def[i]);
+        form->addRow(labels[i], b);
+        boxes << b;
+    }
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel | QDialogButtonBox::RestoreDefaults);
+    connect(bb->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, &dlg, [&] { for (int i = 0; i < 5; ++i) boxes[i]->setValue(def[i]); });
+    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(bb);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QJsonObject w;
+    bool custom = false;
+    for (int i = 0; i < 5; ++i) {
+        w[WEIGHT_KEYS[i]] = boxes[i]->value();
+        custom |= qAbs(boxes[i]->value() - def[i]) > 1e-6;
+    }
+    const QString key = QStringLiteral("autotune/weights/") + goal;
+    if (custom) QSettings().setValue(key, QJsonDocument(w).toJson(QJsonDocument::Compact));
+    else QSettings().remove(key);
+    showStatus(custom ? QStringLiteral("Custom weights saved for %1; run Autotune to use them.").arg(autoGoal_->currentText())
+                      : QStringLiteral("%1 uses its default weights.").arg(autoGoal_->currentText()), theme::OK, 6000);
+}
+
+void OptimizeTab::showAutotuneReport(const QJsonObject &d, const QStringList &notLoaded) {
+    const QJsonObject preset = d.value("preset").toObject();
+    const QJsonObject values = preset.value("values").toObject();
+    const QJsonObject why = d.value("rationale").toObject();
+    const QString goal = d.value("goal").toString();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Autotune — %1").arg(d.value("goal_label").toString()));
+    dlg.resize(980, 600);
+    auto *v = new QVBoxLayout(&dlg);
+    v->setSpacing(6);
+    auto *head = new QLabel(QStringLiteral("<b>Machine</b>&nbsp; %1").arg(d.value("profile_summary").toString().toHtmlEscaped()));
+    head->setWordWrap(true);
+    head->setTextFormat(Qt::RichText);
+    head->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    v->addWidget(head);
+    if (const QString ev = d.value(QStringLiteral("evidence_summary")).toString(); !ev.isEmpty()) {
+        auto *evl = new QLabel(QStringLiteral("<b>Observed</b>&nbsp; %1").arg(ev.toHtmlEscaped()));
+        evl->setWordWrap(true);
+        evl->setTextFormat(Qt::RichText);
+        evl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        v->addWidget(evl);
+    }
+
+    {
+        QStringList w;
+        const QJsonObject wo = d.value(QStringLiteral("weights")).toObject();
+        for (const char *k : WEIGHT_KEYS) w << QStringLiteral("%1 %2").arg(QLatin1String(k)).arg(wo.value(k).toDouble(), 0, 'f', 2);
+        QStringList extra;
+        for (const auto &c : d.value(QStringLiteral("constraints")).toArray()) extra << QStringLiteral("constraint: ") + c.toString();
+        for (const auto &i : d.value(QStringLiteral("live_issues")).toArray()) {
+            const QJsonObject o = i.toObject();
+            extra << QStringLiteral("live %1: %2").arg(o.value("key").toString(), o.value("message").toString());
+        }
+        auto *wl = new QLabel(QStringLiteral("<b>Weights</b>&nbsp; %1%2").arg(w.join(QStringLiteral(" · ")).toHtmlEscaped(),
+            extra.isEmpty() ? QString() : QStringLiteral("<br>") + extra.join(QStringLiteral("<br>")).toHtmlEscaped()));
+        wl->setWordWrap(true);
+        wl->setTextFormat(Qt::RichText);
+        wl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        v->addWidget(wl);
+    }
+    auto *table = new QTableWidget(0, 4);
+    table->setHorizontalHeaderLabels({QStringLiteral("Group"), QStringLiteral("Setting"), QStringLiteral("Value"), QStringLiteral("Why (for this machine)")});
+    table->verticalHeader()->hide();
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionMode(QAbstractItemView::NoSelection);
+    table->setWordWrap(true);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    auto add = [table](const QString &g, const QString &name, const QString &val, const QString &reason, bool changes) {
+        const int r = table->rowCount();
+        table->insertRow(r);
+        auto *a = new QTableWidgetItem(g), *b = new QTableWidgetItem(name), *c = new QTableWidgetItem(val), *e = new QTableWidgetItem(reason);
+        if (changes) { QFont f = c->font(); f.setBold(true); c->setFont(f); }
+        else c->setToolTip(QStringLiteral("Already the live value."));
+        for (auto *it : {a, b, c, e}) it->setToolTip(reason);
+        table->setItem(r, 0, a); table->setItem(r, 1, b); table->setItem(r, 2, c); table->setItem(r, 3, e);
+    };
+    int changing = 0;
+    for (const char *gname : GROUPS) {
+        for (const Row &r : rows_) {
+            if (r.group != QLatin1String(gname) || !values.contains(r.key) || notLoaded.contains(r.key)) continue;
+            const QString shown = r.combo ? r.combo->currentText() : editorValue(r);
+            const bool ch = differs(r);
+            changing += ch;
+            add(r.group, r.label, shown + (ch ? QString() : QStringLiteral("  (=)")), why.value(r.key).toString(), ch);
+        }
+    }
+    const QJsonObject run = preset.value("run").toObject();
+    if (why.contains("run"))
+        add(QStringLiteral("Launch"), QStringLiteral("Game launch boost"),
+            QStringLiteral("nice %1 · %2").arg(run.value("nice").toInt()).arg(run.value("affinity").toString()), why.value("run").toString(), true);
+    table->resizeRowsToContents();
+    v->addWidget(table, 1);
+
+    QStringList off;
+    for (const auto &s : d.value("skipped").toArray()) off << s.toObject().value("key").toString();
+    off << notLoaded;
+    off.removeDuplicates();
+    auto *foot = muted(QStringLiteral("%1 row(s) checked, %2 of them change the live value (bold). Nothing has been written yet: "
+                                      "review in the tab, then Apply checked.%3")
+                           .arg(values.size() - notLoaded.size()).arg(changing)
+                           .arg(off.isEmpty() ? QString() : QStringLiteral("\nNot offered on this machine/kernel: ") + off.join(QStringLiteral(", "))));
+    v->addWidget(foot);
+
+    auto *bb = new QDialogButtonBox;
+    auto *save = bb->addButton(QStringLiteral("Save as preset…"), QDialogButtonBox::AcceptRole);
+    QPushButton *saveGame = goal == QLatin1String("gaming") ? bb->addButton(QStringLiteral("Save + ★ use for games"), QDialogButtonBox::AcceptRole) : nullptr;
+    bb->addButton(QStringLiteral("Close"), QDialogButtonBox::RejectRole);
+    v->addWidget(bb);
+    bool forGames = false;
+    connect(save, &QPushButton::clicked, &dlg, &QDialog::accept);
+    if (saveGame) connect(saveGame, &QPushButton::clicked, &dlg, [&] { forGames = true; dlg.accept(); });
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, QStringLiteral("Save autotuned preset"),
+        QStringLiteral("Preset name (letters, digits, space, _ - .):"), QLineEdit::Normal, d.value("name").toString(), &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    if (!validPresetName(name)) { QMessageBox::warning(this, QStringLiteral("Save preset"), QStringLiteral("Invalid name.")); return; }
+    if (QFile::exists(presetsDir() + '/' + name + ".json") &&
+        QMessageBox::question(this, QStringLiteral("Save preset"), "Overwrite \"" + name + "\"?") != QMessageBox::Yes) return;
+    // What is saved is what the tab now holds (the user may have edited rows
+    // while the report was open), plus the autotune record and summary.
+    QJsonObject p{{"values", collectValues()}, {"run", collectRun()}, {"summary", preset.value("summary")}, {"autotune", preset.value("autotune")}};
+    QString err;
+    if (!writeUserPreset(name, p, &err)) { QMessageBox::critical(this, QStringLiteral("Save preset"), err); return; }
+    loadedPreset_ = name;
+    reloadPresets(name);
+    approvePreset(name, p.value("values").toObject(), [this, name, forGames] {
+        if (forGames) useForGames();
+        else showStatus(QStringLiteral("Saved \"%1\".").arg(name), theme::OK);
+    });
 }
 
 // ── apply / restore ─────────────────────────────────────────────────────────
@@ -1209,6 +1515,9 @@ void OptimizeTab::applyValues(const QJsonObject &values, const QString &preset) 
         QString msg = QStringLiteral("Applied: %1 file(s) written").arg(written);
         if (skipped) msg += QStringLiteral(", %1 not available").arg(skipped);
         if (refused) msg += QStringLiteral(", %1 refused by the kernel (IRQ/PCI, expected)").arg(refused);
+        if (res.contains(QStringLiteral("guard")))
+            msg += QStringLiteral(" · pressure guard watching %1 memory/writeback setting(s) for %2 s")
+                       .arg(res.value("guard").toObject().value("keys").toArray().size()).arg(res.value("guard").toObject().value("seconds").toInt());
         showStatus(msg, errors.isEmpty() ? theme::OK : theme::WARN, 10000);
         if (!errors.isEmpty()) QMessageBox::warning(this, "Apply", "Some settings failed:\n\n" + errors.join('\n'));
         for (Row &r : rows_) r.touched = false;
@@ -1224,8 +1533,9 @@ bool OptimizeTab::applyNamedPreset(const QString &name) {
     for (auto it = all.begin(); it != all.end(); ++it) {
         const Row *r = nullptr;
         for (const Row &x : rows_) if (x.key == it.key()) r = &x;
-        const QString v = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
-        if (r && validFor(*r, v)) values[it.key()] = *it;
+        const QString raw = it->isString() ? it->toString() : QString::number(it->toVariant().toLongLong());
+        const QString v = isCcdRoleKey(it.key()) ? canonicalCcd(raw) : raw;
+        if (r && validFor(*r, v)) values[it.key()] = v;
     }
     if (values.isEmpty()) return false;
     loadPresetObject(p, nullptr);
@@ -1255,11 +1565,16 @@ void OptimizeTab::restoreAll(bool confirm) {
     });
 }
 
+void OptimizeTab::approvePreset(const QString &name, const QJsonObject &values, std::function<void()> then) {
+    runOp({{"op", "preset_save"}, {"name", name}, {"values", values}}, QStringLiteral("Approve preset"),
+          [then](const QJsonObject &res) { if (res.value(QStringLiteral("ok")).toBool() && then) then(); });
+}
+
 void OptimizeTab::runOp(const QJsonObject &req, const QString &what, std::function<void(const QJsonObject &)> then) {
     if (busy_) return;
     setBusy(true);
     showStatus(what + "…", theme::MUTED, 0);
-    privileged::run(helperPath(), req, this, [this, what, then](const privileged::Result &r) {
+    privileged::run(helperForOp(req.value(QStringLiteral("op")).toString()), req, this, [this, what, then](const privileged::Result &r) {
         setBusy(false);
         if (!r.reached) {
             showStatus(what + " failed.", theme::DANGER);
@@ -1285,6 +1600,7 @@ void OptimizeTab::setBusy(bool b) {
     bootBtn_->setEnabled(!b);
     restoreBtn_->setEnabled(!b && active_);
     bootClear_->setEnabled(!b && !boot_.isEmpty());
+    if (autoBtn_) autoBtn_->setEnabled(!b && !autoRunning_);
 }
 
 void OptimizeTab::showStatus(const QString &msg, const char *color, int ms) {

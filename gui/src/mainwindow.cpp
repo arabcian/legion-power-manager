@@ -13,6 +13,7 @@
 #include "scenestab.h"
 #include "sysinfo.h"
 #include "tray.h"
+#include "healthtab.h"
 #include <QCloseEvent>
 #include <QLabel>
 #include <QTabBar>
@@ -54,18 +55,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     // so nobody is offered a control their machine can't honour.
     if (FwattrTab::present()) {
         fwattr_ = new FwattrTab;
-        tabs_->addTab(fwattr_, "Firmware Attributes");
+        tabs_->addTab(fwattr_, "Firmware");
         // Switching to Custom on Home unlocks this tab immediately (not after its poll).
         connect(home_, &HomeTab::profileChanged, fwattr_, &FwattrTab::refreshLockState);
-    }
-    if (NvidiaTab::present()) {
-        nvidia_ = new NvidiaTab;
-        tabs_->addTab(nvidia_, "NVIDIA Curve Optimizer");
-    }
-    // AMD GPU tuning: discrete Radeon or the CPU's integrated graphics (Hybrid mode).
-    if (AmdGpuTab::present()) {
-        amdgpu_ = new AmdGpuTab;
-        tabs_->addTab(amdgpu_, "AMD GPU");
     }
     // One CPU voltage tab per vendor: Curve Optimizer (AMD SMU) or the
     // OC-mailbox undervolt tab (Intel). The other one is never created, so
@@ -84,10 +76,19 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     }();
     if (sysinfo::isAmd() && cpuFamily >= 0x19) {
         ryzen_ = new RyzenTab;
-        tabs_->addTab(ryzen_, "Ryzen Curve Optimizer");
+        tabs_->addTab(ryzen_, "Ryzen Curve");
     } else if (sysinfo::isIntel()) {
         intel_ = new IntelTab;
         tabs_->addTab(intel_, "Intel Undervolt");
+    }
+    if (NvidiaTab::present()) {
+        nvidia_ = new NvidiaTab;
+        tabs_->addTab(nvidia_, "NVIDIA Curve");
+    }
+    // AMD GPU tuning: discrete Radeon or the CPU's integrated graphics (Hybrid mode).
+    if (AmdGpuTab::present()) {
+        amdgpu_ = new AmdGpuTab;
+        tabs_->addTab(amdgpu_, "AMD GPU");
     }
     optimize_ = new OptimizeTab;
     tabs_->addTab(optimize_, "Optimizations");
@@ -96,13 +97,40 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         lighting_ = new LightingTab;
         tabs_->addTab(lighting_, "Lighting");
     }
+    health_ = new HealthTab;
+    tabs_->addTab(health_, "Health");
 
     scenes_ = new SceneEngine(this);
+    home_->setSceneEngine(scenes_);
     tabs_->insertTab(scenesAt, new ScenesTab(this), "Scenes");
+}
+
+// Main tabs are equal boxes: each as wide as the widest label, or wider so
+// the row fills the band. Stepped by 4 px so a window drag re-polishes the
+// tab bar only now and then, not on every pixel.
+void MainWindow::fitTabs() {
+    QTabBar *bar = tabs_->tabBar();
+    QFont f = bar->font();
+    f.setWeight(QFont::DemiBold);  // the selected tab is drawn semi-bold
+    const QFontMetrics fm(f);
+    int text = 0;
+    for (int i = 0; i < tabs_->count(); ++i) text = std::max(text, fm.horizontalAdvance(tabs_->tabText(i)));
+    constexpr int CHROME = 2 * (8 + 1 + 2), BAND_LEFT = 36, SLACK = 12;  // padding+border+margin per side
+    const int share = (tabs_->width() - BAND_LEFT - SLACK) / std::max(1, int(tabs_->count())) - CHROME;
+    const int w = std::max(text + 4, share / 4 * 4);
+    if (w == tabW_) return;
+    tabW_ = w;
+    bar->setStyleSheet(QStringLiteral("QTabBar::tab { min-width: %1px; max-width: %1px; }").arg(w));
+}
+
+void MainWindow::resizeEvent(QResizeEvent *e) {
+    QMainWindow::resizeEvent(e);
+    fitTabs();
 }
 
 void MainWindow::showEvent(QShowEvent *e) {
     QMainWindow::showEvent(e);
+    fitTabs();
     // Centred on the tab band (its height is known once the style has polished it).
     mark_->move(10, std::max(0, (tabs_->tabBar()->height() - mark_->height()) / 2));
     mark_->raise();

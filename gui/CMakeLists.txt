@@ -26,6 +26,7 @@ add_executable(legion-power-manager
     src/vfcurvewidget.cpp src/vfcurvewidget.h
     src/nvidiatab.cpp    src/nvidiatab.h
     src/optimizetab.cpp  src/optimizetab.h
+    src/int64spinbox.cpp src/int64spinbox.h
     src/tray.cpp         src/tray.h
     src/scenes.cpp       src/scenes.h
     src/scenestab.cpp    src/scenestab.h
@@ -36,6 +37,10 @@ add_executable(legion-power-manager
     src/kblayout.cpp     src/kblayout.h
     src/amdgpu.cpp       src/amdgpu.h
     src/amdgputab.cpp    src/amdgputab.h
+    src/healthtab.cpp    src/healthtab.h
+    src/nvregdialog.cpp  src/nvregdialog.h
+    src/systools.cpp     src/systools.h
+    src/klogpage.cpp     src/klogpage.h
 )
 # Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
 # with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the
@@ -76,7 +81,9 @@ endif()
 # Smaller binary / fewer relocations: drop unreferenced sections, link only
 # libraries actually used, no PLT indirection for Qt calls.
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(legion-power-manager PRIVATE -ffunction-sections -fdata-sections -fno-plt)
+    # -O3 explicitly: the value must not depend on CMAKE_CXX_FLAGS_RELEASE, which distro
+    # toolchain files and CXXFLAGS in the environment are free to change.
+    target_compile_options(legion-power-manager PRIVATE -O3 -ffunction-sections -fdata-sections -fno-plt)
     target_link_options(legion-power-manager PRIVATE -Wl,--gc-sections -Wl,--as-needed -Wl,-O1)
 endif()
 if(LPM_NATIVE)
@@ -90,6 +97,14 @@ if(LPM_HARDEN)
         -fstack-protector-strong -fstack-clash-protection
         $<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3>)
     include(CheckCXXCompilerFlag)
+    # libstdc++ bounds checks (vector/string/array operator[], front/back on empty containers):
+    # an out-of-range index aborts instead of corrupting memory. Ignored by other C++ libraries.
+    target_compile_definitions(legion-power-manager PRIVATE _GLIBCXX_ASSERTIONS)
+    # Zero-initialise automatic variables (GCC 12+, clang 16+); skipped where unsupported.
+    check_cxx_compiler_flag(-ftrivial-auto-var-init=zero _autoinit)
+    if(_autoinit)
+        target_compile_options(legion-power-manager PRIVATE -ftrivial-auto-var-init=zero)
+    endif()
     check_cxx_compiler_flag(-fcf-protection=full _cet)
     if(_cet)
         target_compile_options(legion-power-manager PRIVATE -fcf-protection=full)
@@ -146,3 +161,13 @@ install(FILES data/legion-power-manager.desktop DESTINATION ${CMAKE_INSTALL_DATA
 install(FILES data/legion-power-manager-autostart.desktop DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/xdg/autostart
         RENAME legion-power-manager.desktop)
 install(FILES data/legion-power-manager.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
+
+# GUI unit tests (64-bit editor path). Off by default; ctest runs them.
+option(LPM_BUILD_TESTS "Build GUI unit tests" OFF)
+if(LPM_BUILD_TESTS)
+    enable_testing()
+    add_executable(lpm-gui-tests tests/int64spinbox_test.cpp src/int64spinbox.cpp src/int64spinbox.h)
+    target_link_libraries(lpm-gui-tests PRIVATE Qt6::Widgets)
+    target_compile_definitions(lpm-gui-tests PRIVATE QT_NO_KEYWORDS)
+    add_test(NAME int64spinbox COMMAND lpm-gui-tests)
+endif()

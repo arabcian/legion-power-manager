@@ -1,4 +1,5 @@
 #include "ryzentab.h"
+#include <QShowEvent>
 #include "platformprofile.h"
 #include "privileged.h"
 #include "theme.h"
@@ -50,6 +51,19 @@ static QList<int> expandCpuList(const QString &s) {
     return out;
 }
 
+// Stable identity of an L3 domain: cache/index3/id (derived from the APIC ID, i.e. the
+// physical die position). Independent of which CPUs happen to be online.
+static int l3Id(const QString &cpuDir) {
+    const QDir cache(cpuDir + "/cache");
+    for (const QString &idx : cache.entryList({"index*"}, QDir::Dirs, QDir::Name))
+        if (pp::readText(cache.filePath(idx) + "/level") == QStringLiteral("3")) {
+            bool ok = false;
+            const int v = pp::readText(cache.filePath(idx) + "/id").value_or(QString()).toInt(&ok);
+            return ok ? v : -1;
+        }
+    return -1;
+}
+
 static std::optional<QString> l3Shared(const QString &cpuDir) {
     const QDir cache(cpuDir + "/cache");
     for (const QString &idx : cache.entryList({"index*"}, QDir::Dirs, QDir::Name))
@@ -58,34 +72,86 @@ static std::optional<QString> l3Shared(const QString &cpuDir) {
     return std::nullopt;
 }
 
+QList<int> ryzen::parkedCpus() {
+    // Written by tune-helper (root) when it parks a CCD; valid while all its CPUs are offline.
+    QFile f(QStringLiteral("/run/legion-power-manager/tune/ccd-park.json"));
+    if (!f.open(QIODevice::ReadOnly) || f.size() > 4096) return {};
+    QList<int> cpus;
+    for (const auto &v : QJsonDocument::fromJson(f.readAll()).object().value("cpus").toArray()) cpus << v.toInt();
+    const QList<int> online = expandCpuList(pp::readText(QStringLiteral("/sys/devices/system/cpu/online")).value_or(QString()));
+    if (cpus.isEmpty() || std::any_of(cpus.begin(), cpus.end(), [&](int c) { return online.contains(c); })) return {};
+    std::sort(cpus.begin(), cpus.end());
+    return cpus;
+}
+
 ryzen::Layout ryzen::detect() {
     Layout out;
     const QDir sys(QStringLiteral("/sys/devices/system/cpu"));
-    QSet<QString> keys;
-    for (const QString &c : sys.entryList({"cpu[0-9]*"}, QDir::Dirs))
-        if (auto s = l3Shared(sys.filePath(c))) keys.insert(*s);
+    // Online CPUs only, and L3 lists that overlap are one CCD: during hot-plug
+    // one CPU can still report "0-7,16-23" and its neighbour "0-7" for the
+    // same L3 (same merge rule as tune.rs group_l3).
+    const QList<int> online = expandCpuList(pp::readText(sys.filePath("online")).value_or(QString()));
+    auto isOnline = [&](int c) { return online.isEmpty() || online.contains(c); };
     QList<QList<int>> groups;
-    for (const QString &k : keys) {
-        QList<int> g = expandCpuList(k);
+    QMap<int, int> idOfCpu;  // cpu -> L3 id
+    for (const QString &c : sys.entryList({"cpu[0-9]*"}, QDir::Dirs)) {
+        const int n = c.mid(3).toInt();
+        if (!isOnline(n)) continue;
+        const auto s = l3Shared(sys.filePath(c));
+        if (!s) continue;
+        idOfCpu[n] = l3Id(sys.filePath(c));
+        QList<int> g;
+        for (int x : expandCpuList(*s)) if (isOnline(x) && !g.contains(x)) g << x;
+        if (!g.contains(n)) g << n;
+        for (int i = groups.size() - 1; i >= 0; --i) {
+            if (std::none_of(groups[i].begin(), groups[i].end(), [&](int x) { return g.contains(x); })) continue;
+            for (int x : groups[i]) if (!g.contains(x)) g << x;
+            groups.removeAt(i);
+        }
         std::sort(g.begin(), g.end());
-        g.erase(std::unique(g.begin(), g.end()), g.end());
-        if (!g.isEmpty()) groups << g;
+        groups << g;
     }
-    std::sort(groups.begin(), groups.end(), [](auto &a, auto &b) { return a.first() < b.first(); });
+    // A parked CCD has no online CPU, so sysfs no longer lists it: add it back
+    // from the park record so it keeps its slot in the grid (shown greyed out).
+    const QList<int> parked = parkedCpus();
+    if (!parked.isEmpty() && std::none_of(groups.begin(), groups.end(), [&](const QList<int> &g) {
+            return std::any_of(parked.begin(), parked.end(), [&](int c) { return g.contains(c); }); }))
+        groups << parked;
+    // Order by L3 id when every online group has one (a parked group has none: it sorts by
+    // its first CPU, which is what it always did), else by lowest CPU number.
+    auto keyOf = [&](const QList<int> &g) {
+        for (int c : g) if (idOfCpu.value(c, -1) >= 0) return idOfCpu.value(c);
+        return -1;
+    };
+    const bool haveIds = std::all_of(groups.begin(), groups.end(), [&](const QList<int> &g) { return keyOf(g) >= 0; });
+    std::sort(groups.begin(), groups.end(), [&](const QList<int> &a, const QList<int> &b) {
+        return haveIds ? keyOf(a) < keyOf(b) : a.first() < b.first(); });
     out.ccdCount = groups.size();
     for (int ccd = 0; ccd < groups.size(); ++ccd) {
-        QStringList order;
-        QHash<QString, QList<int>> phys;
+        if (groups[ccd] != parked) continue;
+        // Offline CPUs have no topology/: pair thread i with i + n/2 when the die has SMT.
+        out.parked.insert(ccd);
+        const int n = parked.size(), cores = n > SLOTS_PER_CCD ? n / 2 : n;
+        for (int i = 0; i < cores; ++i)
+            out.cores[ccd].append({n > SLOTS_PER_CCD ? QList<int>{parked[i], parked[i + cores]} : QList<int>{parked[i]}, std::nullopt});
+    }
+    for (int ccd = 0; ccd < groups.size(); ++ccd) {
+        if (out.parked.contains(ccd)) continue;
+        // Physical core = its online SMT siblings; offline siblings (SMT off)
+        // must not become extra "cores" and shift the slot numbering.
+        QList<QList<int>> phys;
         for (int cpu : groups[ccd]) {
+            if (std::any_of(phys.begin(), phys.end(), [&](const QList<int> &p) { return p.contains(cpu); })) continue;
             const QString t = sys.filePath(QStringLiteral("cpu%1/topology/").arg(cpu));
-            QString sib = pp::readText(t + "core_cpus_list").value_or(
-                pp::readText(t + "thread_siblings_list").value_or(QString::number(cpu)));
-            if (!phys.contains(sib)) order << sib;
-            phys[sib] << cpu;
+            QList<int> sib;
+            for (int x : expandCpuList(pp::readText(t + "core_cpus_list").value_or(
+                         pp::readText(t + "thread_siblings_list").value_or(QString::number(cpu)))))
+                if (groups[ccd].contains(x)) sib << x;
+            if (!sib.contains(cpu)) sib << cpu;
+            std::sort(sib.begin(), sib.end());
+            phys << sib;
         }
-        for (const QString &sib : order) {
-            QList<int> cpus = phys.value(sib);
-            std::sort(cpus.begin(), cpus.end());
+        for (const QList<int> &cpus : phys) {
             bool ok = false;
             int hp = pp::readText(sys.filePath(QStringLiteral("cpu%1/acpi_cppc/highest_perf").arg(cpus.first())))
                          .value_or(QString()).toInt(&ok);
@@ -208,7 +274,7 @@ RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) 
     auto *ml = new QHBoxLayout(modeBox);
     ml->setContentsMargins(0, 0, 0, 0);
     auto *rPrimary = new QRadioButton(QStringLiteral("CCD0 only (%1 slots)").arg(SLOTS_PER_CCD));
-    auto *rAll = new QRadioButton(QStringLiteral("All CCDs (%1 slots)").arg(ccdCount_ * SLOTS_PER_CCD));
+    auto *rAll = rAll_ = new QRadioButton(QStringLiteral("All CCDs (%1 slots)").arg(ccdCount_ * SLOTS_PER_CCD));
     rAll->setChecked(true);
     auto *mg = new QButtonGroup(this);
     mg->addButton(rPrimary);
@@ -257,6 +323,7 @@ RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) 
 
         // Row 0: title + quick fill
         auto *title = new QLabel(QStringLiteral("CCD%1").arg(ccd));
+        ccdTitles_[ccd] = title;
         title->setStyleSheet(QStringLiteral("color:%1; font-weight:700; font-size:11pt; background:transparent;").arg(accent));
         auto *fillBar = new QHBoxLayout;
         fillBar->setSpacing(6);
@@ -331,7 +398,7 @@ RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) 
                              "\nHigher = a better core on this die; ★ marks the two best on this CCD.\n" + cpuHint);
             g->addWidget(cppc, r, 3, Qt::AlignCenter);
 
-            slots_.append({ccd, s, e, d, id});
+            slots_.append({ccd, s, e, d, id, cppc});
         }
         // Spare width is shared evenly, so the four columns spread across the
         // card instead of bunching up on the left.
@@ -366,12 +433,18 @@ RyzenTab::RyzenTab(QWidget *parent) : QWidget(parent), layout_(ryzen::detect()) 
 
     reloadProfiles();
     for (int c = 0; c < ccdCount_; ++c) activeCcds_.insert(c);
+    updateParked();
 
     log(QStringLiteral("%1 CCD(s), %2 fixed SMU slots each (%3 total).").arg(ccdCount_).arg(SLOTS_PER_CCD).arg(ccdCount_ * SLOTS_PER_CCD));
     if (!layout_.ccdCount) log(QStringLiteral("CCD topology could not be read from sysfs — assuming %1 CCDs. Verify before applying.").arg(CCD_FALLBACK), "err");
     if (!mismatch.isEmpty()) log("Partially-populated CCD detected — see the notice above about SMU slot IDs vs. OS core IDs.", "cmd");
     bool cppc = false;
     for (const auto &l : std::as_const(layout_.cores)) for (const auto &c : l) cppc |= c.highestPerf.has_value();
+    for (auto it = layout_.cores.cbegin(); it != layout_.cores.cend(); ++it) {
+        QStringList c;
+        for (const auto &pc : it.value()) c << QStringLiteral("%1").arg(pc.cpus.first());
+        log(QStringLiteral("CCD%1 = CPUs (first thread per core): %2").arg(it.key()).arg(c.join(' ')), "info");
+    }
     log(cppc ? "CPPC highest_perf read per core from sysfs — shown in the 'cppc' column."
              : "CPPC highest_perf not available from sysfs on this system — cppc column shows '–'.", cppc ? "info" : "cmd");
     if (!profilesReady_) log("Profile directory is not writable: " + ryzen::profilesDir(), "err");
@@ -460,8 +533,10 @@ void RyzenTab::applyReset() { runOp("reset", {}); }
 bool RyzenTab::applyPerCore(std::function<void()> then) {
     QJsonArray entries;
     QStringList problems;
-    int skipped = 0;
+    int skipped = 0, parkedSkipped = 0;
+    updateParked();
     for (Slot *s : activeSlots()) {
+        if (parkedNow_.contains(s->ccd)) { parkedSkipped += parse(*s).first == Parse::Ok; continue; }
         const auto [st, v] = parse(*s);
         const QString label = QStringLiteral("CCD%1/S%2").arg(s->ccd).arg(s->slot);
         switch (st) {
@@ -478,6 +553,7 @@ bool RyzenTab::applyPerCore(std::function<void()> then) {
         return false;
     }
     if (entries.isEmpty()) { QMessageBox::information(this, "No Input", "No per-core values have been entered."); return false; }
+    if (parkedSkipped) log(QStringLiteral("Skipping %1 slot(s) on the parked CCD (kept in the profile).").arg(parkedSkipped), "cmd");
     if (skipped) log(QStringLiteral("Skipping %1 disabled slot(s).").arg(skipped));
     runOp("set_coper_batch", {{"entries", entries}}, std::move(then));
     return true;
@@ -538,7 +614,7 @@ void RyzenTab::saveProfile() {
     bool ok = false;
     const QString name = QInputDialog::getText(this, "Save Profile", "Profile name:", QLineEdit::Normal, QString(), &ok).trimmed();
     if (!ok) return;
-    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$"));
+    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}\\z"));
     if (!re.match(name).hasMatch()) {
         QMessageBox::warning(this, "Invalid Name", "Use 1-64 characters: letters, digits, space, underscore or hyphen, starting with a letter or digit.");
         return;
@@ -547,8 +623,16 @@ void RyzenTab::saveProfile() {
     if (QFile::exists(path) && QMessageBox::question(this, "Overwrite Profile", "Profile '" + name + "' already exists. Overwrite?",
                                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
         return;
+    QJsonObject state = currentState();
+    if (QFile old(path); old.open(QIODevice::ReadOnly) && old.size() <= 256 * 1024) {
+        // A parked CCD is not in the grid: overwriting must not drop its offsets.
+        QJsonArray cores = state.value("cores").toArray();
+        for (const auto &v : QJsonDocument::fromJson(old.readAll()).object().value("cores").toArray())
+            if (v.toObject().value("ccd").toInt() >= ccdCount_) cores.append(v);
+        state["cores"] = cores;
+    }
     QSaveFile f(path);
-    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(currentState()).toJson()) < 0 || !f.commit()) {
+    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(state).toJson()) < 0 || !f.commit()) {
         QMessageBox::critical(this, "Save Error", f.errorString());
         return;
     }
@@ -581,6 +665,9 @@ bool RyzenTab::loadProfile() {
         hit->disable->setChecked(dis);
         if (!dis && c.value("coper").isDouble()) hit->entry->setText(QString::number(c.value("coper").toInt()));
     }
+    bool hidden = false;
+    for (const Slot &s : slots_) hidden |= !activeCcds_.contains(s.ccd) && (s.disable->isChecked() || !s.entry->text().isEmpty());
+    if (hidden) rAll_->setChecked(true);  // same set Scenes / lpm-gamemode apply
     log("Profile loaded: " + name);
     if (missing) log(QStringLiteral("%1 slot(s) in the profile do not exist on this topology (%2 CCD(s)) and were ignored.")
                          .arg(missing).arg(ccdCount_), "err");
@@ -614,4 +701,62 @@ bool RyzenTab::applyNamedProfile(const QString &name) {
     if (anyCore) return applyPerCore();
     log("Profile '" + name + "' contains no offsets to apply.", "err");
     return false;
+}
+
+// ── parked CCD (Optimizations → Park a CCD) ─────────────────────────────────
+
+void RyzenTab::showEvent(QShowEvent *e) {
+    QWidget::showEvent(e);
+    updateParked();
+}
+
+void RyzenTab::updateParked() {
+    // The layout was read once at construction; hot-plug (park, SMT) or an early start can leave
+    // it stale, which shows one CCD's CPPC values under the other's name. Re-read it and refresh
+    // every CPPC cell when the CPU->CCD mapping is different now.
+    {
+        const ryzen::Layout fresh = ryzen::detect();
+        auto sig = [](const ryzen::Layout &l) {
+            QStringList out;
+            for (auto it = l.cores.cbegin(); it != l.cores.cend(); ++it) {
+                QStringList c;
+                for (const auto &pc : it.value()) c << QString::number(pc.cpus.first());
+                out << QStringLiteral("%1:%2").arg(it.key()).arg(c.join(','));
+            }
+            return out.join(';');
+        };
+        if (fresh.ccdCount == layout_.ccdCount && sig(fresh) != sig(layout_)) {
+            layout_ = fresh;
+            for (const Slot &s : std::as_const(slots_)) {
+                const auto cores = layout_.cores.value(s.ccd);
+                if (s.slot >= cores.size()) continue;
+                s.cppc->setText(cores[s.slot].highestPerf ? QString::number(*cores[s.slot].highestPerf) : QStringLiteral("–"));
+            }
+        }
+    }
+    const QList<int> parked = ryzen::parkedCpus();
+    parkedNow_.clear();
+    for (int ccd = 0; ccd < ccdCount_; ++ccd) {
+        QList<int> cpus;
+        for (const auto &pc : layout_.cores.value(ccd)) cpus << pc.cpus;
+        const bool isParked = !parked.isEmpty() && !cpus.isEmpty()
+                              && std::all_of(cpus.begin(), cpus.end(), [&](int c) { return parked.contains(c); });
+        if (isParked) parkedNow_.insert(ccd);
+        if (QWidget *card = ccdColumns_.value(ccd)) {
+            card->setEnabled(!isParked);
+            card->setToolTip(isParked ? QStringLiteral("CCD%1 is parked (offline) by Optimizations. Its offsets are kept in the "
+                                                       "profile but not sent until it is back online.").arg(ccd) : QString());
+        }
+        if (QLabel *t = ccdTitles_.value(ccd))
+            t->setText(isParked ? QStringLiteral("CCD%1  · parked").arg(ccd) : QStringLiteral("CCD%1").arg(ccd));
+        const auto cores = layout_.cores.value(ccd);
+        for (const Slot &s : std::as_const(slots_)) {
+            if (s.ccd != ccd) continue;
+            if (isParked) { s.cppc->setText(QStringLiteral("–")); continue; }
+            // Back online after being parked when the tab was built: read the live value.
+            if (s.cppc->text() == QStringLiteral("–") && s.slot < cores.size())
+                if (auto v = pp::readText(QStringLiteral("/sys/devices/system/cpu/cpu%1/acpi_cppc/highest_perf").arg(cores[s.slot].cpus.first())))
+                    s.cppc->setText(v->trimmed());
+        }
+    }
 }

@@ -19,6 +19,7 @@
 #include <QCoreApplication>
 #include <QProcess>
 #include <QPushButton>
+#include "nvregdialog.h"
 #include <QSlider>
 #include <QSpinBox>
 #include <QTimer>
@@ -232,7 +233,7 @@ static QSpinBox *spin(int lo, int hi, const QString &suffix, int w) {
 
 NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     auto *root = new QVBoxLayout(this);
-    root->setContentsMargins(12, 10, 12, 10);
+    root->setContentsMargins(12, 8, 12, 8);
     root->setSpacing(5);
 
     // Status + profiles
@@ -275,9 +276,13 @@ NvidiaTab::NvidiaTab(QWidget *parent) : QWidget(parent) {
     auto *bDel = new QPushButton("Delete");
     bDel->setObjectName("btnDanger");
     connect(bDel, &QPushButton::clicked, this, &NvidiaTab::deleteProfile);
+    auto *bDrv = new QPushButton("Driver options…");
+    bDrv->setToolTip("nvidia / nvidia-drm module options (modprobe.d), applied at the next boot.");
+    connect(bDrv, &QPushButton::clicked, this, [this] { NvRegDialog(this).exec(); });
     prow->addWidget(bApplyProf);
     prow->addWidget(bDef);
     prow->addWidget(bDel);
+    prow->addWidget(bDrv);
     sv->addLayout(prow);
     root->addWidget(status);
 

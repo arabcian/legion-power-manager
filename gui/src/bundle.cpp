@@ -45,7 +45,7 @@ static QList<std::pair<const char *, QString>> singles() {
 }
 
 static bool safeName(const QString &n) {
-    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _.()+-]{0,63}$"));
+    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _.()+-]{0,63}\\z"));
     return re.match(n).hasMatch() && !n.contains(QLatin1String(".."));
 }
 
@@ -132,16 +132,18 @@ void importFrom(const QString &path, QWidget *parent, std::function<void(const Q
     if (entries.isEmpty() && singleWrites.isEmpty()) { done("Import: the bundle is empty."); return; }
 
     const QJsonObject from = b.value("machine").toObject(), here = machine();
+    auto fromStr = [&](const char *k, const QString &def) { return from.value(QLatin1String(k)).toString(def).left(64); };
     QString text = QStringLiteral("Bundle from %1 (%2):\n\n• %3")
-        .arg(from.value("product").toString("unknown machine"), b.value("created").toString().left(10), summary.join("\n• "));
+        .arg(fromStr("product", QStringLiteral("unknown machine")), b.value("created").toString().left(10), summary.join("\n• "));
     if (rejected) text += QStringLiteral("\n\n%1 item(s) with invalid names were left out.").arg(rejected);
     if (from.value("product") != here.value("product") || from.value("bios") != here.value("bios"))
         text += QStringLiteral("\n\n⚠ Made on %1 / BIOS %2 — this machine is %3 / BIOS %4. Curve Optimizer offsets, undervolts and "
                                "GPU curves are specific to one chip: check them before applying.")
-                    .arg(from.value("product").toString("?"), from.value("bios").toString("?"),
+                    .arg(fromStr("product", QStringLiteral("?")), fromStr("bios", QStringLiteral("?")),
                          here.value("product").toString("?"), here.value("bios").toString("?"));
 
     QMessageBox box(QMessageBox::Question, "Import settings", text, QMessageBox::NoButton, parent);
+    box.setTextFormat(Qt::PlainText);
     QPushButton *overwrite = nullptr, *keep = nullptr, *go = nullptr;
     if (conflicts) {
         box.setInformativeText(QStringLiteral("%1 item(s) already exist here.").arg(conflicts));

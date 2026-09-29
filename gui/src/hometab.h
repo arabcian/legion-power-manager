@@ -19,10 +19,13 @@ class QProcess;
 class QPushButton;
 class QTimer;
 
+class SceneEngine;
+
 class HomeTab : public QWidget {
     Q_OBJECT
 public:
     explicit HomeTab(QWidget *parent = nullptr);
+    void setSceneEngine(SceneEngine *eng);  // pause banner
 
     static QString profileLabel(const QString &profile);
     static QString helperPath();
@@ -60,6 +63,8 @@ private:
     // Banner when lpm-boot-guard / the login guard paused presets after a crash.
     void refreshGuard();
     QFrame *guardBanner_ = nullptr;
+    QFrame *pauseBanner_ = nullptr;
+    QPushButton *resumeScenes_ = nullptr;
     QLabel *guardText_ = nullptr;
     QPushButton *resumeBoot_ = nullptr, *resumeLogin_ = nullptr;
     void refreshSelection();
@@ -148,7 +153,6 @@ private:
     int autoAllChoice_ = 0;
     // "Max fans" mode: every fan at its maximum (or EC Full Speed on). The per-fan
     // controls are greyed out behind a banner; one button returns all to Auto.
-    QFrame *maxBanner_ = nullptr;
     QLabel *maxBannerText_ = nullptr;
     QPushButton *maxBannerBtn_ = nullptr;
     QPushButton *maxAllBtn_ = nullptr;

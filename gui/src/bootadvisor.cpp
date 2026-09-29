@@ -218,7 +218,7 @@ BootAdvisor::BootAdvisor(QWidget *parent) : QWidget(parent) {
     cmd("rcu_nocbs=all rcutree.enable_rcu_lazy=1", "Lazy RCU: batches RCU callbacks and delays them by seconds instead of waking "
         "idle CPUs for each one — a measurable idle-power saving on laptops (it is what ChromeOS and Android ship). Needs a "
         "kernel built with CONFIG_RCU_LAZY.", false, false,
-        [param] { return QFile::exists("/sys/module/rcutree/parameters/enable_rcu_lazy"); },
+        [] { return QFile::exists("/sys/module/rcutree/parameters/enable_rcu_lazy"); },
         [param] { return onCmdline("rcu_nocbs=all") && param("rcutree", "enable_rcu_lazy") == "Y" ? 1 : 0; });
     cmd("pcie_aspm.policy=powersupersave", "Boot with the deepest PCIe link power states (L1 substates) where devices allow "
         "them. The Devices tab switches the policy at runtime; this makes it the default.", false, false,

@@ -3,6 +3,7 @@
 
 class AmdGpuTab;
 class FwattrTab;
+class HealthTab;
 class HomeTab;
 class SceneEngine;
 class IntelTab;
@@ -26,6 +27,7 @@ public:
     FwattrTab *fwattr() const { return fwattr_; }
     LightingTab *lighting() const { return lighting_; }  // nullptr without a Spectrum keyboard
     SceneEngine *scenes() const { return scenes_; }
+    HealthTab *health() const { return health_; }
     /// Set by the tray's Quit: closeEvent then really closes instead of hiding.
     void setForceQuit(bool v) { forceQuit_ = v; }
     void setHideOnClose(bool v) { hideOnClose_ = v; }
@@ -34,9 +36,12 @@ protected:
     void closeEvent(QCloseEvent *e) override;
     void showEvent(QShowEvent *e) override;
     void hideEvent(QHideEvent *e) override;
+    void resizeEvent(QResizeEvent *e) override;
 
 private:
+    void fitTabs();
     QTabWidget *tabs_;
+    int tabW_ = -1;
     QLabel *mark_;
     HomeTab *home_;
     RyzenTab *ryzen_ = nullptr;
@@ -47,5 +52,6 @@ private:
     FwattrTab *fwattr_ = nullptr;
     LightingTab *lighting_ = nullptr;
     SceneEngine *scenes_;
+    HealthTab *health_;
     bool forceQuit_ = false, hideOnClose_ = false;
 };

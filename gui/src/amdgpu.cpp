@@ -33,7 +33,7 @@ QList<Card> cards() {
     // Dev aid (like LPM_FWATTR_BASE): LPM_AMDGPU_DRM=<dir with cardN/device> for screenshots and tests.
     const QDir drm(qEnvironmentVariableIsSet("LPM_AMDGPU_DRM") ? qEnvironmentVariable("LPM_AMDGPU_DRM")
                                                                : QStringLiteral("/sys/class/drm"));
-    static const QRegularExpression cardRe(QStringLiteral("^card\\d+$"));
+    static const QRegularExpression cardRe(QStringLiteral("^card\\d+\\z"));
     for (const QString &n : drm.entryList(QDir::Dirs | QDir::System | QDir::NoDotAndDotDot, QDir::Name)) {
         if (!cardRe.match(n).hasMatch()) continue;
         const QString dev = drm.filePath(n) + QStringLiteral("/device");

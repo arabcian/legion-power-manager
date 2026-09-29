@@ -10,8 +10,10 @@
 #include "platformprofile.h"
 #include "privileged.h"
 #include "ryzentab.h"
+#include <algorithm>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
@@ -43,7 +45,7 @@ static QString sceneFile(const QString &n) { return dir() + '/' + n + QStringLit
 
 bool validName(const QString &n) {
     // Same rule as the Ryzen/Intel profile names: it becomes a file name.
-    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$"));
+    static const QRegularExpression re(QStringLiteral("^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}\\z"));
     return re.match(n).hasMatch();
 }
 
@@ -103,6 +105,13 @@ std::optional<Scene> load(const QString &name) {
     const QJsonObject light = o.value("lighting").toObject();
     if (const int p = light.value("profile").toInt(-1); p >= 0 && p <= 6) s.lightProfile = p;
     if (const int b = light.value("brightness").toInt(-1); b >= 0 && b <= 9) s.lightBrightness = b;
+    if (const QJsonValue f = o.value("fan_fullspeed"); f.isBool()) s.fanFullSpeed = f.toBool() ? 1 : 0;
+    const QJsonArray ft = o.value("fan_table").toArray();
+    if (ft.size() == 10) {
+        QVector<int> lv;
+        for (const QJsonValue &v : ft) lv << v.toInt(0);
+        if (std::all_of(lv.begin(), lv.end(), [](int x) { return x >= 1 && x <= 10; })) s.fanTable = lv;
+    }
     s.command = o.value("command").toString().trimmed();
     return s;
 }
@@ -129,6 +138,8 @@ bool save(const Scene &s, QString *err, const QJsonObject &tuningValues) {
         if (s.lightBrightness >= 0) light["brightness"] = s.lightBrightness;
         o["lighting"] = light;
     }
+    if (s.fanFullSpeed >= 0) o["fan_fullspeed"] = s.fanFullSpeed == 1;
+    if (s.fanTable.size() == 10) { QJsonArray a; for (int x : s.fanTable) a << x; o["fan_table"] = a; }
     if (!s.command.isEmpty()) o["command"] = s.command;
     return writeObject(sceneFile(s.name), o, err);
 }
@@ -141,13 +152,14 @@ Auto loadAuto() {
     a.enabled = o.value("auto").toBool();
     a.onAc = o.value("on_ac").toString();
     a.onBattery = o.value("on_battery").toString();
+    a.paused = o.value("paused").toBool();
     if (!validName(a.onAc)) a.onAc.clear();
     if (!validName(a.onBattery)) a.onBattery.clear();
     return a;
 }
 
 bool saveAuto(const Auto &a, QString *err) {
-    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}}, err);
+    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}, {"paused", a.paused}}, err);
 }
 
 std::optional<bool> onAc() {
@@ -288,7 +300,9 @@ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadA
     retunePoll();
     // Session start: bring the machine to the scene for the current source,
     // after the tabs have finished their own startup reads.
-    if (auto_.enabled && ac_) QTimer::singleShot(STARTUP_DELAY_MS, this, &SceneEngine::startupApply);
+    // A theme change re-execs the app: the hardware is already in the scene's state.
+    if (auto_.enabled && ac_ && !QCoreApplication::arguments().contains(QStringLiteral("--theme-restart")))
+        QTimer::singleShot(STARTUP_DELAY_MS, this, &SceneEngine::startupApply);
 }
 
 // The login scene can carry a CPU/GPU curve: if one is unstable, applying it
@@ -299,7 +313,7 @@ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadA
 static constexpr int LOGIN_WINDOW_MS = 120000;
 
 void SceneEngine::startupApply() {
-    if (!auto_.enabled || !ac_) return;
+    if (!auto_.enabled || auto_.paused || !ac_) return;
     const QString file = loginGuardFile();
     QJsonObject g = readObject(file);
     const QString cur = bootId();
@@ -341,6 +355,20 @@ bool SceneEngine::setAuto(const Auto &a, QString *err) {
     if (!saveAuto(a, err)) return false;
     auto_ = a;
     if (a.enabled && !wasOn && ac_) applyForSource(*ac_);
+    return true;
+}
+
+bool SceneEngine::setPaused(bool on, QString *err) {
+    if (auto_.paused == on) return true;
+    Auto a = auto_;
+    a.paused = on;
+    if (!saveAuto(a, err)) return false;
+    auto_ = a;
+    Q_EMIT pausedChanged(on);
+    Q_EMIT finished(QString(), true, {on ? QStringLiteral("scenes paused — no automatic scene changes until resumed")
+                                         : QStringLiteral("scenes resumed")});
+    // Resuming catches up with the current power source.
+    if (!on && auto_.enabled && ac_) applyForSource(*ac_);
     return true;
 }
 
@@ -429,11 +457,12 @@ void SceneEngine::checkGameEnd() {
     Q_EMIT finished(QString(), true, {QStringLiteral("the game launcher exited without its POST hook — leaving the game scene")});
     const QString target = auto_.enabled && ac_ ? (*ac_ ? auto_.onAc : auto_.onBattery) : before;
     // Ends the dead session and restores the game tuning (tune-helper prune).
-    privileged::run(privileged::helperPath("tune-helper"), QJsonObject{{"op", "prune"}}, this,
-                    [this, target](const privileged::Result &) { if (validName(target)) apply(target); }, 120000);
+    privileged::run(privileged::helperPath("tune-profile-helper"), QJsonObject{{"op", "prune"}}, this,
+                    [this, target](const privileged::Result &) { if (validName(target) && !auto_.paused) apply(target); }, 120000);
 }
 
 void SceneEngine::applyForSource(bool onAc) {
+    if (auto_.paused) { deferred_ = false; return; }
     // Never switch scenes under a running game: lpm-gamemode POST returns to
     // the scene for the then-current power source when the last game exits.
     if (gameSessions() > 0) {
@@ -456,6 +485,23 @@ void SceneEngine::apply(const QString &name) {
     start(*s);
 }
 
+/// The NVIDIA dGPU is on the bus, has a driver bound AND the driver actually
+/// initialised it (/proc/driver/nvidia/gpus lists it; "nvidia-smi: No devices were
+/// found" = empty). After iGPU-only / a firmware power cut the PCI function can stay
+/// listed with the module loaded while the GPU is dead: every NVIDIA / WMI-GPU call
+/// against it can then hang in the kernel (the helper sits in D state), so a scene
+/// skips those steps instead of trying them. Directory listing only: no GPU wake-up.
+static bool nvidiaUsable() {
+    const QDir d(QStringLiteral("/sys/bus/pci/devices"));
+    bool onBus = false;
+    for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::System)) {
+        auto rd = [&](const char *f) { QFile x(d.filePath(e) + '/' + QLatin1String(f)); return x.open(QIODevice::ReadOnly) ? x.readAll().trimmed() : QByteArray(); };
+        if (rd("vendor") == "0x10de" && rd("class").startsWith("0x03") && QFileInfo::exists(d.filePath(e) + QStringLiteral("/driver"))
+            && rd("power/runtime_status") != "error") { onBus = true; break; }
+    }
+    return onBus && !QDir(QStringLiteral("/proc/driver/nvidia/gpus")).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty();
+}
+
 void SceneEngine::addStep(const QString &what, Step step) { steps_.append({what, std::move(step)}); }
 
 void SceneEngine::helper(const QString &name, const QJsonObject &req, Done done,
@@ -474,6 +520,18 @@ void SceneEngine::start(const Scene &s) {
     current_ = s.name;
     Q_EMIT started(s.name);
 
+    // 0. EC fan boost FIRST: turning it off before the profile change means the fans never
+    //    spin up for the new profile and then drop again.
+    if (s.fanFullSpeed >= 0) {
+        addStep("Fan boost", [this, on = s.fanFullSpeed == 1](Done done) {
+            privileged::run(privileged::helperPath("legion-profile-helper"),
+                            QJsonObject{{"device", "fan_fullspeed"}, {"value", on ? "1" : "0"}}, this,
+                            [done, on](const privileged::Result &r) {
+                                done(r.ok(), r.ok() ? QString(on ? "turbo (EC full speed)" : "auto") : r.message());
+                            });
+        });
+    }
+
     // 1. Platform profile — first: firmware limits depend on it being Custom.
     if (!s.platformProfile.isEmpty()) {
         addStep("Power profile", [this, p = s.platformProfile](Done done) {
@@ -486,6 +544,18 @@ void SceneEngine::start(const Scene &s) {
             }, [](const QJsonObject &j) {
                 const QString eff = j.value("effective").toString();
                 return eff.isEmpty() ? QString() : HomeTab::profileLabel(eff);
+            });
+        });
+    }
+
+    // The EC may reset the flag on a profile change: re-assert only if it no longer matches.
+    if (s.fanFullSpeed >= 0 && !s.platformProfile.isEmpty()) {
+        addStep("Fan boost check", [this, on = s.fanFullSpeed == 1](Done done) {
+            const QString h = privileged::helperPath("legion-profile-helper");
+            privileged::run(h, QJsonObject{{"fan_fullspeed", "get"}}, this, [this, h, on, done](const privileged::Result &r) {
+                if (!r.ok() || r.json.value("on").toBool() == on) { done(true, "unchanged"); return; }
+                privileged::run(h, QJsonObject{{"device", "fan_fullspeed"}, {"value", on ? "1" : "0"}}, this,
+                                [done](const privileged::Result &r2) { done(r2.ok(), r2.ok() ? QStringLiteral("re-applied after the profile change") : r2.message()); });
             });
         });
     }
@@ -513,6 +583,7 @@ void SceneEngine::start(const Scene &s) {
             auto afterSysfs = [this, wmi, note, done, n = batch.size()](bool ok, const QString &msg) {
                 if (!ok) { done(false, msg); return; }
                 if (wmi.isEmpty()) { done(true, QStringLiteral("%1 value(s)").arg(n) + note); return; }
+                if (!nvidiaUsable()) { done(true, QStringLiteral("%1 value(s); %2 GPU value(s) skipped (NVIDIA dGPU is off)").arg(n).arg(wmi.size()) + note); return; }
                 helper("legion-gpu-helper", {{"op", "apply"}, {"values", wmi}}, [done, n, note, w = wmi.size()](bool ok, const QString &m) {
                     done(ok, ok ? QStringLiteral("%1 value(s) + %2 GPU (WMI)").arg(n).arg(w) + note : "GPU (WMI): " + m);
                 });
@@ -571,14 +642,19 @@ void SceneEngine::start(const Scene &s) {
     }
 
     // 4. NVIDIA V/F curve.
+    const bool cpuStep = s.cpu.kind != Choice::Unchanged && (win_->ryzen() || win_->intel());
     if (s.gpu.kind != Choice::Unchanged && win_->nvidia()) {
-        addStep("GPU curve", [this, c = s.gpu](Done done) {
-            // Two NvAPI sessions writing the ClockBoostTable at once is asking for trouble.
-            if (win_->nvidia()->busy()) { done(false, "the NVIDIA tab is busy; skipped"); return; }
-            const QJsonObject req = c.kind == Choice::Reset ? QJsonObject{{"op", "reset_gpu_curve"}}
-                                                            : QJsonObject{{"op", "apply_named_profile"}, {"name", c.name}};
-            helper("nvcurve-root-helper", req, [done, c](bool ok, const QString &m) {
-                done(ok, ok ? (c.kind == Choice::Reset ? QStringLiteral("reset") : "'" + c.name + "'") : m);
+        addStep("GPU curve", [this, c = s.gpu, cpuStep](Done done) {
+            // Same 2 s gap after a CPU curve as lpm-gamemode (UNDERVOLT_GAP).
+            if (!nvidiaUsable()) { done(true, "skipped (NVIDIA dGPU is off)"); return; }
+            QTimer::singleShot(cpuStep ? 2000 : 0, this, [this, c, done] {
+                // Two NvAPI sessions writing the ClockBoostTable at once is asking for trouble.
+                if (win_->nvidia()->busy()) { done(false, "the NVIDIA tab is busy; skipped"); return; }
+                const QJsonObject req = c.kind == Choice::Reset ? QJsonObject{{"op", "reset_gpu_curve"}}
+                                                                : QJsonObject{{"op", "apply_named_profile"}, {"name", c.name}};
+                helper("nvcurve-root-helper", req, [done, c](bool ok, const QString &m) {
+                    done(ok, ok ? (c.kind == Choice::Reset ? QStringLiteral("reset") : "'" + c.name + "'") : m);
+                });
             });
         });
     }
@@ -587,18 +663,42 @@ void SceneEngine::start(const Scene &s) {
     //    go back to their originals, and a running game's tuning is left alone.
     if (s.tuning.kind != Choice::Unchanged) {
         addStep("Optimizations", [this, c = s.tuning](Done done) {
-            QJsonObject req{{"op", "apply"}, {"mode", "manual"}, {"replace", true}, {"values", QJsonObject()}};
-            if (c.kind == Choice::Profile) {
-                const QJsonObject p = win_->optimize()->presetObject(c.name);
-                if (p.isEmpty()) { done(false, "preset '" + c.name + "' not found"); return; }
-                req["values"] = p.value("values").toObject();
-                req["preset"] = c.name;
+            // By name: tune-profile-helper takes the values from the root-owned approved store, never from this request.
+            QJsonObject req{{"op", "apply_preset"}, {"mode", "manual"}, {"replace", true}, {"preset", QJsonValue::Null}};
+            auto run = [this, done, c](const QJsonObject &rq) {
+                privileged::run(privileged::helperPath("tune-profile-helper"), rq, this, [done, c](const privileged::Result &r) {
+                    if (r.reached && r.json.value("game_active").toBool()) { done(true, "left alone (game session active)"); return; }
+                    if (!r.ok()) { done(false, r.message()); return; }
+                    done(true, c.kind == Choice::Reset ? QStringLiteral("originals restored") : "'" + c.name + "'");
+                }, 120000);
+            };
+            if (c.kind != Choice::Profile) { run(req); return; }
+            const QJsonObject p = win_->optimize()->presetObject(c.name);
+            if (p.isEmpty()) { done(false, "preset '" + c.name + "' not found"); return; }
+            req["preset"] = c.name;
+            if (QFile::exists(QStringLiteral("/etc/legion-power-manager/presets/") + c.name + QStringLiteral(".json"))) { run(req); return; }
+            // First use: approve (store root-owned) once, then apply by name.
+            privileged::run(privileged::helperPath("tune-helper"),
+                            QJsonObject{{"op", "preset_save"}, {"name", c.name}, {"values", p.value("values").toObject()}}, this,
+                            [run, req, done](const privileged::Result &r) {
+                                if (!r.ok()) { done(false, r.message()); return; }
+                                run(req);
+                            }, 120000);
+        });
+    }
+
+    // 5a. Custom-mode fan curve — only while the Custom power profile is active (the EC follows
+    //     the table there and nowhere else); skipped with a note otherwise, not an error.
+    if (s.fanTable.size() == 10) {
+        addStep("Fan curve", [this, lv = s.fanTable](Done done) {
+            if (pp::currentProfile(pp::primaryHandler()) != QStringLiteral("custom")) {
+                done(true, "skipped (the EC uses its own curve outside the Custom power profile)");
+                return;
             }
-            privileged::run(privileged::helperPath("tune-helper"), req, this, [done, c](const privileged::Result &r) {
-                if (r.reached && r.json.value("game_active").toBool()) { done(true, "left alone (game session active)"); return; }
-                if (!r.ok()) { done(false, r.message()); return; }
-                done(true, c.kind == Choice::Reset ? QStringLiteral("originals restored") : "'" + c.name + "'");
-            }, 120000);
+            QJsonArray a;
+            for (int x : lv) a << x;
+            helper("legion-profile-helper", QJsonObject{{"fan_table", "set"}, {"levels", a}}, done,
+                   [](const QJsonObject &) { return QStringLiteral("table written and verified"); });
         });
     }
 

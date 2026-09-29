@@ -16,6 +16,7 @@
 //   ~/.config/legion-power-manager/scenes.json      {"auto", "on_ac", "on_battery"}
 #include <QJsonObject>
 #include <QMap>
+#include <QVector>
 #include <QObject>
 #include <QStringList>
 #include <functional>
@@ -40,6 +41,8 @@ struct Scene {
     Choice cpu, gpu, tuning;       // tuning Reset = restore originals
     int lightProfile = -1;         // keyboard lighting profile 1-6; -1 = unchanged
     int lightBrightness = -1;      // keyboard brightness 0-9; -1 = unchanged
+    QVector<int> fanTable;         // Custom-mode EC fan table (10 levels, 1..10); empty = unchanged
+    int fanFullSpeed = -1;         // EC fan boost (Full Speed): 1 on, 0 auto; -1 = unchanged
     QString command;               // optional; run as the user, no shell
     bool operator==(const Scene &) const = default;
 };
@@ -47,6 +50,7 @@ struct Scene {
 struct Auto {
     bool enabled = false;
     QString onAc, onBattery;       // scene names; empty = leave as is
+    bool paused = false;           // no automatic scene changes (power source, login, game); manual Apply still works
 };
 
 QString dir();
@@ -96,6 +100,8 @@ public:
     scenes::Auto autoConfig() const { return auto_; }
     /// Persists the setting; enabling it applies the matching scene at once.
     bool setAuto(const scenes::Auto &a, QString *err = nullptr);
+    bool paused() const { return auto_.paused; }
+    bool setPaused(bool on, QString *err = nullptr);
     std::optional<bool> powerSource() const { return ac_; }
 
 Q_SIGNALS:
@@ -103,6 +109,7 @@ Q_SIGNALS:
     /// `log` holds one line per component, failures prefixed with "✗".
     void finished(const QString &name, bool ok, const QStringList &log);
     void powerSourceChanged(bool onAc);
+    void pausedChanged(bool paused);
 
 private:
     using Done = std::function<void(bool ok, const QString &msg)>;

@@ -21,6 +21,7 @@ class QLabel;
 class QLineEdit;
 class QPushButton;
 class QSpinBox;
+class Int64SpinBox;
 class QTabWidget;
 class QTimer;
 
@@ -58,7 +59,7 @@ private:
         QCheckBox *include = nullptr;
         QLabel *name = nullptr, *cur = nullptr;
         QComboBox *combo = nullptr;
-        QSpinBox *spin = nullptr;
+        Int64SpinBox *spin = nullptr;  // 64-bit: dirty limits exceed INT_MAX
         QPushButton *revert = nullptr;
     };
 
@@ -74,6 +75,7 @@ private:
 
     static bool validFor(const Row &r, const QString &v);
     QString editorValue(const Row &r) const;
+    QString canonicalCcd(const QString &v) const;
     bool setEditorValue(Row &r, const QString &v);
     bool differs(const Row &r) const;
     void markRow(Row &r);
@@ -92,20 +94,32 @@ private:
     void setBoot();
     void clearBoot();
 
+    // Autotune: tune-helper {"op":"autotune"} profiles the hardware and
+    // returns a preset for the chosen base (see lpm_helpers::autotune).
+    void runAutotune();
+    /// Per-goal objective weights (QSettings autotune/weights/<goal>); empty = goal defaults.
+    QJsonObject autotuneWeights(const QString &goal) const;
+    void editAutotuneWeights();
+    void showAutotuneReport(const QJsonObject &d, const QStringList &notLoaded);
+
     void applySelected();
     void applyValues(const QJsonObject &values, const QString &preset);
     void revertRow(const QString &key);
     void runOp(const QJsonObject &req, const QString &what, std::function<void(const QJsonObject &)> then = {});
+    // Stores the preset's values root-owned (tune-helper preset_save) so it can be applied by name; then() runs on success.
+    void approvePreset(const QString &name, const QJsonObject &values, std::function<void()> then);
     void setBusy(bool b);
     void showStatus(const QString &msg, const char *color = nullptr, int ms = 6000);
 
     QList<Row> rows_;
-    QJsonObject topology_, state_, boot_;
+    QJsonObject topology_, state_, boot_, isolation_;
     bool active_ = false, busy_ = false, describing_ = false, helperMissing_ = false;
 
     QLabel *banner_ = nullptr, *bannerDetail_ = nullptr, *status_ = nullptr, *bootLabel_ = nullptr;
     QPushButton *restoreBtn_ = nullptr, *applyBtn_ = nullptr, *gameBtn_ = nullptr, *bootBtn_ = nullptr, *bootClear_ = nullptr;
-    QComboBox *presetCombo_ = nullptr, *affinity_ = nullptr;
+    QComboBox *presetCombo_ = nullptr, *affinity_ = nullptr, *autoGoal_ = nullptr;
+    QPushButton *autoBtn_ = nullptr;
+    bool autoRunning_ = false;
     QSpinBox *nice_ = nullptr;
     QCheckBox *autogroup_ = nullptr, *uvCpu_ = nullptr, *uvGpu_ = nullptr;
     QLabel *uvInfo_ = nullptr;
