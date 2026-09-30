@@ -25,6 +25,9 @@
 //! [`guard_verdict`] is the rollback rule of the post-apply pressure guard.
 //! Reasoning per knob: docs/AUTOTUNE.md.
 
+use crate::calib;
+use crate::model;
+use crate::defaults;
 use crate::iorate;
 use crate::tune;
 use serde_json::{json, Map, Value};
@@ -36,7 +39,7 @@ const GIB: u64 = 1 << 30;
 /// Cost per unit of deviation from the reference ("be modest").
 const MODESTY: f64 = 0.10;
 /// A candidate must beat the reference by this much to be written.
-const MARGIN: f64 = 0.03;
+pub const MARGIN: f64 = 0.03;
 /// Largest integer the GUI's JSON layer (double) carries exactly.
 pub const JSON_SAFE_INT: i64 = 1 << 53;
 
@@ -355,6 +358,13 @@ pub struct Profile {
     pub io: iorate::IoRate,
     /// /proc/cmdline: boot parameters the user chose are hard constraints.
     pub cmdline: String,
+    /// Tunable values captured early in boot (kernel + distro + user sysctl,
+    /// before TLP/LPM): the anchor scored knobs adapt from.
+    pub defaults: Option<defaults::Defaults>,
+    /// Per key: applies / guard rollbacks on this machine.
+    pub outcomes: BTreeMap<String, defaults::Outcome>,
+    /// Measured effects from lpm-calibrate (replace the estimated ones).
+    pub calibration: Option<calib::Calibration>,
     /// Live values of the rows whose rule depends on the current state.
     pub current: BTreeMap<String, String>,
 }
@@ -494,6 +504,9 @@ impl Profile {
             evidence: Evidence::gather(),
             io: iorate::gather(),
             cmdline: rd("/proc/cmdline").unwrap_or_default(),
+            defaults: defaults::load(),
+            outcomes: defaults::load_outcomes(),
+            calibration: calib::Calibration::load(),
             current,
         }
     }
@@ -508,6 +521,25 @@ impl Profile {
     /// Frequency is chosen by the scheduler (schedutil), not by CPPC/HWP.
     fn schedutil(&self) -> bool { !self.epp && self.governors.iter().any(|g| g == "schedutil") }
     fn cur(&self, k: &str) -> Option<&str> { self.current.get(k).map(String::as_str) }
+    /// Replaces a candidate's estimated latency/throughput/power/memory effects
+    /// with calibrated ones (stability risk stays the model's).
+    fn apply_measured(&self, g: Goal, key: &str, reference: &str, value: &str, c: &mut Cand) {
+        let Some(m) = self.calibration.as_ref().and_then(|cal| cal.get(key, reference, value, calib::load_share(g.key()))) else { return };
+        overlay(&mut c.fx, m);
+        c.why.push_str(" (effects measured on this machine)");
+    }
+    /// A candidate that caused an OOM kill during the calibration load phase.
+    fn measured_unsafe(&self, key: &str, value: &str) -> bool {
+        self.calibration.as_ref().map_or(false, |c| c.is_unsafe(key, value))
+    }
+    /// Boot-time value of a tunable, when a snapshot exists.
+    pub fn boot_default(&self, k: &str) -> Option<&str> { self.defaults.as_ref()?.values.get(k).map(String::as_str) }
+    /// Stability cost learned from guard rollbacks: None = key retired (>= 2 rollbacks).
+    fn learned_risk(&self, k: &str) -> Option<f64> {
+        let o = self.outcomes.get(k).copied().unwrap_or_default();
+        if o.rollbacks >= 2 { return None; }
+        Some(-0.6 * o.rollbacks as f64 / (o.applies as f64 + 1.0))
+    }
     /// Value of a boot parameter (`name=value`), or "" for a bare flag.
     pub fn boot_param(&self, name: &str) -> Option<&str> {
         self.cmdline.split_whitespace().find_map(|w| {
@@ -537,6 +569,7 @@ impl Profile {
                          "psi_cpu_some": self.evidence.psi_cpu_some, "psi_io_some": self.evidence.psi_io_some,
                          "psi_io_full": self.evidence.psi_io_full},
             "storage_write": self.io.to_json(),
+            "boot_defaults": self.defaults.as_ref().map(|d| json!({"clean": d.clean, "kernel": d.kernel, "keys": d.values.len()})),
         })
     }
 
@@ -554,6 +587,11 @@ impl Profile {
         p.push(format!("{} GB RAM", self.ram_gb()));
         p.push(format!("swap: {}", self.swap.as_str()));
         p.push(self.io.summary());
+        p.push(match &self.defaults {
+            Some(d) if d.clean => "anchored at boot defaults".into(),
+            Some(_) => "anchored at boot defaults (captured after TLP/LPM)".into(),
+            None => "no boot-default snapshot (enable lpm-boot-guard)".into(),
+        });
         let mut g = Vec::new();
         if self.nvidia_dgpu { g.push("NVIDIA"); }
         if self.amd_igpu { g.push("AMD"); }
@@ -593,6 +631,8 @@ struct Rules<'a> {
     out: Vec<Decision>,
     /// key -> [{value, U}] for the report / log.
     scores: Map<String, Value>,
+    /// Messages of the joint pass (shown with the constraint notes).
+    notes: Vec<String>,
 }
 
 fn vstr(v: &Value) -> String { match v { Value::String(s) => s.clone(), x => x.to_string() } }
@@ -625,7 +665,48 @@ impl<'a> Rules<'a> {
     }
     /// Scored knob: writes the winner, or the reference if it is a real value.
     /// Returns the value in effect afterwards (live value when left alone).
+    /// Scored knob anchored at the boot default (when captured):
+    /// * the boot value is the reference; an alternative equal to it lends it its effects;
+    /// * distance from the anchor costs modesty (log2 for numbers), and numbers may
+    ///   move at most 2x from it (x 2^(2*evidence) for evidence-driven knobs);
+    /// * guard rollbacks add stability cost; two rollbacks retire the key's alternatives.
     fn choose(&mut self, key: &'static str, reference: Cand, alts: Vec<Cand>) -> Option<String> {
+        let (reference, mut alts) = self.anchor(key, reference, alts);
+        // Reference for the measurements: anchor, else live value, else what was live while calibrating.
+        let ref_str = if !reference.value.is_null() { Some(vstr(&reference.value)) } else {
+            self.p.cur(key).map(str::to_owned).or_else(|| self.p.calibration.as_ref().and_then(|c| c.values(key, "")).map(|(r, _)| r))
+        };
+        alts.retain(|c| !self.p.measured_unsafe(key, &vstr(&c.value)));
+        if let Some(r) = ref_str { for c in alts.iter_mut() { self.p.apply_measured(self.g, key, &r, &vstr(&c.value), c); } }
+        self.choose_raw(key, reference, alts)
+    }
+
+    fn anchor(&self, key: &str, mut reference: Cand, mut alts: Vec<Cand>) -> (Cand, Vec<Cand>) {
+        let learned = self.p.learned_risk(key);
+        let Some(d0) = self.p.boot_default(key).map(str::to_owned) else {
+            match learned { Some(l) => for c in alts.iter_mut() { c.fx.risk += l; }, None => alts.clear() }
+            return (reference, alts);
+        };
+        let strength = if key == "vm.watermark_scale_factor" { self.p.evidence.reclaim_strength() } else { 0.0 };
+        let max_dist = 1.0 + 2.0 * strength;
+        let fx0 = alts.iter().find(|c| vstr(&c.value) == d0).map(|c| c.fx).unwrap_or_default();
+        alts.retain(|c| vstr(&c.value) != d0);
+        match learned { Some(l) => for c in alts.iter_mut() { c.fx.risk += l; }, None => alts.clear() }
+        let cal = self.p.calibration.as_ref();
+        let share = calib::load_share(self.g.key());
+        let seen = |v: &str| cal.and_then(|c| c.get(key, &d0, v, share)).map_or(0.0, |m| m.n);
+        alts.retain_mut(|c| match anchor_dist(&vstr(&c.value), &d0) {
+            // Measured twice or more: one more doubling is allowed.
+            Some(d) if d > max_dist && !(d <= max_dist + 1.0 && seen(&vstr(&c.value)) >= 2.0) => false,
+            Some(d) => { c.dev += 0.1 * d; c.fx = sub(c.fx, fx0); true }
+            None => { c.dev += 0.1; c.fx = sub(c.fx, fx0); true }
+        });
+        let v = d0.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(d0));
+        reference = Cand { value: v, fx: Fx::default(), dev: 0.0, why: "Boot default (kernel + distro + your sysctl, before TLP/LPM).".into() };
+        (reference, alts)
+    }
+
+    fn choose_raw(&mut self, key: &'static str, reference: Cand, alts: Vec<Cand>) -> Option<String> {
         match self.pick(key, &reference, &alts) {
             Some(i) => {
                 let c = &alts[i];
@@ -636,11 +717,43 @@ impl<'a> Rules<'a> {
             }
             None if !reference.value.is_null() => {
                 let v = reference.value.clone();
-                self.set_live(key, v.clone(), format!("{} No candidate beats the kernel default by {MARGIN} for these weights.", reference.why));
+                self.set_live(key, v.clone(), format!("{} No candidate beats it by {MARGIN} for these weights.", reference.why));
                 Some(vstr(&v))
             }
             None => self.p.cur(key).map(str::to_owned),
         }
+    }
+    /// When lpm-calibrate measured `key`, choose among the measured values by
+    /// score (reference = boot/live value) instead of the structural rule.
+    /// Numeric keys also get interpolated doses between measured values (see calib::curve).
+    fn calibrated_choice(&mut self, key: &'static str) -> bool {
+        let Some(cal) = self.p.calibration.as_ref() else { return false };
+        let reference = self.p.boot_default(key).or_else(|| self.p.cur(key)).map(str::to_owned).unwrap_or_default();
+        let Some((stored_ref, vals)) = cal.values(key, &reference) else { return false };
+        let reference = if reference.is_empty() { stored_ref } else { reference };
+        let share = calib::load_share(self.g.key());
+        let mut alts: Vec<Cand> = vals.iter().filter(|v| **v != reference).map(|v| {
+            let val = v.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(v));
+            cand(val, Fx::default(), 0.2, format!("{key} = {v}."))
+        }).collect();
+        if let Ok(r) = reference.parse::<i64>() {
+            let mut pts: Vec<(i64, calib::Measured)> = vals.iter().filter_map(|v| {
+                let n = v.parse::<i64>().ok()?;
+                Some((n, if n == r { calib::Measured { lat: Some(0.0), thr: Some(0.0), pwr: Some(0.0), mem: Some(0.0), n: 99.0 } }
+                         else { cal.get(key, &reference, v, share)? }))
+            }).collect();
+            if !pts.iter().any(|(n, _)| *n == r) { pts.push((r, calib::Measured { lat: Some(0.0), thr: Some(0.0), pwr: Some(0.0), mem: Some(0.0), n: 99.0 })); }
+            if pts.len() >= 3 {
+                for (v, m) in calib::curve(&pts) {
+                    if vals.iter().any(|x| x.parse::<i64>().ok() == Some(v)) { continue; }
+                    let mut c = cand(v, Fx::default(), 0.2, format!("{key} = {v} (dose interpolated between measured values)."));
+                    overlay(&mut c.fx, m);
+                    alts.push(c);
+                }
+            }
+        }
+        self.choose(key, leave(), alts);
+        true
     }
     /// Value in effect after this rule set: decided, else live.
     fn eff(&self, key: &str) -> Option<String> {
@@ -650,20 +763,140 @@ impl<'a> Rules<'a> {
 
 fn round2(x: f64) -> f64 { (x * 100.0).round() / 100.0 }
 
+/// log2 distance of two numeric values (+1 so 0 is reachable); None for text.
+fn anchor_dist(a: &str, b: &str) -> Option<f64> {
+    let (x, y) = (a.parse::<f64>().ok()?, b.parse::<f64>().ok()?);
+    Some(((x.abs() + 1.0) / (y.abs() + 1.0)).log2().abs() + if x.signum() != y.signum() && x != 0.0 && y != 0.0 { 1.0 } else { 0.0 })
+}
+
+/// Measured effects replace the estimates in proportion to the evidence:
+/// (n·measured + K·estimate) / (n + K), K = 1 run. One run halves the
+/// estimate's say, five runs leave it a sixth.
+fn overlay(f: &mut Fx, m: calib::Measured) {
+    const K: f64 = 1.0;
+    let n = m.n.max(0.0);
+    let mix = |est: f64, meas: f64| (n * meas + K * est) / (n + K);
+    if let Some(v) = m.lat { f.lat = mix(f.lat, v); }
+    if let Some(v) = m.thr { f.thr = mix(f.thr, v); }
+    if let Some(v) = m.pwr { f.pwr = mix(f.pwr, v); }
+    if let Some(v) = m.mem { f.mem = mix(f.mem, v); }
+}
+
+fn sub(a: Fx, b: Fx) -> Fx { fx(a.lat - b.lat, a.thr - b.thr, a.pwr - b.pwr, a.mem - b.mem, a.risk - b.risk) }
+
 /// Pure rule set with the goal's default weights. Keys that do not exist on this machine are filtered later.
 pub fn decide(goal: Goal, p: &Profile) -> Vec<Decision> { decide_weighted(goal, p, Weights::for_goal(goal)).0 }
 
 /// Decisions plus the score trace and the constraint notes.
 pub fn decide_weighted(goal: Goal, p: &Profile, w: Weights) -> (Vec<Decision>, Map<String, Value>, Vec<String>) {
-    let mut r = Rules { p, g: goal, w, out: Vec::new(), scores: Map::new() };
+    let mut r = Rules { p, g: goal, w, out: Vec::new(), scores: Map::new(), notes: Vec::new() };
     cpu_rules(&mut r);
     memory_rules(&mut r);
     sched_rules(&mut r);
     io_rules(&mut r);
     device_rules(&mut r);
+    signature_pass(&mut r);
+    joint_pass(&mut r);
     repair_live(&mut r);
-    let notes = enforce(&mut r.out, p);
+    let mut notes = std::mem::take(&mut r.notes);
+    notes.extend(enforce(&mut r.out, p));
     (r.out, r.scores, notes)
+}
+
+// ── joint decision (interactions between knobs) ──────────────────────────────
+
+impl<'a> Rules<'a> {
+    /// Candidate values of a calibrated knob with their cost, index 0 = reference. Same
+    /// constraints as `anchor`: boot-default trust region, unsafe values, retired keys, learned risk.
+    fn level_costs(&self, key: &str, reference: &str, values: &[String]) -> Vec<(String, f64)> {
+        let mut out = vec![(reference.to_owned(), 0.0)];
+        let Some(learned) = self.p.learned_risk(key) else { return out };
+        let d0 = self.p.boot_default(key).map(str::to_owned);
+        let cal = self.p.calibration.as_ref();
+        let share = calib::load_share(self.g.key());
+        let strength = if key == "vm.watermark_scale_factor" { self.p.evidence.reclaim_strength() } else { 0.0 };
+        let max_dist = 1.0 + 2.0 * strength;
+        for v in values {
+            if v == reference || self.p.measured_unsafe(key, v) { continue; }
+            let mut dev = 0.2;
+            if let Some(d0) = &d0 {
+                let seen = cal.and_then(|c| c.get(key, d0, v, share)).map_or(0.0, |m| m.n);
+                match anchor_dist(v, d0) {
+                    Some(d) if d > max_dist && !(d <= max_dist + 1.0 && seen >= 2.0) => continue,
+                    Some(d) => dev += 0.1 * d,
+                    None => dev += 0.1,
+                }
+            }
+            out.push((v.clone(), -MODESTY * dev + self.w.stability * learned));
+        }
+        out
+    }
+    /// Value in effect for a model knob that the rules already decided (context for the joint search).
+    fn context_value(&self, key: &str) -> Option<String> {
+        if key == "thp" {
+            let m = self.eff("thp.enabled")?;
+            if m != "always" && m != "madvise" { return None; }
+            let mthp = ["thp.mthp_16k", "thp.mthp_32k", "thp.mthp_64k"].iter().any(|k| self.eff(k).map_or(false, |v| v != "never"));
+            return Some(if mthp { format!("{m}+mthp") } else { m });
+        }
+        tune::find(key).and_then(|t| self.eff(t.key))
+    }
+}
+
+/// The measured joint model decides the calibrated knobs together: it searches the best
+/// combination for this goal's weights (posterior mean minus a risk term, minus modesty and
+/// learned risk), then drops every change whose in-context gain does not clear the margin with
+/// confidence. The rules' and the per-knob choices made before are the starting point (the
+/// outcome is never worse than them under the model); THP and the dirty window, which are
+/// not single knobs, and per-CCD role variants stay as fixed context.
+fn joint_pass(r: &mut Rules) {
+    let Some(cal) = r.p.calibration.as_ref() else { return };
+    let wts = [r.w.latency, r.w.throughput, r.w.power, r.w.footprint];
+    let Some(joint) = cal.joint(wts, calib::load_share(r.g.key())) else { return };
+    let (mut keys, mut cands, mut fixed) = (Vec::new(), Vec::new(), Vec::new());
+    for key in joint.keys() {
+        let Some(reference) = cal.refs.get(&key).cloned() else { continue };
+        let scoped = format!("{key}_");
+        if tune::find(&key).is_none() || r.out.iter().any(|d| d.key.starts_with(&scoped)) {
+            if let Some(v) = r.context_value(&key) { if v != reference { fixed.push((key.clone(), v)); } }
+            continue;
+        }
+        if r.p.boot_default(&key).map_or(false, |d| d != reference) { continue; }
+        let c = r.level_costs(&key, &reference, &model::with_mids(&reference, &joint.values(&key)));
+        if c.len() > 1 { keys.push(key); cands.push(c); }
+    }
+    if keys.is_empty() { return; }
+    let start: Vec<usize> = keys.iter().zip(&cands).map(|(k, c)| {
+        r.out.iter().find(|d| d.key == k.as_str()).and_then(|d| c.iter().position(|(v, _)| *v == vstr(&d.value))).unwrap_or(0)
+    }).collect();
+    let prob = model::Problem::new(&joint, keys.clone(), cands.clone(), fixed, model::RISK_Z, MARGIN, cal.unsafe_sets.clone());
+    let mut rng = model::Rng::new(0x5EED);
+    let mut sel = prob.optimize(&start, &mut rng, 8);
+    if prob.score(&sel, 0.0) < prob.score(&start, 0.0) - 1e-9 { sel = start.clone(); }
+    let dropped = prob.prune(&mut sel, model::RISK_Z, MARGIN);
+    let cfg0 = prob.cfg(&start);
+    let marg = prob.marginals(&sel);
+    for (i, key) in keys.iter().enumerate() {
+        if sel[i] == start[i] { continue; }
+        let value = cands[i][sel[i]].0.clone();
+        let why = if sel[i] == 0 {
+            let d = dropped.iter().find(|d| d.0 == i);
+            format!("Joint model: {} = {} looked good alone but next to the other chosen settings it adds {:+.3} (±{:.3}); back to the reference.",
+                    key, cands[i][start[i]].0, d.map_or(0.0, |d| d.1), d.map_or(0.0, |d| d.2))
+        } else {
+            let m = marg.iter().find(|m| m.0 == i);
+            let alone = joint.eval_diff(&[(key.clone(), value.clone())], &[]).0;
+            format!("Joint model: {} = {}: {:+.3} alone, {:+.3} (±{:.3}) next to the other chosen settings.", key, value, alone, m.map_or(0.0, |m| m.1), m.map_or(0.0, |m| m.2))
+        };
+        let Some(t) = tune::find(key) else { continue };
+        let v = value.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(value));
+        r.set_live(t.key, v, why);
+    }
+    let cfg = prob.cfg(&sel);
+    let (mu, var) = joint.eval(&cfg);
+    let mu0 = joint.eval(&cfg0).0;
+    r.notes.push(format!("Joint model: {} calibrated change(s) predicted {:+.3} ± {:.3} weighted gain for this goal (per-knob choices alone: {:+.3}).",
+                         sel.iter().filter(|s| **s > 0).count(), mu, var.sqrt(), mu0));
 }
 
 // ── memory ───────────────────────────────────────────────────────────────────
@@ -694,12 +927,60 @@ fn thp_fx(always: bool, mthp: bool, ptes: u32, pace: Pace) -> (Fx, f64) {
     (f, dev)
 }
 
+type Combo = (bool, bool, u32, Pace);
+
+/// Swaps the fault-time part of a THP combination (mode + mTHP) for the
+/// calibrated one; khugepaged's slow effects (max_ptes_none, pace) stay modelled.
+fn thp_measured(p: &Profile, g: Goal, c: Combo, f: &mut Fx) {
+    let Some(cal) = p.calibration.as_ref() else { return };
+    let label = format!("{}{}", if c.0 { "always" } else { "madvise" }, if c.1 { "+mthp" } else { "" });
+    let m = if label == "madvise" { calib::Measured { lat: Some(0.0), thr: Some(0.0), pwr: Some(0.0), mem: Some(0.0), n: 99.0 } }
+            else { match cal.get("thp", "madvise", &label, calib::load_share(g.key())) { Some(m) => m, None => return } };
+    let (em, _) = thp_fx(c.0, c.1, 511, Pace::Default);
+    let mut model = *f;
+    model.lat -= em.lat; model.thr -= em.thr; model.pwr -= em.pwr; model.mem -= em.mem;
+    let mut meas = Fx::default();
+    overlay(&mut meas, m);
+    f.lat = model.lat + if m.lat.is_some() { meas.lat } else { em.lat };
+    f.thr = model.thr + if m.thr.is_some() { meas.thr } else { em.thr };
+    f.pwr = model.pwr + if m.pwr.is_some() { meas.pwr } else { em.pwr };
+    f.mem = model.mem + if m.mem.is_some() { meas.mem } else { em.mem };
+}
+
+fn combo_dist(a: Combo, b: Combo) -> f64 {
+    0.5 * (a.0 != b.0) as u8 as f64 + 0.3 * (a.1 != b.1) as u8 as f64
+        + 0.2 * (a.2 as f64 - b.2 as f64).abs() / 511.0 + 0.15 * (a.3 != b.3) as u8 as f64
+}
+
+/// The boot snapshot's THP configuration, if it is one the search can express
+/// and the kernel honours (mTHP on needs max_ptes_none 0 or 511).
+fn thp_anchor(p: &Profile, mthp_ok: bool) -> Option<Combo> {
+    let e = p.boot_default("thp.enabled")?;
+    let always = match e { "always" => true, "madvise" => false, _ => return None };
+    let ptes: u32 = p.boot_default("thp.khp_max_ptes_none")?.parse().ok().filter(|n| *n <= 511)?;
+    let scan: u32 = p.boot_default("thp.khp_pages_to_scan").and_then(|v| v.parse().ok()).unwrap_or(4096);
+    let sleep: u32 = p.boot_default("thp.khp_scan_sleep_ms").and_then(|v| v.parse().ok()).unwrap_or(10_000);
+    let pace = if scan <= 2048 || sleep >= 20_000 { Pace::Slow } else if scan >= 8192 || sleep <= 5000 { Pace::Fast } else { Pace::Default };
+    let mthp = mthp_ok && MTHP.iter().filter(|(_, kb)| *kb <= 64).any(|(k, _)| p.boot_default(k).map_or(false, |v| v != "never"));
+    if mthp && ptes != 0 && ptes != 511 { return None; }
+    if ![511, 255, 64, 0].contains(&ptes) { return None; }
+    Some((always, mthp, ptes, pace))
+}
+
 fn thp_rules(r: &mut Rules) {
     let p = r.p;
     // A transparent_hugepage= boot parameter is the user's own decision.
     let boot = p.boot_param("transparent_hugepage").map(str::to_owned);
     let mthp_ok = p.kernel_at_least(6, 8);
-    let reference = { let (f, d) = thp_fx(false, false, 511, Pace::Default); Cand { value: json!("madvise/511"), fx: f, dev: d, why: String::new() } };
+    // Reference: the boot-time THP configuration when it is valid, else the kernel default.
+    let anchor = thp_anchor(p, mthp_ok).filter(|a| boot.as_deref().map_or(true, |b| (b == "always") == a.0));
+    let refc: Combo = anchor.unwrap_or((boot.as_deref() == Some("always"), false, 511, Pace::Default));
+    let label = |c: Combo| json!(format!("{}{}/{}/{:?}", if c.0 { "always" } else { "madvise" }, if c.1 { "+mthp" } else { "" }, c.2, c.3));
+    let (mut rf, rd0) = thp_fx(refc.0, refc.1, refc.2, refc.3);
+    thp_measured(p, r.g, refc, &mut rf);
+    let reference = Cand { value: label(refc), fx: rf, dev: if anchor.is_some() { 0.0 } else { rd0 }, why: String::new() };
+    let keys = ["thp.enabled", "thp.khp_max_ptes_none", "thp.khp_pages_to_scan", "thp.khp_scan_sleep_ms", "thp.mthp_16k", "thp.mthp_32k", "thp.mthp_64k"];
+    let learned: Option<f64> = keys.iter().map(|k| p.learned_risk(k)).sum();
     let mut alts = Vec::new();
     let mut combos = Vec::new();
     for always in [false, true] {
@@ -710,16 +991,22 @@ fn thp_rules(r: &mut Rules) {
             let ptes: &[u32] = if mthp { &[511, 0] } else { &[511, 255, 64, 0] };
             for &pt in ptes {
                 for pace in [Pace::Slow, Pace::Default, Pace::Fast] {
-                    if !always && !mthp && pt == 511 && pace == Pace::Default { continue; }
-                    let (f, d) = thp_fx(always, mthp, pt, pace);
-                    alts.push(Cand { value: json!(format!("{}{}/{pt}/{pace:?}", if always { "always" } else { "madvise" }, if mthp { "+mthp" } else { "" })), fx: f, dev: d, why: String::new() });
+                    let c: Combo = (always, mthp, pt, pace);
+                    if c == refc { continue; }
+                    let Some(risk) = learned else { continue };
+                    let (mut f, d) = thp_fx(always, mthp, pt, pace);
+                    if p.measured_unsafe("thp", &format!("{}{}", if always { "always" } else { "madvise" }, if mthp { "+mthp" } else { "" })) { continue; }
+                    thp_measured(p, r.g, c, &mut f);
+                    f.risk += risk;
+                    let dev = if anchor.is_some() { combo_dist(c, refc) } else { d };
+                    alts.push(Cand { value: label(c), fx: f, dev, why: String::new() });
                     combos.push((always, mthp, pt, pace));
                 }
             }
         }
     }
     let win = r.pick("thp", &reference, &alts);
-    let (always, mthp, ptes, pace) = win.map(|i| combos[i]).unwrap_or((false, false, 511, Pace::Default));
+    let (always, mthp, ptes, pace) = win.map(|i| combos[i]).unwrap_or(refc);
     let (f, d) = thp_fx(always, mthp, ptes, pace);
     let score = f.explain(&r.w, d);
     if boot.is_none() {
@@ -753,7 +1040,8 @@ fn thp_rules(r: &mut Rules) {
         }
     }
     // Synchronous compaction on every fault stalls the faulting thread.
-    if p.cur("thp.defrag") == Some("always") {
+    if r.calibrated_choice("thp.defrag") {
+    } else if p.cur("thp.defrag") == Some("always") {
         r.set("thp.defrag", "madvise", "defrag=always stalls every faulting thread on compaction; madvise (kernel default) limits that to opted-in ranges.");
     }
     if !matches!(p.swap, SwapKind::None) {
@@ -783,15 +1071,19 @@ fn dirty_rules(r: &mut Rules) {
         cand(t, fx(lat, thr, pwr, -frac(t) * 2.0, risk), dev, String::new())
     };
     let reference = mk(1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    let alts = vec![
+    let mut alts = vec![
         mk(0.25, 0.15, -0.15, -0.05, 0.0, 0.4),
         mk(0.5, 0.10, -0.05, -0.02, 0.0, 0.2),
         mk(2.0, -0.15, 0.08, 0.10, -0.05, 0.3),
     ];
+    for c in alts.iter_mut() {
+        let t = format!("{}", c.value.as_f64().unwrap_or(1.0));
+        p.apply_measured(r.g, "vm.dirty", "1", &t, c);
+    }
     let win = r.pick("vm.dirty_bytes", &reference, &alts);
     let (t, c) = match win { Some(i) => (alts[i].value.as_f64().unwrap_or(1.0), &alts[i]), None => (1.0, &reference) };
     let (bg, d) = dirty_pair(rate, ram, t);
-    let score = c.fx.explain(&r.w, c.dev);
+    let score = format!("{}{}", c.fx.explain(&r.w, c.dev), c.why);
     let src = p.io.summary();
     r.set("vm.dirty_background_bytes", bg as i64,
           format!("Background writeback starts at {} MiB (~{:.2} s of writes at {src}). {score}", bg >> 20, bg as f64 / rate as f64));
@@ -860,16 +1152,18 @@ fn memory_rules(r: &mut Rules) {
     // Swap cost model (kernel doc: swappiness = relative I/O cost, > 100 for in-memory swap).
     match p.swap {
         SwapKind::Zram => {
-            r.set_live("vm.swappiness", 150, "zram swap costs a compression, not I/O: cold anonymous pages go there before hot page cache (kernel doc: > 100 for in-memory swap).");
-            r.set_live("vm.page_cluster", 0, "zram has no seek cost: no swap readahead.");
+            if !r.calibrated_choice("vm.swappiness") {
+                r.set_live("vm.swappiness", 150, "zram swap costs a compression, not I/O: cold anonymous pages go there before hot page cache (kernel doc: > 100 for in-memory swap).");
+            }
+            if !r.calibrated_choice("vm.page_cluster") { r.set_live("vm.page_cluster", 0, "zram has no seek cost: no swap readahead."); }
             r.set_live("zswap.enabled", "0", "zram is the swap device: zswap in front of it would compress twice.");
         }
         SwapKind::None => {}
         k => {
             let hdd = k == SwapKind::Hdd;
-            r.set_live("vm.swappiness", if hdd { 60 } else { 100 }, if hdd { "Swap on a spinning disk: keep swap-outs rarer than cache drops (kernel default)." }
-                       else { "zswap absorbs swap-outs in RAM: equal cost for anon and file pages." });
-            r.set_live("vm.page_cluster", if hdd { 3 } else { 1 }, "Swap readahead sized for the device (8 pages on HDD, 2 on flash).");
+            if !r.calibrated_choice("vm.swappiness") { r.set_live("vm.swappiness", if hdd { 60 } else { 100 }, if hdd { "Swap on a spinning disk: keep swap-outs rarer than cache drops (kernel default)." }
+                       else { "zswap absorbs swap-outs in RAM: equal cost for anon and file pages." }); }
+            if !r.calibrated_choice("vm.page_cluster") { r.set_live("vm.page_cluster", if hdd { 3 } else { 1 }, "Swap readahead sized for the device (8 pages on HDD, 2 on flash)."); }
             r.set_live("zswap.enabled", "1", "Disk swap present: zswap keeps most swapped pages compressed in RAM.");
             r.set_live("zswap.shrinker_enabled", "1", "Cold pool pages move on to disk proactively.");
             if r.is(Gaming) { r.set_live("zswap.compressor", "lz4", "lz4: fastest decompression when a swapped page is touched again."); }
@@ -888,17 +1182,21 @@ pub fn wsf_for(headroom: u64, ram_bytes: u64) -> i64 {
 fn io_rules(r: &mut Rules) {
     use Goal::*;
     let p = r.p;
-    if p.rotational {
+    // Measured on this machine: pick by score instead of by rule.
+    if r.calibrated_choice("blk.scheduler") {
+    } else if p.rotational {
         r.set_live("blk.scheduler", if matches!(r.g, Gaming | Desktop) { "bfq" } else { "mq-deadline" },
               if matches!(r.g, Gaming | Desktop) { "A spinning disk is present: bfq keeps interactive reads responsive under competing I/O." }
               else { "A spinning disk is present: mq-deadline bounds latency while merging for throughput." });
     } else {
         r.set_live("blk.scheduler", "none", "Flash only: no reordering, lowest per-request latency and CPU cost.");
     }
-    match r.g {
-        Throughput => r.set("blk.read_ahead_kb", if p.rotational { 2048 } else { 512 }, "Larger read-ahead for sequential reads (sources, archives); costs page cache on random access."),
-        Gaming => r.set("blk.read_ahead_kb", 256, "Games stream assets sequentially from large packs: 256 KiB read-ahead."),
-        _ => {}
+    if !r.calibrated_choice("blk.read_ahead_kb") {
+        match r.g {
+            Throughput => r.set("blk.read_ahead_kb", if p.rotational { 2048 } else { 512 }, "Larger read-ahead for sequential reads (sources, archives); costs page cache on random access."),
+            Gaming => r.set("blk.read_ahead_kb", 256, "Games stream assets sequentially from large packs: 256 KiB read-ahead."),
+            _ => {}
+        }
     }
     r.choose("blk.wbt_lat_usec", leave(), vec![
         cand(0, fx(-0.15, 0.05, 0.0, 0.0, -0.05), 0.3, "No writeback throttling: writes flush at full device speed, but reads queue behind them."),
@@ -996,6 +1294,23 @@ fn device_rules(r: &mut Rules) {
     if p.amd() && p.amd_igpu { r.set_live("gpu.amdgpu_dpm", "auto", "Driver-managed iGPU clocks ('low' is not stable on this iGPU)."); }
     if p.intel() && p.intel_igpu && (r.is(PowerSave) || (r.is(Gaming) && p.nvidia_dgpu)) {
         r.set("gpu.intel_slpc_profile", "power_saving", "iGPU clocks ramp gently: it only composites or idles here.");
+    }
+}
+
+/// Every key the machine signature measured and no scored rule handled yet is
+/// re-decided from the measurements (replacing a structural rule's value). A
+/// global key is left alone when a rule already set a scoped variant of it
+/// (cpu.epp vs cpu.epp_ccd0: CCD roles stay structural).
+fn signature_pass(r: &mut Rules) {
+    let Some(cal) = r.p.calibration.as_ref() else { return };
+    let keys: Vec<&'static str> = cal.key_names().iter().filter_map(|k| tune::find(k).map(|t| t.key)).collect();
+    for key in keys {
+        if r.scores.contains_key(key) { continue; }
+        let scoped = format!("{key}_");
+        if r.out.iter().any(|d| d.key.starts_with(&scoped)) { continue; }
+        let before: Vec<Decision> = r.out.iter().filter(|d| d.key == key).cloned().collect();
+        r.out.retain(|d| d.key != key);
+        if !r.calibrated_choice(key) { r.out.extend(before); }
     }
 }
 
@@ -1244,7 +1559,7 @@ fn sched_rules(r: &mut Rules) {
         Desktop => (if lazy { "lazy" } else { "full" }, "Lazy preemption keeps full's wake-up latency for RT/interactive work with fewer forced switches."),
         Throughput | PowerSave => (if lazy { "lazy" } else { "voluntary" }, "Fewer involuntary context switches: more work per slice."),
     };
-    r.set("sched.preempt", pre, pw);
+    if !r.calibrated_choice("sched.preempt") { r.set("sched.preempt", pre, pw); }
     // EEVDF base slice stays at the kernel default: EEVDF already gives
     // latency-sensitive tasks earlier deadlines, and no measured source backs
     // a fixed shorter/longer global slice for these goals.
@@ -1589,6 +1904,7 @@ mod tests {
             evidence: Evidence::default(),
             io: iorate::IoRate { bps: 1500 * MIB, source: iorate::Source::Probe, device: "nvme0n1".into(), class: iorate::DevClass::Nvme },
             cmdline: "root=/dev/nvme0n1p2 nowatchdog pcie_aspm=force usbcore.autosuspend=-1 processor.max_cstate=9".into(),
+            defaults: None, outcomes: BTreeMap::new(), calibration: None,
             current: BTreeMap::from([
                 ("vm.min_free_kbytes".into(), "67584".into()), ("cpu.ccd_park".into(), "none".into()),
                 ("thp.enabled".into(), "always".into()), ("thp.khp_max_ptes_none".into(), "409".into()),
@@ -1768,6 +2084,128 @@ mod tests {
         }
     }
 
+
+    fn with_defaults(mut p: Profile, kv: &[(&str, &str)]) -> Profile {
+        p.defaults = Some(defaults::Defaults { values: kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), clean: true, kernel: "7.2.8".into() });
+        p
+    }
+
+    #[test]
+    fn anchored_thp_keeps_boot_mode_but_bounds_fill_in() {
+        let mut p = with_defaults(legion(), &[("thp.enabled", "always"), ("thp.khp_max_ptes_none", "511"),
+            ("thp.khp_pages_to_scan", "4096"), ("thp.khp_scan_sleep_ms", "10000"), ("thp.mthp_16k", "never"),
+            ("thp.mthp_32k", "never"), ("thp.mthp_64k", "never")]);
+        p.current.clear();
+        p.current.insert("thp.enabled".into(), "always".into());
+        let g = decide(Goal::Gaming, &p);
+        assert!(get(&g, "thp.enabled").is_none(), "gaming stays on the boot THP mode");
+        assert_eq!(get(&g, "thp.khp_max_ptes_none"), Some(&json!(0)), "but khugepaged stops filling in");
+        assert_eq!(get(&decide(Goal::Desktop, &p), "thp.enabled"), Some(&json!("madvise")), "footprint weight moves desktop");
+    }
+
+    #[test]
+    fn trust_region_and_return_to_boot_default() {
+        let mut p = with_defaults(legion(), &[("vm.watermark_scale_factor", "10"), ("vm.vfs_cache_pressure", "100")]);
+        p.ram_kb = 32 << 20;
+        p.evidence = Evidence { uptime_s: 86_400, pgscan_direct: 30_000, pgscan_kswapd: 1_000_000, allocstall: 1_000, ..Default::default() };
+        // Weak evidence: 128 MiB (factor ~39) is > 2x from the boot 10 -> outside the trust region.
+        let (d, sc, _) = decide_weighted(Goal::Gaming, &p, Weights::for_goal(Goal::Gaming));
+        assert!(get(&d, "vm.watermark_scale_factor").map_or(true, |v| v == &json!(10)), "{:?}", sc.get("vm.watermark_scale_factor"));
+        p.evidence = Evidence { uptime_s: 86_400, pgscan_direct: 400_000, pgscan_kswapd: 1_000_000, allocstall: 5_000, ..Default::default() };
+        assert!(int(&decide(Goal::Gaming, &p), "vm.watermark_scale_factor") > 10);
+        // A drifted live value goes back to the boot default when nothing beats it.
+        p.evidence = Evidence::default();
+        p.current.insert("vm.vfs_cache_pressure".into(), "50".into());
+        assert_eq!(get(&decide(Goal::Throughput, &p), "vm.vfs_cache_pressure"), Some(&json!(100)));
+    }
+
+    #[test]
+    fn rollbacks_retire_a_key() {
+        let mut p = with_defaults(legion(), &[("pm.pci_runtime", "on")]);
+        p.current.insert("pm.pci_runtime".into(), "on".into());
+        assert_eq!(get(&decide(Goal::Desktop, &p), "pm.pci_runtime"), Some(&json!("auto")));
+        p.outcomes.insert("pm.pci_runtime".into(), defaults::Outcome { applies: 3, rollbacks: 1 });
+        let one = decide(Goal::Desktop, &p);
+        assert!(get(&one, "pm.pci_runtime").is_none(), "one rollback in four applies already costs more than the gain");
+        p.outcomes.insert("pm.pci_runtime".into(), defaults::Outcome { applies: 50, rollbacks: 2 });
+        assert!(get(&decide(Goal::PowerSave, &p), "pm.pci_runtime").is_none(), "two rollbacks retire it");
+        let d = defaults::parse_defaults(&json!({"clean": true, "kernel": "7.2", "values": {"vm.swappiness": "60"}})).unwrap();
+        assert_eq!(d.values["vm.swappiness"], "60");
+        let o = defaults::parse_outcomes(&json!({"vm.dirty_bytes": {"applies": 4, "rollbacks": 1}}));
+        assert_eq!(o["vm.dirty_bytes"], defaults::Outcome { applies: 4, rollbacks: 1 });
+    }
+
+
+    fn meas(lat: f64, thr: f64, mem: Option<f64>) -> calib::Measured { calib::Measured { lat: Some(lat), thr: Some(thr), pwr: None, mem, n: 1.0 } }
+    /// n runs of the same result, idle or load.
+    fn sig(c: &mut calib::Calibration, key: &str, r: &str, v: &str, load: bool, m: calib::Measured, runs: usize) {
+        for _ in 0..runs { c.add(key, r, v, if load { calib::Phase::Load } else { calib::Phase::Idle }, Some(m), false, 0, ""); }
+    }
+
+    #[test]
+    fn calibration_replaces_estimates() {
+        let mut p = legion();
+        p.current.clear();
+        let mut cal = calib::Calibration::default();
+        sig(&mut cal, "thp", "madvise", "always", false, meas(0.0, 0.01, Some(-0.6)), 5);
+        sig(&mut cal, "thp", "madvise", "madvise+mthp", false, meas(0.0, 0.0, Some(0.0)), 5);
+        sig(&mut cal, "thp", "madvise", "always+mthp", false, meas(0.0, 0.01, Some(-0.7)), 5);
+        sig(&mut cal, "blk.read_ahead_kb", "128", "1024", false, meas(0.0, 0.30, None), 5);
+        sig(&mut cal, "vm.dirty", "1", "0.5", false, meas(0.40, 0.0, None), 5);
+        p.current.insert("blk.read_ahead_kb".into(), "128".into());
+        p.calibration = Some(cal);
+        let w = Weights { throughput: 3.0, footprint: 0.0, ..Weights::for_goal(Goal::Throughput) };
+        let (d, _, _) = decide_weighted(Goal::Throughput, &p, w);
+        let u_of = |sc: &Map<String, Value>| sc["thp"].as_array().unwrap().iter()
+            .find(|x| x["value"] == json!("always/511/Default")).unwrap()["u"].as_f64().unwrap();
+        let (_, measured, _) = decide_weighted(Goal::Throughput, &p, w);
+        let mut q = p.clone();
+        q.calibration = None;
+        let (_, modelled, _) = decide_weighted(Goal::Throughput, &q, w);
+        assert!(u_of(&measured) < 0.0 && u_of(&modelled) > 0.3, "measured: THP=always buys ~nothing here");
+        assert_eq!(get(&d, "blk.read_ahead_kb"), Some(&json!(1024)));
+        let de = decide(Goal::Desktop, &p);
+        assert_eq!(int(&de, "vm.dirty_bytes") as u64, dirty_pair(p.io.bps, p.ram_kb * 1024, 0.5).1);
+        assert!(de.iter().find(|x| x.key == "vm.dirty_bytes").unwrap().why.contains("measured"));
+    }
+
+    #[test]
+    fn load_phase_measurements_drive_pressure_knobs() {
+        let mut p = legion();
+        let wsf = wsf_for(256 << 20, p.ram_kb * 1024).to_string();
+        let mut cal = calib::Calibration::default();
+        sig(&mut cal, "vm.watermark_scale_factor", "10", &wsf, true, meas(0.30, 0.0, None), 3);
+        cal.add("mm.lru_gen_min_ttl", "0", "1000", calib::Phase::Load, Some(meas(0.9, 0.0, None)), true, 0, "");
+        sig(&mut cal, "sched.preempt", "full", "lazy", true, meas(-0.25, 0.0, None), 3);
+        sig(&mut cal, "sched.preempt", "full", "voluntary", true, meas(-0.4, 0.0, None), 3);
+        sig(&mut cal, "vm.swappiness", "150", "60", true, meas(-0.2, 0.0, None), 3);
+        sig(&mut cal, "vm.swappiness", "150", "100", true, meas(0.0, 0.0, None), 3);
+        p.calibration = Some(cal);
+        let g = decide(Goal::Gaming, &p);
+        assert_eq!(get(&g, "vm.watermark_scale_factor").map(vstr), Some(wsf));
+        assert!(get(&g, "mm.lru_gen_min_ttl").is_none(), "unsafe candidate never picked");
+        assert!(get(&decide(Goal::Throughput, &p), "sched.preempt").map_or(true, |v| v == "full"));
+        assert!(get(&g, "vm.swappiness").map_or(true, |v| v == 150));
+    }
+
+    #[test]
+    fn signature_doses_numeric_knobs_and_respects_roles() {
+        let mut p = with_defaults(legion(), &[("sched.migration_cost_ns", "500000"), ("cpu.epp", "balance_performance")]);
+        let mut cal = calib::Calibration::default();
+        // Measured: 250 µs slightly better, 1 ms clearly better, 5 ms worse -> the optimum lies in between.
+        sig(&mut cal, "sched.migration_cost_ns", "500000", "250000", true, meas(-0.05, 0.0, None), 4);
+        sig(&mut cal, "sched.migration_cost_ns", "500000", "1000000", true, meas(0.20, 0.05, None), 4);
+        sig(&mut cal, "sched.migration_cost_ns", "500000", "5000000", true, meas(-0.10, 0.10, None), 4);
+        // Global EPP measured: must not override the per-CCD roles on an X3D part.
+        sig(&mut cal, "cpu.epp", "balance_performance", "performance", false, meas(0.3, 0.3, None), 4);
+        p.calibration = Some(cal);
+        let (d, sc, _) = decide_weighted(Goal::Gaming, &p, Weights::for_goal(Goal::Gaming));
+        let v = int(&d, "sched.migration_cost_ns");
+        assert!(v >= 700_000 && v <= 2_300_000, "dose between the measured points: {v}");
+        assert!(sc["sched.migration_cost_ns"].as_array().unwrap().len() > 4, "interpolated doses were scored");
+        assert!(get(&d, "cpu.epp").is_none() && get(&d, "cpu.epp_ccd0").is_some());
+    }
+
     #[test]
     fn guard_rolls_back_on_sustained_stalls_only() {
         let base = Pressure { io_full10: 1.0, mem_full10: 0.0, allocstall: 100 };
@@ -1863,5 +2301,49 @@ mod tests {
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
             assert!(v["ok"].as_bool().unwrap());
         }
+    }
+
+    #[test]
+    fn joint_model_keeps_synergy_and_drops_redundancy() {
+        let kv = [("vm.swappiness", "60"), ("vm.page_cluster", "3"), ("vm.vfs_cache_pressure", "100"), ("vm.page_lock_unfairness", "5")];
+        let mut p = with_defaults(legion(), &kv);
+        for (k, v) in kv { p.current.insert(k.into(), v.into()); }
+        let facs = vec![model::Factor { key: "vm.swappiness".into(), reference: "60".into(), values: vec!["100".into()] },
+                        model::Factor { key: "vm.page_cluster".into(), reference: "3".into(), values: vec!["1".into()] },
+                        model::Factor { key: "vm.vfs_cache_pressure".into(), reference: "100".into(), values: vec!["50".into()] },
+                        model::Factor { key: "vm.page_lock_unfairness".into(), reference: "5".into(), values: vec!["3".into()] }];
+        // Truth (latency): swappiness and page_cluster only pay together; vfs_cache_pressure and compaction do the same job (redundant).
+        let truth = |c: &model::Cfg| {
+            let has = |k: &str| c.iter().any(|(a, _)| a == k);
+            let mut y = 0.0;
+            if has("vm.swappiness") { y += 0.02; }
+            if has("vm.page_cluster") { y += 0.02; }
+            if has("vm.swappiness") && has("vm.page_cluster") { y += 0.12; }
+            if has("vm.vfs_cache_pressure") { y += 0.10; }
+            if has("vm.page_lock_unfairness") { y += 0.10; }
+            if has("vm.vfs_cache_pressure") && has("vm.page_lock_unfairness") { y -= 0.10; }
+            y
+        };
+        let mut rng = model::Rng::new(11);
+        let mut design = model::initial_design(&facs, 70, &mut rng);
+        for _ in 0..12 { design.push(Vec::new()); }
+        let n = design.len();
+        let rows: Vec<calib::Row> = design.iter().enumerate().map(|(i, c)| calib::Row {
+            phase: calib::Phase::Load, sess: 1, pos: i as f64 / n as f64, t: 0, kernel: String::new(), cfg: c.clone(),
+            y: [truth(c) + ((rng.unit() + rng.unit()) - 1.0) * 0.04, f64::NAN, f64::NAN, f64::NAN], w: 1.0, bv: calib::BENCH_VERSION }).collect();
+        let mut cal = calib::Calibration::default();
+        cal.put_session(calib::Phase::Load, 1, rows);
+        for f in &facs { cal.refs.insert(f.key.clone(), f.reference.clone()); }
+        p.calibration = Some(cal);
+        let (d, _, notes) = decide_weighted(Goal::Gaming, &p, Weights::for_goal(Goal::Gaming));
+        assert_eq!((get(&d, "vm.swappiness").map(vstr), get(&d, "vm.page_cluster").map(vstr)), (Some("100".into()), Some("1".into())), "synergy kept: {d:?}");
+        let redundant = [get(&d, "vm.vfs_cache_pressure").is_some(), get(&d, "vm.page_lock_unfairness").is_some()];
+        assert_eq!(redundant.iter().filter(|x| **x).count(), 1, "exactly one of the redundant pair: {d:?}");
+        assert!(notes.iter().any(|n| n.starts_with("Joint model")), "{notes:?}");
+        // An unsafe combination is never picked.
+        let mut q = p.clone();
+        q.calibration.as_mut().unwrap().add_unsafe_set(vec![("vm.swappiness".into(), "100".into()), ("vm.page_cluster".into(), "1".into())]);
+        let (d2, _, _) = decide_weighted(Goal::Gaming, &q, Weights::for_goal(Goal::Gaming));
+        assert!(!(get(&d2, "vm.swappiness").is_some() && get(&d2, "vm.page_cluster").is_some()), "{d2:?}");
     }
 }

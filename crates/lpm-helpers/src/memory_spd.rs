@@ -398,6 +398,7 @@ fn save_backup(data: &[u8], tag: &str) -> Result<String, String> {
 /// Writes the whole variable (attributes + data), clearing and restoring the
 /// immutable flag efivarfs puts on it, then reads it back.
 fn aod_write(b: &[u8], backup: &str) -> Result<(), String> {
+    crate::wlog::log("efivar", &format!("AodSetupRpl write {} bytes (backup {backup})", b.len()));
     set_immutable(AOD_VAR, false)?;
     let w = fs::OpenOptions::new().write(true).open(AOD_VAR)
         .and_then(|mut f| { use std::io::Write; f.write_all(b) });

@@ -9,6 +9,7 @@
 //!   {"op":"autotune","goal":"gaming","weights":{..}}   any user: hardware profile + derived preset
 //!       (goal: powersave | gaming | throughput | desktop; optional objective weights; see lpm_helpers::autotune)
 //!   {"op":"audit"}                                     any user: safety audit of the root preset store + boot preset
+//!   {"op":"capture_defaults"}                          tune-helper only: boot-default snapshot (normally done at boot)
 //!   {"op":"io_probe"}                                  tune-helper only: bounded write-rate probe for autotune
 //!       (<= 512 MiB O_DIRECT into an unlinked O_TMPFILE on /var/tmp; result in /var/lib/legion-power-manager/io-probe.json)
 //!   {"op":"profile"}                                   any user: the hardware profile autotune uses
@@ -479,6 +480,7 @@ fn guard_after(mut out: Value, base: autotune::Pressure) -> Value {
     let keys: Vec<String> = out["results"].as_array().map(|a| a.iter()
         .filter(|r| r["ok"].as_bool() == Some(true) && r["written"].as_u64().unwrap_or(0) > 0)
         .filter_map(|r| r["key"].as_str()).filter(|k| autotune::guarded(k)).map(str::to_owned).collect()).unwrap_or_default();
+    lpm_helpers::defaults::record(&keys, false);
     if !keys.is_empty() && std::env::var_os("LPM_NO_GUARD").is_none() && spawn_guard(&keys, base) {
         out["guard"] = json!({"keys": keys, "seconds": autotune::GUARD_SECS});
     }
@@ -526,6 +528,7 @@ fn spawn_guard(keys: &[String], base: autotune::Pressure) -> bool {
             }
             Err(e) => json!({"error": e}),
         };
+        lpm_helpers::defaults::record(keys, true);
         let body = json!({"time": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                           "verdict": v, "keys": keys, "restored": restored});
         let _ = write_root_file(GUARD_FILE, &serde_json::to_vec_pretty(&body).unwrap());
@@ -820,6 +823,8 @@ fn boot_preset() -> Option<Value> {
 }
 
 fn op_boot() -> Value {
+    // Fallback snapshot when lpm-boot-guard is not enabled (runs before the preset).
+    let _ = lpm_helpers::defaults::capture();
     let Some(b) = boot_preset() else { return json!({"ok": true, "applied": false, "message": "no boot preset"}) };
     let Some(values) = b["values"].as_object().cloned() else { return json!({"ok": false, "error": "boot preset has no values"}) };
     let base = autotune::Pressure::sample();
@@ -888,6 +893,10 @@ fn run() -> Value {
             Err(e) => json!({"ok": false, "error": e}),
         },
         "preset_save" => op_preset_save(&req),
+        "capture_defaults" => match lpm_helpers::defaults::capture() {
+            Ok(v) => json!({"ok": true, "result": v}),
+            Err(e) => json!({"ok": false, "error": e}),
+        },
         "io_probe" => match lpm_helpers::iorate::probe("/var/tmp") {
             Ok(v) => json!({"ok": true, "probe": v}),
             Err(e) => json!({"ok": false, "error": e}),

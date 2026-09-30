@@ -21,6 +21,9 @@ extern "C" fn on_term(_: libc::c_int) { STOP.store(true, Ordering::SeqCst); }
 fn fail(e: String) -> i32 { eprintln!("lpm-boot-guard: {e}"); 2 }
 
 fn arm() -> i32 {
+    lpm_helpers::legion_wmi::log_state("boot-state");
+    // Boot defaults for autotune: before TLP and before any preset service.
+    if let Err(e) = lpm_helpers::defaults::capture() { eprintln!("lpm-boot-guard: boot-default snapshot failed: {e}"); }
     match bootguard::arm() {
         Ok(v) => {
             if v["tripped"] == true {
@@ -50,6 +53,7 @@ fn watch() -> i32 {
         // clean end of this boot gets recorded (for the GUI's login guard).
         while !STOP.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_secs(1)); }
     }
+    lpm_helpers::legion_wmi::log_state("shutdown-state");
     bootguard::shutdown().map_or_else(fail, |_| 0)
 }
 
@@ -59,7 +63,7 @@ fn main() {
         Some("arm") => arm(),
         Some("watch") => watch(),
         Some("disarm") => bootguard::disarm().map_or_else(fail, |_| 0),
-        Some("shutdown") => bootguard::shutdown().map_or_else(fail, |_| 0),
+        Some("shutdown") => { lpm_helpers::legion_wmi::log_state("shutdown-state"); bootguard::shutdown().map_or_else(fail, |_| 0) }
         Some("check") => match bootguard::should_skip() {
             None => 0,
             Some(why) => { eprintln!("lpm-boot-guard: skipping boot presets — {why}"); 1 }

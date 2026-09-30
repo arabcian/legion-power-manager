@@ -124,6 +124,10 @@ cpufreq driver, RAM, swap, storage, kernel, boot parameters, memory and I/O
 pressure history) and fills the tab with a preset for the chosen goal. Nothing
 is written until you press *Apply checked*.
 
+- **Anchored at boot defaults.** The boot-time values (kernel + distro + your
+  sysctl, before TLP) are the reference; settings move at most 2× from them
+  unless evidence justifies more, and settings the pressure guard had to roll
+  back are penalised, then retired. Enable `lpm-boot-guard` for the snapshot.
 - **Weighted, not "bigger is better".** Every setting with a trade-off is
   scored over latency, throughput, power, memory footprint and stability; a
   value is written only if it clearly beats leaving the setting alone. Each goal
@@ -147,6 +151,7 @@ lpm-autotune gaming --save           # save it as "Auto Gaming"
 sudo lpm-autotune probe              # measure disk write speed (<= 512 MiB, <= 4 s)
 lpm-autotune audit [--fix]           # find/repair unsafe values in scenes and presets
 lpm-autotune report [SECONDS]        # memory, THP, writeback, PSI, vmstat deltas
+sudo lpm-calibrate [--budget MIN]    # measure the machine: knobs, their pair/triple interactions and THP (sequential design; depth grows with the budget), idle + under load
 ```
 
 After updating from an older version run `lpm-autotune audit --fix`, then

@@ -21,13 +21,18 @@ pub mod memory_spd;
 pub mod intel_uv;
 pub mod intel_uv_daemon;
 pub mod iorate;
+pub mod defaults;
+pub mod calib;
+pub mod bench;
 pub mod isolate;
 pub mod legion_wmi;
 pub mod lighting;
 pub mod machine;
+pub mod model;
 pub mod nvreg;
 pub mod tools;
 pub mod tune;
+pub mod wlog;
 
 /// The first processor block of /proc/cpuinfo (vendor, family, model, name are
 /// identical across CPUs), read once per process. The whole file is one
@@ -114,6 +119,15 @@ pub fn finish(v: Value) -> i32 {
 /// sysfs store handlers parse one buffer per write and must not be fed
 /// in pieces, so a short write is reported as an error instead of retried.
 pub fn sysfs_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    let r = sysfs_write_inner(path, data);
+    if wlog::interesting_sysfs(path) {
+        wlog::log("sysfs", &format!("{} <- {} [{}]", path.display(), String::from_utf8_lossy(data).trim(),
+                                    match &r { Ok(_) => "ok".to_string(), Err(e) => format!("err {e}") }));
+    }
+    r
+}
+
+fn sysfs_write_inner(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)

@@ -148,6 +148,21 @@ fn modprobe_acpi_call() { crate::modprobe("acpi_call"); }
 /// therefore done under an exclusive flock on the proc file, and the reply
 /// is bounded (the module's buffer is small; a runaway read never grows).
 pub(crate) fn acpi_raw(expr: &str) -> Result<String, String> {
+    let r = acpi_raw_inner(expr);
+    if !acpi_is_read(expr) {
+        crate::wlog::log("acpi", &format!("{expr} -> {}", match &r { Ok(o) => format!("ok {}", o.chars().take(40).collect::<String>()), Err(e) => format!("err {e}") }));
+    }
+    r
+}
+
+/// Pure reads (status polls, WQA6 tune reads, get methods) are not logged.
+fn acpi_is_read(expr: &str) -> bool {
+    expr.contains("WMAE 0x0 0x11") || expr.contains("WQA6")
+        || (expr.contains("WMAB") && expr.contains(" 0x5"))
+        || [0x28, 0x29, 0x31, 0x32, 0x38, 0x3F, 0x40].iter().any(|m| expr.contains(&format!("WMAA 0x0 0x{m:x} ")) || expr.ends_with(&format!("WMAA 0x0 0x{m:x}")))
+}
+
+fn acpi_raw_inner(expr: &str) -> Result<String, String> {
     use std::io::{Read, Write};
     const MAX_REPLY: u64 = 4096;
     let mut f = OpenOptions::new().read(true).write(true).custom_flags(libc::O_CLOEXEC).open(ACPI_CALL)
@@ -742,4 +757,12 @@ pub fn set_fw_oc(key: &str, value: i64) -> Value {
     let got = now.get("tunes").and_then(|t| t.get(key)).and_then(|t| t["value"].as_i64());
     if got != Some(value) { return json!({"ok": false, "error": format!("{key}: read-back {got:?}")}); }
     json!({"ok": true, "key": key, "value": value, "reboot_required": true})
+}
+
+/// Logs the BIOS-side state (profile + firmware OC tunes + BIOS OC mode) so a
+/// change between boot, writes and shutdown shows up in writes.log.
+pub fn log_state(tag: &str) {
+    if !acpi_available() { modprobe_acpi_call(); }
+    let s = format!("profile={:?} fw_oc={}", platform_profile(), fw_oc_status());
+    crate::wlog::log(tag, &s);
 }

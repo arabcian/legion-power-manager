@@ -22,7 +22,7 @@ if [[ -x "$PREFIX/libexec/legion-power-manager/tune-helper" ]]; then
     fi
 fi
 rm -rf "$PREFIX/libexec/legion-power-manager"
-rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-gamemode" "$PREFIX/bin/lpm-intel-uv" "$PREFIX/bin/lpm-autotune" \
+rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-gamemode" "$PREFIX/bin/lpm-intel-uv" "$PREFIX/bin/lpm-autotune" "$PREFIX/bin/lpm-calibrate" \
       /etc/init.d/lpm-tune /etc/init.d/lpm-intel-uv /etc/init.d/lpm-intel-uv-daemon /etc/init.d/lpm-boot-guard {/lib64,/usr/lib64,/lib,/usr/lib}/elogind/system-sleep/50-lpm-intel-uv \
       "$PREFIX/share/applications/legion-power-manager.desktop" \
       "$PREFIX/share/icons/hicolor/scalable/apps/legion-power-manager.svg" \
