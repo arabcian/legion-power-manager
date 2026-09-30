@@ -1007,6 +1007,7 @@ fn main() {
     let state_active = std::fs::read_to_string(TUNE_STATE).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .map_or(false, |v| v["baseline"].as_array().map_or(false, |a| !a.is_empty()));
     if state_active { die("an Optimizations preset is active: Restore originals first, so every knob is measured from the boot state"); }
+    let _ = lpm_helpers::secure_dir("/run/legion-power-manager");
     let _ = lpm_helpers::secure_dir("/run/legion-power-manager/tune");
     let lock = std::fs::OpenOptions::new().create(true).write(true).open(TUNE_LOCK).unwrap_or_else(|e| die(&format!("lock: {e}")));
     if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 { die("Legion Power Manager is applying something; try again"); }
