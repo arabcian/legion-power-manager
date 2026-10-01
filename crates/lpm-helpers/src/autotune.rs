@@ -1328,6 +1328,7 @@ fn signature_pass(r: &mut Rules) {
     let keys: Vec<&'static str> = cal.key_names().iter().filter_map(|k| tune::find(k).map(|t| t.key)).collect();
     for key in keys {
         if r.scores.contains_key(key) { continue; }
+        if key == "cpu.epp_boost" && !r.is(Goal::PowerSave) { continue; }
         let scoped = format!("{key}_");
         if r.out.iter().any(|d| d.key.starts_with(&scoped)) { continue; }
         let before: Vec<Decision> = r.out.iter().filter(|d| d.key == key).cloned().collect();

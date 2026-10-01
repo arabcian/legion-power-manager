@@ -276,6 +276,8 @@ pub fn override_values(key: &str, live: &str, ram_kb: u64) -> Option<Vec<String>
         "kernel.sched_burst_inherit_type" => v(&[0, 1, 2]),
         "sched.migration_cost_ns" => v(&[r / 2, r * 2, 5_000_000]),
         "sched.nr_migrate" => v(&[8, 32, 128]),
+        // up/tasks are test modes with wrong weight distribution, not candidates.
+        "sched.cgroup_mode" => Some(["smp", "concur", "max"].iter().filter(|x| **x != live).map(|x| x.to_string()).collect()),
         "cpu.wake_latency_us" => v(&[0, 20, 200]),
         // Dose ladder for the CCD frequency caps: 100/90/80/70 % of the live cap (100 MHz steps).
         "cpu.max_freq_ccd0" | "cpu.max_freq_ccd1" if r > 0 => v(&[0.9, 0.8, 0.7].map(|f| ((r as f64 * f) / 100_000.0).round() as i64 * 100_000)),
