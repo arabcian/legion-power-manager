@@ -200,6 +200,7 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("sched.ext", "needs a userspace scheduler"), ("kernel.watchdog", "never disabled"), ("kernel.sched_schedstats", "debug counters"),
     ("kernel.cfs_bandwidth_slice_us", "only with CPU quotas"), ("kernel.sched_util_clamp_min_rt_default", "RT tasks only"),
     ("wq.cpumask", "topology (structural)"), ("irq.affinity", "topology (structural)"),
+    ("kernel.sched_burst_cache_lifetime", "fork-time cache: no fork benchmark"),
 ];
 
 /// Candidate values per key where the generic rule (Choice: its options;
@@ -224,6 +225,8 @@ pub fn override_values(key: &str, live: &str, ram_kb: u64) -> Option<Vec<String>
         "vm.stat_interval" => v(&[1, 10]),
         "vm.page_lock_unfairness" => v(&[1, 5, 20]),
         "zswap.max_pool_percent" => v(&[10, 20, 30]),
+        // 0/1/2 are the whole range: the generic halve/double rule would only offer 1.
+        "kernel.sched_burst_inherit_type" => v(&[0, 1, 2]),
         "sched.migration_cost_ns" => v(&[r / 2, r * 2, 5_000_000]),
         "sched.nr_migrate" => v(&[8, 32, 128]),
         "cpu.wake_latency_us" => v(&[0, 20, 200]),

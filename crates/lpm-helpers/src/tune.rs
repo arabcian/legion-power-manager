@@ -152,6 +152,8 @@ pub enum Target {
     AmdgpuAbm,
     /// Wake-on-LAN of every physical Ethernet port, through `ethtool` (no sysfs knob).
     EthWol,
+    /// Energy-Efficient Ethernet of every physical Ethernet port, through `ethtool --set-eee`.
+    EthEee,
     /// `soft` block switch of every rfkill device of one type (bluetooth / wlan / wwan).
     /// Inverted for the user: 1 = radio enabled.
     Rfkill(&'static str),
@@ -440,6 +442,15 @@ pub const TUNABLES: &[Tunable] = &[
     t("zswap.shrinker_enabled", "Memory", "zswap shrinker",
       "Kernel 6.8+: under memory pressure zswap writes its coldest compressed pages on to the swap device proactively, instead of only when the pool is full. Keeps the pool from filling up with pages that will never be used again. 1 is right for almost everyone.",
       Kind::Bool, NO, Target::File("/sys/module/zswap/parameters/shrinker_enabled")),
+    t("vm.defrag_mode", "Memory", "vm.defrag_mode",
+      "1 = the page allocator works harder to avoid fragmentation, which keeps huge pages (THP/mTHP) and other higher-order allocations obtainable; 0 = stock. The kernel documentation recommends enabling it right after boot because fragmentation, once it has happened, can be long-lasting or even permanent - so put it in the boot preset instead of toggling it mid-session. The commit that introduced it reports that THP success rates stop declining over time, but start lower than on the stock allocator. Only pays off while THP/mTHP are in use; with 32 GB of RAM it costs little.",
+      Kind::Bool, NO, Target::File("/proc/sys/vm/defrag_mode")),
+    t("thp.shrink_underused", "Memory", "THP shrink underused",
+      "Kernel 6.12+: every THP created at fault or collapse time is put on a deferred list, and under memory pressure the 'underused' ones (more zero-filled 4 KB pages than khugepaged max_ptes_none allows) are split so the empty part can be reclaimed. 1 = on (the way THP=always pays its RSS bloat back when RAM gets tight); 0 = huge pages are never split for that reason: they stay whole, a little more memory stays held, no splitting work under pressure.",
+      Kind::Bool, NO, Target::File("/sys/kernel/mm/transparent_hugepage/shrink_underused")),
+    t("zswap.accept_threshold", "Memory", "zswap accept threshold (%)",
+      "Once the zswap pool has hit its maximum size, new pages are refused until it shrinks below this percentage of the maximum (stock 90): the hysteresis that stops zswap flapping between 'full' and 'accepting' at the limit. Lower = zswap resumes accepting only after it has drained further, which means more pages go straight to the disk swap in the meantime. Only matters when the pool actually fills up.",
+      int(1, 100), NO, Target::File("/sys/module/zswap/parameters/accept_threshold_percent")),
     // ── Scheduler ─────────────────────────────────────────────────────────
     warn(t("sched.ext", "Scheduler", "sched_ext scheduler",
       "Runs a sched_ext BPF scheduler (kernel 6.12+ with CONFIG_SCHED_CLASS_EXT, plus the scx schedulers installed) in place of the kernel's EEVDF while the setting is active; restoring stops it and EEVDF takes over again instantly. lavd = latency-criticality aware, built for gaming and interactive loads (frame pacing, input latency) and aware of big/little and X3D core differences; bpfland = prioritises interactive tasks, good general desktop choice; rusty/flash/cosmos/p2dq are more specialised. Best used as a game-mode setting. A buggy scheduler cannot hang the system: the kernel's watchdog ejects it and falls back to EEVDF. Only scx_* binaries that are root-owned in system directories are ever started.",
@@ -478,10 +489,10 @@ pub const TUNABLES: &[Tunable] = &[
       "Live-switchable preemption model on PREEMPT_DYNAMIC kernels (shows 'root only' if the kernel was not built with it, or debugfs is not mounted - the row still activates, root just cannot read the current value from an unprivileged describe). full = a running task can be preempted almost anywhere: lowest latency, right for desktop/gaming and what the gaming presets set. voluntary = only at explicit preemption points: slightly higher latency, slightly higher throughput, a good middle ground. none = cooperative-style, maximum throughput minimum latency guarantees, essentially never wanted on a desktop. lazy (6.13+) = full's latency behaviour with some of voluntary's throughput via deferred preemption; use it for compile-heavy presets if your kernel supports it, otherwise voluntary is the fallback (see the Compile throughput preset).",
       Kind::Choice, Options::Fixed(&["none", "voluntary", "full", "lazy"]), Target::File("/sys/kernel/debug/sched/preempt"))),
     dbg(t("sched.base_slice_ns", "Scheduler", "EEVDF base slice (debugfs)",
-      "EEVDF scheduler's base time slice in nanoseconds - roughly, how long a task runs before it becomes fair game for preemption by an equally-important task. Kernel default scales as ~3 ms times log2(CPU count), capped. Smaller (e.g. 1000000 = 1 ms, what the gaming presets use) means the scheduler re-evaluates fairness more often: lower worst-case latency for anything waiting its turn, at a small throughput cost from more frequent context switches. Larger (e.g. 3000000 = 3 ms, the Compile throughput preset) favours throughput: fewer switches, slightly higher latency for anything waiting.",
+      "Hidden on BORE kernels (CachyOS), where this file is read-only: use 'min_base_slice_ns' below there. EEVDF scheduler's base time slice in nanoseconds - roughly, how long a task runs before it becomes fair game for preemption by an equally-important task. Kernel default scales as ~3 ms times log2(CPU count), capped. Smaller (e.g. 1000000 = 1 ms, what the gaming presets use) means the scheduler re-evaluates fairness more often: lower worst-case latency for anything waiting its turn, at a small throughput cost from more frequent context switches. Larger (e.g. 3000000 = 3 ms, the Compile throughput preset) favours throughput: fewer switches, slightly higher latency for anything waiting.",
       int(100_000, 100_000_000), NO, Target::File("/sys/kernel/debug/sched/base_slice_ns"))),
     dbg(t("sched.min_base_slice_ns", "Scheduler", "min_base_slice_ns (debugfs)",
-      "Identical purpose to the base_slice_ns row above; some patched kernels - including the one lutris-game-tune was written against - expose this same tunable under this alternate filename instead. Whichever of the two files exists on your kernel is the one that is 'available'; set both rows the same and only the real one actually writes.",
+      "The writable base-slice knob of BORE kernels (CachyOS), where base_slice_ns is read-only: the effective slice is the smallest whole multiple of one scheduler tick (1/HZ, i.e. 1 ms at HZ=1000) that is >= this value, so 1000000 gives 1 ms and 2000000 (the stock minimum) gives 2 ms; values below one tick round up to a tick. Other patched kernels - including the one lutris-game-tune was written against - expose the same tunable under this filename as well. Whichever of the two files exists on your kernel is the one that is 'available'; set both rows the same and only the real one actually writes.",
       int(100_000, 100_000_000), NO, Target::File("/sys/kernel/debug/sched/min_base_slice_ns"))),
     dbg(t("sched.migration_cost_ns", "Scheduler", "migration_cost_ns (debugfs)",
       "How long (ns) a task must have run before the scheduler treats it as cache-cold and freely migratable without a locality penalty. Lower migrates more readily for better load balance; higher keeps tasks pinned longer for better cache locality. Niche - the kernel default suits almost everyone.",
@@ -495,6 +506,33 @@ pub const TUNABLES: &[Tunable] = &[
     dbg(t("sched.feat_run_to_parity", "Scheduler", "RUN_TO_PARITY (debugfs)",
       "Wakeup preemption is inhibited until the running task has reached its zero-lag point or used up its slice (default on); tasks with a shorter slice may still cancel it (PREEMPT_SHORT). On = fewer preemptions and context switches, better throughput; off = every eligible wakeup may preempt at once, lower worst-case wake-up latency, more switches. Leave on unless you are chasing a specific latency spike.",
       Kind::Bool, NO, Target::SchedFeature("RUN_TO_PARITY"))),
+    t("kernel.sched_bore", "Scheduler", "BORE scheduler",
+      "BORE (Burst-Oriented Response Enhancer, in CachyOS kernels): demotes tasks by how long they ran since they last slept or yielded, so bursty CPU hogs (compiles, encoders, shader builds) lose priority to light interactive tasks (compositor, input, audio, the game's main thread). 1 = on, 0 = plain EEVDF weights; switching reweights every task at once, so it is safe at runtime. The rows below only exist while it is built in.",
+      int(0, 1), NO, Target::File("/proc/sys/kernel/sched_bore")),
+    t("kernel.sched_burst_inherit_type", "Scheduler", "BORE burst inheritance",
+      "What a freshly forked process inherits from its relatives: 0 = nothing (every new process starts un-penalised), 1 = the average penalty of its parent's children, 2 = the average over the closest ancestor that actually fans out into several children (stock). With 2 the many short helper processes of a launcher tree (Steam, pressure-vessel, Wine, build systems) inherit the penalty of their siblings instead of starting fresh. Higher = more consistent classification of process trees; 0 = every new process gets a clean slate.",
+      int(0, 2), NO, Target::File("/proc/sys/kernel/sched_burst_inherit_type")),
+    t("kernel.sched_burst_smoothness", "Scheduler", "BORE smoothness",
+      "How slowly the remembered penalty of a task grows when its latest burst was longer than before (0-3; stock 1): the increase is divided by 2^value. Larger = a task that suddenly turns CPU-heavy is demoted more gradually, so short spikes in a normally light task (a game frame that takes longer) do not immediately cost it priority. A shrinking penalty is always taken in one step.",
+      int(0, 3), NO, Target::File("/proc/sys/kernel/sched_burst_smoothness")),
+    t("kernel.sched_burst_penalty_offset", "Scheduler", "BORE penalty offset",
+      "Tolerance before the penalty starts (0-63; stock 24): bursts shorter than roughly 2^offset ns are not penalised at all. Higher = more of a task's run time is tolerated before it is demoted (closer to plain EEVDF); lower = demotion starts earlier.",
+      int(0, 63), NO, Target::File("/proc/sys/kernel/sched_burst_penalty_offset")),
+    t("kernel.sched_burst_penalty_scale", "Scheduler", "BORE penalty scale",
+      "How steeply the penalty grows with the burst length (0-4095; stock 1536 in current CachyOS patches, 1280 in older ones). Higher = hogs fall further behind interactive tasks; 0 = no penalty at all. Raising it favours latency of light tasks over the throughput of CPU-bound ones; lowering it does the opposite.",
+      int(0, 4095), NO, Target::File("/proc/sys/kernel/sched_burst_penalty_scale")),
+    t("kernel.sched_burst_cache_lifetime", "Scheduler", "BORE burst cache lifetime (ns)",
+      "How long (ns) the averaged penalty of a process tree or thread group is cached before it is recomputed for the next fork (stock 75000000 = 75 ms). Longer = cheaper forks, staler averages; shorter = fresher averages, more scanning work per fork under heavy fork rates. Only relevant with burst inheritance on.",
+      int(0, 4_294_967_295), NO, Target::File("/proc/sys/kernel/sched_burst_cache_lifetime")),
+    dbg(t("sched.feat_preempt_short", "Scheduler", "PREEMPT_SHORT (debugfs)",
+      "Lets a waking task with a shorter slice than the running one cancel RUN_TO_PARITY and preempt it at once (default on). It is the exception that keeps latency-sensitive tasks (the ones that asked for a short slice) responsive while RUN_TO_PARITY protects everyone else's slice; turning it off makes RUN_TO_PARITY absolute. Leave on for interactive and game loads.",
+      Kind::Bool, NO, Target::SchedFeature("PREEMPT_SHORT"))),
+    dbg(t("sched.feat_delay_dequeue", "Scheduler", "DELAY_DEQUEUE (debugfs)",
+      "A task that goes to sleep while it still owes the CPU (negative lag) is kept in the competition until it has worked that off instead of being dequeued at once; when it is chosen it has positive lag by definition. Fairer across sleep/wake cycles, at the price of a little extra scheduling work. Default on; 0 restores the old behaviour, mainly useful to rule it out while chasing a scheduling regression.",
+      Kind::Bool, NO, Target::SchedFeature("DELAY_DEQUEUE"))),
+    dbg(t("sched.feat_hrtick", "Scheduler", "HRTICK (debugfs)",
+      "High-resolution preemption tick: arms a one-shot hrtimer for the exact end of the running task's slice instead of waiting for the next periodic tick. Matters when the slice is shorter than a tick or not a multiple of it (e.g. a 0.5 ms base slice at HZ=1000); costs a timer programming on every context switch, so it is off by default. Try it together with a short base slice, measure, and leave off otherwise.",
+      Kind::Bool, NO, Target::SchedFeature("HRTICK"))),
     t("wq.affinity_scope", "Scheduler", "Unbound workqueue affinity scope",
       "Kernel 6.6+: how widely an unbound work item may travel from the CPU that queued it. cache (stock) = within the same L3 - on a two-CCD Ryzen the work stays on the die that asked for it, no cross-CCD cache traffic; smt / cpu = even closer (better locality, less work-conservation); numa / system = anywhere (best for spreading heavy work, worst locality). Use together with 'Unbound workqueue CPUs', which is a hard CPU mask; this row is only the locality preference inside that mask.",
       Kind::Choice, Options::Fixed(&["cpu", "smt", "cache", "numa", "system"]), Target::File("/sys/module/workqueue/parameters/default_affinity_scope")),
@@ -514,6 +552,21 @@ pub const TUNABLES: &[Tunable] = &[
     t("blk.read_ahead_kb", "Storage", "Read-ahead (KiB)",
       "How many KiB the kernel speculatively reads ahead on sequential access patterns. Default 128. Larger (e.g. 512-1024) helps games that stream assets sequentially out of large packed files (common in open-world titles) - more of the next chunk is already in cache by the time it is needed. Smaller (e.g. 32-64) helps workloads dominated by random, non-sequential reads (databases, some emulator ROM sets) where readahead just wastes IO bandwidth. If unsure, leave at 128 - this is a workload-shape bet, not a universal win either direction.",
       int(0, 16_384), NO, Target::PerBlock("read_ahead_kb")),
+    t("blk.rq_affinity", "Storage", "rq_affinity",
+      "Where a finished block request is completed. 0 = on whatever CPU took the interrupt; 1 = on a CPU of the same group (cache domain) as the submitter - fewer cross-CCD cache transfers on a two-CCD Ryzen; 2 = always on the submitting CPU itself (strongest locality, costs an IPI when the interrupt landed elsewhere). Together with 'IRQ affinity' this decides which die handles NVMe completion work.",
+      int(0, 2), NO, Target::PerBlock("rq_affinity")),
+    t("blk.nomerges", "Storage", "nomerges",
+      "Turns off the block layer's request-merge lookups: 0 = merge as usual, 1 = only the cheap one-hit merge attempt, 2 = no merging at all. On a fast NVMe SSD merging saves nothing worth the lookup, so 2 trims a little CPU per request; it does hurt sequential throughput on spinning disks and some SATA SSDs.",
+      int(0, 2), NO, Target::PerBlock("nomerges")),
+    t("blk.iostats", "Storage", "I/O statistics accounting",
+      "Per-request accounting that feeds /proc/diskstats, iostat and the PSI I/O numbers. 0 removes it from the I/O fast path (a small saving per request on NVMe at high IOPS); the cost is that iostat, htop's disk columns and I/O statistics stop updating.",
+      Kind::Bool, NO, Target::PerBlock("iostats")),
+    t("blk.add_random", "Storage", "Disk entropy contribution",
+      "Whether disk I/O timing is mixed into the kernel's entropy pool. 0 = off: one less per-request hook. Modern kernels do not depend on it for seeding, so 0 loses nothing on a machine with a hardware RNG (and this one has the CPU's).",
+      Kind::Bool, NO, Target::PerBlock("add_random")),
+    t("blk.nr_requests", "Storage", "Queue depth (nr_requests)",
+      "How many requests may be allocated in the block layer per queue. Lower = shorter queues, less queuing delay behind a big write burst; higher = more requests in flight for sustained throughput. The kernel refuses values above what the device's tag set can hold, which is reported as a failure for this row only. Stock is a device-dependent value; change it only to chase latency under heavy parallel I/O.",
+      int(4, 65_536), NO, Target::PerBlock("nr_requests")),
     // ── Network ───────────────────────────────────────────────────────────
     t("net.tcp_congestion", "Network", "TCP congestion control",
       "Algorithm that decides how fast TCP sends. cubic (default) backs off on packet loss, so a lossy Wi-Fi link or a busy uplink makes it swing between too fast and too slow - visible as latency spikes in online games and uneven downloads. bbr models the path's bandwidth and round-trip time instead and keeps queues short: steadier latency and better throughput on Wi-Fi and long routes. bbr is loaded on demand (tcp_bbr module). Only affects new connections.",
@@ -524,6 +577,15 @@ pub const TUNABLES: &[Tunable] = &[
     t("net.wifi_power_save", "Network", "Wi-Fi power save",
       "802.11 power save lets the Wi-Fi radio doze between beacons. On (the usual default) saves real power on battery but adds tens of milliseconds of latency and jitter whenever the radio has to wake - the classic cause of ping spikes in online games. Off = radio always awake: steady latency, more drain. Set per interface through iw; NetworkManager may turn it back on when it reconnects (set wifi.powersave there to make it stick).",
       Kind::Bool, NO, Target::WifiPowerSave),
+    t("net.tcp_slow_start_after_idle", "Network", "TCP slow start after idle",
+      "1 (stock) = a TCP connection that has been idle for about one RTO restarts from a small congestion window. 0 = it keeps the window it had, so a long-lived connection that goes quiet and bursts again (a game server link, SSH, a download resuming after a pause) gets its full speed back at once. Cheap and safe for a desktop; affects new sends on existing connections immediately.",
+      int(0, 1), NO, Target::File("/proc/sys/net/ipv4/tcp_slow_start_after_idle")),
+    t("net.tcp_mtu_probing", "Network", "TCP MTU probing",
+      "0 = off, 1 = packetization-layer path-MTU discovery switches on when an ICMP 'black hole' is detected (a router that drops the 'too big' messages, common on VPNs and some mobile networks: connections hang after the handshake), 2 = always probe. 1 costs nothing until it is needed and rescues the connections that would otherwise stall.",
+      int(0, 2), NO, Target::File("/proc/sys/net/ipv4/tcp_mtu_probing")),
+    t("net.netdev_max_backlog", "Network", "Receive backlog (packets)",
+      "Per-CPU queue of received packets waiting for the network stack when the NIC delivers faster than the CPU processes them (stock 1000; CachyOS ships 4096). A larger queue absorbs bursts on a fast link (2.5 GbE, Wi-Fi 7) instead of dropping packets, at the price of a little more buffering delay while it is full. Only matters under bursty receive load.",
+      int(100, 1_000_000), NO, Target::File("/proc/sys/net/core/netdev_max_backlog")),
     // ── Devices ───────────────────────────────────────────────────────────
     t("pci.aspm", "Devices", "PCIe ASPM policy",
       "PCIe Active State Power Management policy. 'performance' keeps every PCIe link at full power, no link-state transitions: removes the wake-up latency that shows as GPU or NVMe micro-jitter when a link drops to a power-saving state between traffic bursts - right for a plugged-in gaming session. 'powersave'/'powersupersave' let links drop to save power (better battery life, small idle power win) but on some hardware combinations actively cause dropouts on NVMe or Wi-Fi rather than just adding latency - if you see random Wi-Fi disconnects or NVMe timeouts, try 'performance' or 'default' here even outside gaming. 'default' defers to what the BIOS/ACPI tables request per device.",
@@ -552,6 +614,9 @@ pub const TUNABLES: &[Tunable] = &[
     t("net.wol", "Devices", "Wake-on-LAN (Ethernet)",
       "Wake-on-LAN keeps the Ethernet PHY/MAC partly powered so a magic packet can wake the machine. 0 = off (TLP's WOL_DISABLE default): the NIC can power down fully in suspend and the laptop cannot be woken by network chatter in a bag; 1 = magic-packet wake (ethtool wol g), only offered when the port supports it. Set through ethtool; restoring a port that had another wake mode (e.g. 'pg') writes magic-packet wake back. n/a without ethtool or without a wired port that supports WoL.",
       Kind::Bool, NO, Target::EthWol),
+    t("net.eee", "Devices", "Energy-Efficient Ethernet (EEE)",
+      "EEE lets the Ethernet PHY drop into a low-power idle state between packets (LPI) and wake on demand. 1 = on: a small idle saving on the PHY; 0 = off: no wake-up delay (tens of microseconds) on the first packet after a quiet moment, and it avoids the link flapping some switch/NIC combinations show with EEE. Set through ethtool --set-eee; only offered for a wired port whose driver reports EEE settings.",
+      Kind::Bool, NO, Target::EthEee),
     t("rf.bluetooth", "Devices", "Bluetooth radio",
       "Soft-blocks / unblocks every Bluetooth adapter through rfkill (1 = radio on, 0 = off). An idle but enabled adapter keeps its USB/PCIe link and firmware awake (a few hundred mW); TLP switches it off on battery when you list it in DEVICES_TO_DISABLE. Turning it off disconnects every Bluetooth device, so leave it on if a BT mouse or headset is in use.",
       Kind::Bool, NO, Target::Rfkill("bluetooth")),
@@ -784,6 +849,16 @@ fn debugfs_snapshot_value(key: &str) -> Option<String> {
     if md.uid() != 0 || md.mode() & 0o022 != 0 { return None; }
     let v: Value = serde_json::from_str(&std::fs::read_to_string(DEBUGFS_SNAPSHOT).ok()?).ok()?;
     v.get(key)?.as_str().map(str::to_owned)
+}
+
+/// Some(true/false) = the root-written snapshot lists / does not list this debugfs key (the
+/// tunable exists on this kernel or not); None when no trustworthy snapshot exists yet.
+fn debugfs_snapshot_has(key: &str) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(DEBUGFS_SNAPSHOT).ok()?;
+    if md.uid() != 0 || md.mode() & 0o022 != 0 { return None; }
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(DEBUGFS_SNAPSHOT).ok()?).ok()?;
+    Some(v.get(key).is_some())
 }
 
 /// Mounts debugfs if needed (root only). Never fails the request.
@@ -1507,6 +1582,37 @@ fn wol_set(f: &Path, data: &str) -> Result<(), String> {
     }
 }
 
+/// "1" = EEE enabled, "0" = disabled; None when the port/driver reports no EEE settings.
+fn eee_get(f: &Path) -> Option<String> {
+    let dev = wifi_ifname(f)?;
+    let (ok, out) = run_tool(&ethtool()?, &["--show-eee", &dev], std::time::Duration::from_secs(3))?;
+    if !ok { return None; }
+    for l in out.lines() {
+        if let Some(v) = l.trim().strip_prefix("EEE status:") {
+            let v = v.trim();
+            if v.starts_with("not supported") { return None; }
+            return Some(if v.starts_with("disabled") { "0".into() } else { "1".into() });
+        }
+    }
+    None
+}
+
+fn eee_set(f: &Path, data: &str) -> Result<(), String> {
+    let dev = wifi_ifname(f).ok_or_else(|| format!("{}: not a network interface path", f.display()))?;
+    let bin = ethtool().ok_or("ethtool not found (install sys-apps/ethtool)")?;
+    let arg = match data {
+        "0" => "off",
+        "1" => "on",
+        _ => return Err(format!("EEE takes 0/1, got '{data}'")),
+    };
+    if eee_get(f).is_none() { return Err(format!("{dev}: port reports no EEE settings")); }
+    match run_tool(&bin, &["--set-eee", &dev, "eee", arg], std::time::Duration::from_secs(3)) {
+        Some((true, _)) => Ok(()),
+        Some((false, _)) => Err(format!("{dev}: ethtool refused eee {arg}")),
+        None => Err(format!("{dev}: ethtool timed out")),
+    }
+}
+
 // ── ATA disk discovery, APM (hdparm), AHCI runtime PM ───────────────────
 
 fn hdparm() -> Option<PathBuf> {
@@ -1859,6 +1965,12 @@ fn file_usable(p: &str) -> bool {
         "/proc/sys/vm/dirty_background_ratio" => read(Path::new("/proc/sys/vm/dirty_background_bytes")).as_deref() == Some("0"),
         // Present but empty (and not writable) where EAS cannot run.
         "/proc/sys/kernel/sched_energy_aware" => read(Path::new(p)).map_or(false, |v| !v.is_empty()),
+        // BORE kernels (CachyOS) export base_slice_ns read-only and derive it from min_base_slice_ns:
+        // a row that can only fail must not be offered.
+        "/sys/kernel/debug/sched/base_slice_ns" => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).map_or(true, |m| m.permissions().mode() & 0o222 != 0)
+        }
         _ => true,
     }
 }
@@ -1884,6 +1996,7 @@ pub fn write_value(t: &Tunable, f: &Path, data: &str) -> Result<(), String> {
     match t.target {
         Target::WifiPowerSave => wifi_set(f, data),
         Target::EthWol => wol_set(f, data),
+        Target::EthEee => eee_set(f, data),
         Target::DiskApm(_) => apm_set(f, data),
         Target::SchedExt => scx_set(data),
         Target::SchedFeature(n) => {
@@ -1968,6 +2081,7 @@ pub fn files(t: &Tunable) -> Vec<PathBuf> {
         Target::Irq => if has_domains() { irq_files() } else { vec![] },
         Target::WifiPowerSave => wifi_ifaces(),
         Target::EthWol => eth_ifaces(),
+        Target::EthEee => eth_ifaces().into_iter().filter(|p| eee_get(p).is_some()).collect(),
         Target::PciAspm => pci_aspm_files(),
         Target::SchedExt => if scx_available().is_empty() { vec![] } else { vec![PathBuf::from(SCX_STATE)] },
         Target::CcdPark => {
@@ -2154,8 +2268,8 @@ fn current_with(t: &Tunable, fs: Vec<PathBuf>) -> Option<String> {
         }
         Target::SchedExt => return scx_current(),
         Target::DiskApm(_) => return fs.first().and_then(|f| apm_get(f)),
-        Target::WifiPowerSave | Target::EthWol => {
-            let get = |f: &PathBuf| if matches!(t.target, Target::EthWol) { wol_get(f) } else { wifi_get(f) };
+        Target::WifiPowerSave | Target::EthWol | Target::EthEee => {
+            let get = |f: &PathBuf| match t.target { Target::EthWol => wol_get(f), Target::EthEee => eee_get(f), _ => wifi_get(f) };
             let mut vals = fs.iter().filter_map(get);
             let first = vals.next()?;
             return Some(if vals.all(|v| v == first) { first } else { "mixed".into() });
@@ -2272,7 +2386,7 @@ pub fn plan(t: &Tunable, value: &str) -> Result<Vec<(PathBuf, String)>, String> 
                 .map(|f| (f, "1".to_owned())).collect()
         }
         Target::SchedExt => vec![(fs[0].clone(), value.to_owned())],
-        Target::WifiPowerSave | Target::EthWol => fs.into_iter().map(|f| (f, value.to_owned())).collect(),
+        Target::WifiPowerSave | Target::EthWol | Target::EthEee => fs.into_iter().map(|f| (f, value.to_owned())).collect(),
         Target::RaplWatts(_) => {
             let w: i64 = value.parse().map_err(|_| format!("'{value}' is not a wattage"))?;
             fs.into_iter().map(|f| (f, (w * 1_000_000).to_string())).collect()
@@ -2296,6 +2410,7 @@ pub fn baseline_value(t: &Tunable, f: &Path) -> Option<String> {
         Target::PciLatency => return pci_latency_read(f).map(|b| format!("{b:02x}")),
         Target::WifiPowerSave => return wifi_get(f),
         Target::EthWol => return wol_get(f),
+        Target::EthEee => return eee_get(f),
         Target::DiskApm(_) => return apm_get(f),
         Target::SchedExt => return scx_current(),
         Target::SchedFeature(n) => return read(f).and_then(|raw| sched_feature_state(&raw, n)).map(|v| if v == "1" { n.to_owned() } else { format!("NO_{n}") }),
@@ -2475,7 +2590,7 @@ pub fn describe() -> Value {
             "kind": match t.kind { Kind::Choice => "choice", Kind::Int { .. } => "int", Kind::Bool => "bool" },
             "options": opts, "min": min, "max": max,
             // debugfs is root-only (0700): unprivileged callers cannot tell; root checks at write time.
-            "available": !fs.is_empty() || t.debugfs,
+            "available": !fs.is_empty() || (t.debugfs && debugfs_snapshot_has(t.key).unwrap_or(true)),
             "debugfs": t.debugfs, "caution": t.caution, "hotplug": is_hotplug(t.key),
             "files": fs.len(),
             "current": current_with(t, fs).or_else(|| if t.debugfs { debugfs_snapshot_value(t.key) } else { None }),
@@ -2528,7 +2643,8 @@ mod tests {
         for k in ["cpu.idle_governor", "thp.mthp_64k", "thp.khp_max_ptes_none", "net.tcp_congestion",
                   "net.default_qdisc", "net.wifi_power_save", "pci.aspm_links", "sched.ext",
                   "disk.apm_0", "pm.ahci_runtime_timeout", "pm.ahci_disk_runtime", "pm.ahci_port_runtime",
-                  "net.wol", "rf.bluetooth", "rf.wlan", "rf.wwan", "gpu.amdgpu_abm", "usb.autosuspend_ms"] {
+                  "net.wol", "rf.bluetooth", "rf.wlan", "rf.wwan", "gpu.amdgpu_abm", "usb.autosuspend_ms",
+                  "vm.defrag_mode", "kernel.sched_bore", "sched.feat_preempt_short", "blk.rq_affinity", "net.eee"] {
             assert!(find(k).is_some(), "{k}");
         }
         assert!(best_effort(find("pci.aspm_links").unwrap()));
