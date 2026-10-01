@@ -1076,6 +1076,9 @@ fn dirty_rules(r: &mut Rules) {
         mk(0.5, 0.10, -0.05, -0.02, 0.0, 0.2),
         mk(2.0, -0.15, 0.08, 0.10, -0.05, 0.3),
     ];
+    // Windows clamped to the same limits (fast disk) are the reference itself, not a dose with an effect.
+    let mut seen = vec![dirty_pair(rate, ram, 1.0)];
+    alts.retain(|c| { let b = dirty_pair(rate, ram, c.value.as_f64().unwrap_or(1.0)); if seen.contains(&b) { false } else { seen.push(b); true } });
     for c in alts.iter_mut() {
         let t = format!("{}", c.value.as_f64().unwrap_or(1.0));
         p.apply_measured(r.g, "vm.dirty", "1", &t, c);
@@ -2153,6 +2156,7 @@ mod tests {
         sig(&mut cal, "blk.read_ahead_kb", "128", "1024", false, meas(0.0, 0.30, None), 5);
         sig(&mut cal, "vm.dirty", "1", "0.5", false, meas(0.40, 0.0, None), 5);
         p.current.insert("blk.read_ahead_kb".into(), "128".into());
+        p.io.bps = 400 * MIB; // windows 0.5 and 1 are different limits here (on a fast disk both clamp to the same)
         p.calibration = Some(cal);
         let w = Weights { throughput: 3.0, footprint: 0.0, ..Weights::for_goal(Goal::Throughput) };
         let (d, _, _) = decide_weighted(Goal::Throughput, &p, w);

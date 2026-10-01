@@ -327,6 +327,14 @@ fn plan(rounds: usize, scale: f64, ram: u64, only: &Option<Vec<String>>, phase: 
                 if x != reference && !values.contains(&x) { values.push(x); }
             }
         }
+        if key == "vm.dirty" {
+            // Windows are clamped to [32 MiB, min(RAM/50, 1 GiB)]: on a fast disk several become the same limits,
+            // which would be measured as different doses (or as the reference itself).
+            let rate = lpm_helpers::iorate::gather().bps;
+            let bytes = |w: &str| w.parse::<f64>().ok().map(|w| lpm_helpers::autotune::dirty_pair(rate, ram, w));
+            let mut seen = vec![bytes(&reference)];
+            values.retain(|v| { let b = bytes(v); if seen.contains(&b) { false } else { seen.push(b); true } });
+        }
         if values.is_empty() { skipped.push((key, "no alternative values".into())); continue; }
         for (ph, b) in calib::phases_for(&key, group) {
             if (phase == "idle" && ph == Phase::Load) || (phase == "load" && ph == Phase::Idle) { continue; }
@@ -508,7 +516,9 @@ fn compute_rows(runs: &[Run], phase: Phase, sess: u64, kernel: &str, n_total: us
 /// A finished run: sample, OOM kill, evidence weight (a busy machine counts less), time.
 struct Done { s: Sample, oom: bool, w: f64, t: u64 }
 
-struct Runner<'a> { j: Journal, c: &'a Ctx, rate: u64, ram: u64, ballast: Option<Ballast>, restarts: u32, runs: usize, t0: Instant, busy: usize }
+struct Runner<'a> { j: Journal, c: &'a Ctx, rate: u64, ram: u64, ballast: Option<Ballast>, restarts: u32, runs: usize, t0: Instant, busy: usize,
+                    /// Settings every run starts from (a run that changes the same key overrides them).
+                    base: Cfg }
 
 impl Runner<'_> {
     fn need_ballast(&mut self) -> Result<(), String> {
@@ -533,7 +543,8 @@ impl Runner<'_> {
         eprint!("\r[{:>3} runs {:>4.1} min] {:<4} {:<64}", self.runs, self.t0.elapsed().as_secs_f64() / 60.0, if phase == Phase::Idle { "idle" } else { "load" },
                 if cfg.is_empty() { format!("reference {note}") } else { format!("{} change(s): {}{}", cfg.len(), names.join(" "), if cfg.len() > 3 { " ..." } else { "" }) });
         let _ = std::io::stderr().flush();
-        for (k, v) in cfg {
+        let base: Vec<(String, String)> = self.base.iter().filter(|(k, _)| !cfg.iter().any(|(c, _)| c == k)).cloned().collect();
+        for (k, v) in base.iter().chain(cfg.iter()) {
             if let Err(e) = apply(&mut self.j, k, v, self.rate, self.ram) {
                 eprintln!("\n{k} = {v}: {e} — run skipped");
                 let _ = self.j.restore();
@@ -737,6 +748,10 @@ fn design_phase(cal: &mut Calibration, rn: &mut Runner, phase: Phase, its: &[&It
     let name = if phase == Phase::Idle { "idle" } else { "load" };
     let mut factors: Vec<Factor> = its.iter().map(|i| Factor { key: i.key.clone(), reference: i.reference.clone(), values: i.values.clone() }).collect();
     let bs = union_benches(its);
+    // vm.dirty's reference is window "1" (what autotune reads it as), not the live limits: every run of
+    // this phase starts from it, so the reference runs are what the label says.
+    let dirty_ok = tune::find("vm.dirty_bytes").map_or(false, |t| !tune::files(t).is_empty());
+    rn.base = factors.iter().filter(|f| f.key == "vm.dirty" && dirty_ok).map(|f| (f.key.clone(), f.reference.clone())).collect();
     let cost = est_secs(phase, bs, rn.c.scale).max(1.0);
     let n_total = ((budget / cost) as usize).clamp(12, dp.cap);
     let n_init = ((n_total as f64 * dp.init) as usize).clamp(8, n_total);
@@ -861,7 +876,7 @@ fn design_main(cal: &mut Calibration, items: &[Item], ctx: &Ctx, rate: u64, ram:
     }
     let phases = split(items, ctx.scale, budget);
     if phases.is_empty() { eprintln!("nothing to design: fewer than two testable knobs"); return; }
-    let mut rn = Runner { j: Journal { entries: Vec::new() }, c: ctx, rate, ram, ballast: None, restarts: 0, runs: 0, t0: Instant::now(), busy: 0 };
+    let mut rn = Runner { j: Journal { entries: Vec::new() }, c: ctx, rate, ram, ballast: None, restarts: 0, runs: 0, t0: Instant::now(), busy: 0, base: Vec::new() };
     for (ph, its, secs) in &phases {
         let pdp = if progressive {
             let p = progress(cal, *ph, &phase_factors(its));
@@ -1007,7 +1022,6 @@ fn main() {
     let state_active = std::fs::read_to_string(TUNE_STATE).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .map_or(false, |v| v["baseline"].as_array().map_or(false, |a| !a.is_empty()));
     if state_active { die("an Optimizations preset is active: Restore originals first, so every knob is measured from the boot state"); }
-    let _ = lpm_helpers::secure_dir("/run/legion-power-manager");
     let _ = lpm_helpers::secure_dir("/run/legion-power-manager/tune");
     let lock = std::fs::OpenOptions::new().create(true).write(true).open(TUNE_LOCK).unwrap_or_else(|e| die(&format!("lock: {e}")));
     if unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 { die("Legion Power Manager is applying something; try again"); }

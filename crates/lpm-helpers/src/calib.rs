@@ -581,7 +581,7 @@ impl Calibration {
         let rows: Vec<Value> = self.rows.iter().map(|r| json!({
             "ph": if r.phase == Phase::Idle { 0 } else { 1 }, "s": r.sess, "p": r.pos, "t": r.t, "k": r.kernel, "w": r.w, "bv": r.bv,
             "c": r.cfg.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "y": r.y.iter().map(|v| num(*v)).collect::<Vec<_>>()})).collect();
-json!({"version": 4, "fingerprint": self.fingerprint.to_json(), "on_battery": self.on_battery, "keys": keys, "rows": rows,
+json!({"version": 5, "fingerprint": self.fingerprint.to_json(), "on_battery": self.on_battery, "keys": keys, "rows": rows,
                "refs": self.refs, "hyp": self.hyp, "strategies": self.strategies, "unsafe_sets": self.unsafe_sets.iter().map(|u| u.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>()).collect::<Vec<_>>()})
     }
     pub fn from_json(v: &Value) -> Calibration {
@@ -617,6 +617,8 @@ json!({"version": 4, "fingerprint": self.fingerprint.to_json(), "on_battery": se
                               cfg: r["c"].as_array().into_iter().flatten().filter_map(pair).collect(), y, w: r["w"].as_f64().unwrap_or(1.0),
                               bv: r["bv"].as_u64().unwrap_or(1) as u8 });
         }
+        // Format 4 logged vm.dirty design rows against the live limits while labelling them window "1".
+        if version < 5 { c.rows.retain(|r| !r.cfg.iter().any(|(k, _)| k == "vm.dirty")); }
         for (k, x) in v["refs"].as_object().into_iter().flatten() { if let Some(x) = x.as_str() { c.refs.insert(k.clone(), x.to_owned()); } }
         for u in v["unsafe_sets"].as_array().into_iter().flatten() { c.unsafe_sets.push(u.as_array().into_iter().flatten().filter_map(pair).collect()); }
         for (k, x) in v["hyp"].as_object().into_iter().flatten() {
