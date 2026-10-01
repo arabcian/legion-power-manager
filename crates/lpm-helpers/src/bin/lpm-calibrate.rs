@@ -1,8 +1,9 @@
-//! lpm-calibrate — build this machine's signature: what every CPU, scheduler
-//! and memory knob does here, idle and under load, accumulated across runs.
+//! lpm-calibrate — build this machine's signature: what every CPU, scheduler,
+//! memory and storage knob does here, idle, under load and on the disk,
+//! accumulated across runs.
 //!
-//!   sudo lpm-calibrate [--budget MIN] [--depth lean|deep|max] [--all] [--phase idle|load|both]
-//!                      [--only KEY|@thp|@mem|@cpu|@sched,..] [--sessions N] [--thorough] [--dir PATH] [--seed N] [--no-confirm]
+//!   sudo lpm-calibrate [--budget MIN] [--depth lean|deep|max] [--all] [--phase idle|load|io|both]
+//!                      [--only KEY|@thp|@mem|@cpu|@sched|@io,..] [--sessions N] [--thorough] [--dir PATH] [--seed N] [--no-confirm]
 //!   sudo lpm-calibrate --oat [...]        legacy: one knob at a time (ref, every candidate, ref)
 //!   lpm-calibrate --list                  the plan: keys, values, depth, estimated time, coverage
 //!   lpm-calibrate --show                  the signature (weighted estimates per value, interactions)
@@ -26,13 +27,16 @@
 //! the smallest culprit set, which is stored as unsafe; a run disturbed by other programs
 //! counts less.
 //!
-//! The plan comes from the tunable table itself (CPU, Scheduler, Memory),
+//! The plan comes from the tunable table itself (CPU, Scheduler, Memory, Storage),
 //! minus keys that are structural or unsafe to flip (calib::EXCLUDED). The
 //! budget (--budget, default 15 min) is kept by wall clock; repeated sessions
 //! fill the gaps of earlier ones and refine the estimates.
 //! Results accumulate in /var/lib/legion-power-manager/signature.json
 //! (recency- and kernel-weighted); autotune doses every knob from it.
 //!
+//! Phase IO: the storage suite (bench::io) on the disk holding --dir (default: /var/tmp or
+//! the first of /var/cache, /home, / that is on a local disk) for the Storage rows and the
+//! dirty window - their effects are measured and weighed there only (storage weight).
 //! Phase 1 (idle): quiet machine. Phase 2 (load): a ballast child holds memory
 //! down to max(1 GiB, 5 % RAM) free, re-faults 64 MiB blocks and keeps half the
 //! CPUs busy; part of its memory is perforated (free, but no free 2 MiB block). Brakes: the ballast dies at once if MemAvailable < 256 MiB or PSI
@@ -97,9 +101,14 @@ impl Journal {
         }
         Ok(())
     }
+    /// Puts every original back. The I/O scheduler goes first: switching the elevator resets
+    /// the queue's nr_requests and (bfq) writeback throttling, so a journaled original of those
+    /// must be written after it, not before.
     fn restore(&mut self) -> Vec<String> {
         let mut errs = Vec::new();
-        for (k, f, o) in self.entries.iter().rev() {
+        let sched = |k: &str| k == "blk.scheduler";
+        let order = self.entries.iter().filter(|e| sched(&e.0)).chain(self.entries.iter().rev().filter(|e| !sched(&e.0)));
+        for (k, f, o) in order {
             if let Some(t) = tune::find(k) {
                 if let Err(e) = tune::write_value(t, f, o) { if f.exists() { errs.push(format!("{k} {}: {e}", f.display())); } }
             }
@@ -133,9 +142,17 @@ fn apply(j: &mut Journal, key: &str, value: &str, rate: u64, ram: u64) -> Result
     }
 }
 
-/// Live value of a group, as one of its labels.
-fn live_label(key: &str) -> Option<String> {
+/// Live value of a group, as one of its labels. A Storage row whose disks disagree ("mixed",
+/// e.g. a USB stick next to the NVMe drives) takes the value of the disk the suite measures.
+fn live_label(key: &str, disk: Option<&str>) -> Option<String> {
     let cur = |k: &str| tune::find(k).and_then(tune::current);
+    if let (Some(attr), Some(d)) = (key.strip_prefix("blk."), disk) {
+        let v = cur(key)?;
+        if v != "mixed" { return Some(v); }
+        let raw = std::fs::read_to_string(format!("/sys/block/{d}/queue/{attr}")).ok()?;
+        let raw = raw.trim();
+        return Some(match (raw.find('['), raw.find(']')) { (Some(a), Some(b)) if b > a => raw[a + 1..b].to_owned(), _ => raw.to_owned() });
+    }
     match key {
         "vm.dirty" => Some("1".into()),
         "thp" => {
@@ -196,7 +213,8 @@ impl Ballast {
 
 /// `scale` stretches every measurement window (1.0 default, 1.6 with --thorough).
 /// `battery`: power source chosen at session start (whole machine) instead of RAPL.
-struct Ctx { exe: PathBuf, dir: String, io_size: usize, scale: f64, battery: bool }
+/// `disk`: whole disk holding `dir` (None: not a local disk - no IO phase).
+struct Ctx { exe: PathBuf, dir: String, disk: Option<String>, io_size: usize, scale: f64, battery: bool }
 
 fn ms(c: &Ctx, base: u64) -> Duration { Duration::from_millis((base as f64 * c.scale) as u64) }
 
@@ -212,6 +230,7 @@ fn run_idle(b: Benches, c: &Ctx) -> Result<Sample, String> {
         if let Some(w) = bench::wake_p99_us(ms(c, 600)) { s.insert(Metric::WakeP99Us, w); }
     }
     if b.cpu {
+        if let Some(f) = bench::frame_tail_us(ms(c, 600)) { s.insert(Metric::FrameP99Us, f); }
         s.insert(Metric::CpuSingle, bench::cpu_single(ms(c, 400)));
         let (rate, eff) = bench::cpu_multi(ms(c, 600));
         s.insert(Metric::CpuMulti, rate);
@@ -233,6 +252,7 @@ fn run_load(b: Benches, c: &Ctx) -> Result<(Sample, bool), String> {
         if let Some(w) = bench::wake_p99_us(ms(c, 600)) { s.insert(Metric::WakeP99Us, w); }
         if b.cpu {
             if let Some(p) = bench::pingpong_p99_us(2000) { s.insert(Metric::PingPongP99Us, p); }
+            if let Some(f) = bench::frame_tail_us(ms(c, 600)) { s.insert(Metric::FrameP99Us, f); }
             s.insert(Metric::CpuSingle, bench::cpu_single(ms(c, 400)));
         }
         if b.cpu_mem { bench::probe_child(&c.exe, 256, &mut s)?; }
@@ -245,12 +265,24 @@ fn run_load(b: Benches, c: &Ctx) -> Result<(Sample, bool), String> {
     Ok((s, bench::vmstat("oom_kill") > oom0))
 }
 
+/// One run of the IO phase: page cache dropped (the previous run's file pages must not serve
+/// this one's reads), then the storage suite on the measured disk.
+fn run_io(c: &Ctx) -> Result<Sample, String> {
+    unsafe { libc::sync(); }
+    let _ = std::fs::write("/proc/sys/vm/drop_caches", "3");
+    std::thread::sleep(Duration::from_millis(400));
+    let mut s = Sample::new();
+    bench::io(&c.dir, c.io_size, &mut s)?;
+    Ok(s)
+}
+
 /// Seconds per run (default windows; --thorough scales them).
 fn est_secs(ph: Phase, b: Benches, scale: f64) -> f64 {
     let s = match ph {
         Phase::Idle => 0.3 + if b.io || b.cpu_mem { 0.8 } else { 0.0 } + if b.idle { 2.8 } else { 0.0 } + if b.cpu || b.cpu_mem { 0.6 } else { 0.0 }
-            + if b.cpu { 1.1 } else { 0.0 } + if b.cpu_mem { 1.8 } else { 0.0 } + if b.io { 2.0 } else { 0.0 },
-        Phase::Load => 1.4 + if b.cpu { 0.5 } else { 0.0 } + if b.cpu_mem { 1.0 } else { 0.0 } + if b.io { 0.8 } else { 0.0 },
+            + if b.cpu { 1.7 } else { 0.0 } + if b.cpu_mem { 1.8 } else { 0.0 } + if b.io { 4.0 } else { 0.0 },
+        Phase::Load => 1.4 + if b.cpu { 1.1 } else { 0.0 } + if b.cpu_mem { 1.0 } else { 0.0 } + if b.io { 2.0 } else { 0.0 },
+        Phase::Io => 0.6 + 4.0,
     };
     s * scale
 }
@@ -276,9 +308,10 @@ fn order(reference: &str, cands: &[String], rounds: usize) -> Vec<String> {
 /// One planned measurement: a key in one phase.
 struct Item { key: String, phase: Phase, benches: Benches, reference: String, values: Vec<String>, secs: f64 }
 
-/// `--only` entry: a key, or a group alias (@thp, @mem, @cpu, @sched).
+/// `--only` entry: a key, or a group alias (@thp, @mem, @cpu, @sched, @io = Storage rows + dirty window).
 fn selects(x: &str, key: &str, group: &str) -> bool {
     match x {
+        "@io" | "@storage" => calib::io_key(key),
         "@thp" => key == "thp" || key.starts_with("thp."),
         "@mem" => group == "Memory",
         "@cpu" => group == "CPU",
@@ -287,7 +320,7 @@ fn selects(x: &str, key: &str, group: &str) -> bool {
     }
 }
 
-fn plan(rounds: usize, scale: f64, ram: u64, only: &Option<Vec<String>>, phase: &str, cal: &Calibration) -> (Vec<Item>, Vec<(String, String)>) {
+fn plan(rounds: usize, scale: f64, ram: u64, only: &Option<Vec<String>>, phase: &str, cal: &Calibration, disk: &Result<String, String>) -> (Vec<Item>, Vec<(String, String)>) {
     let swap = bench::meminfo_kb("SwapTotal:").unwrap_or(0) > 0;
     let zram = std::fs::read_to_string("/proc/swaps").unwrap_or_default().contains("/dev/zram");
     let numa = std::fs::read_dir("/sys/devices/system/node").map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("node")).count()).unwrap_or(1);
@@ -295,7 +328,7 @@ fn plan(rounds: usize, scale: f64, ram: u64, only: &Option<Vec<String>>, phase: 
     let mut skipped = Vec::new();
     let mut keys: Vec<(String, &'static str)> = vec![("vm.dirty".into(), "Memory"), ("thp".into(), "Memory")];
     for t in tune::TUNABLES {
-        if !["CPU", "Scheduler", "Memory"].contains(&t.group) { continue; }
+        if !["CPU", "Scheduler", "Memory", "Storage"].contains(&t.group) { continue; }
         if let Some((_, why)) = calib::EXCLUDED.iter().find(|(k, _)| *k == t.key) { skipped.push((t.key.to_owned(), why.to_string())); continue; }
         let why = if !tune::vendor_ok(t) { Some("other CPU vendor") }
             else if !t.debugfs && tune::files(t).is_empty() { Some("not on this machine/kernel") }
@@ -308,7 +341,8 @@ fn plan(rounds: usize, scale: f64, ram: u64, only: &Option<Vec<String>>, phase: 
     }
     for (key, group) in keys {
         if only.as_ref().map_or(false, |o| !o.iter().any(|x| selects(x, &key, group))) { continue; }
-        let Some(reference) = live_label(&key) else { skipped.push((key, "live value unreadable".into())); continue };
+        if calib::io_key(&key) { if let Err(e) = disk { skipped.push((key, format!("no storage suite: {e} (--dir PATH on a local disk)"))); continue; } }
+        let Some(reference) = live_label(&key, disk.as_ref().ok().map(String::as_str)) else { skipped.push((key, "live value unreadable".into())); continue };
         let t = tune::find(&key);
         let opts: Vec<String> = t.map(|t| tune::options(t).into_iter().map(|(v, _)| v).collect()).unwrap_or_default();
         let raw = match key.as_str() {
@@ -337,13 +371,13 @@ fn plan(rounds: usize, scale: f64, ram: u64, only: &Option<Vec<String>>, phase: 
         }
         if values.is_empty() { skipped.push((key, "no alternative values".into())); continue; }
         for (ph, b) in calib::phases_for(&key, group) {
-            if (phase == "idle" && ph == Phase::Load) || (phase == "load" && ph == Phase::Idle) { continue; }
+            if phase != "both" && phase != ph.name() { continue; }
             let secs = est_secs(ph, b, scale) * runs_for(values.len(), rounds) as f64;
             items.push(Item { key: key.clone(), phase: ph, benches: b, reference: reference.clone(), values: values.clone(), secs });
         }
     }
     // Least measured first; phases stay together (one ballast for the whole load phase).
-    items.sort_by_key(|i| (i.phase == Phase::Load, cal.coverage(&i.key, i.phase)));
+    items.sort_by_key(|i| (i.phase.idx(), cal.coverage(&i.key, i.phase)));
     (items, skipped)
 }
 
@@ -482,33 +516,65 @@ struct Run { cfg: Cfg, s: Sample, order: usize, t: u64, w: f64 }
 
 fn obj_index(m: Metric) -> usize { match m.objective() { Objective::Lat => 0, Objective::Thr => 1, Objective::Pwr => 2, Objective::Mem => 3 } }
 
+/// Weight of every metric inside its objective, from the scatter of the session's reference
+/// runs (robust sd of the log values): w = 1 / (sd^2 + mean sd^2 of the objective), i.e. halfway
+/// between equal weights and inverse variance, then kept within 1/3..3x of the equal share. A
+/// tail that jumps 30 % between identical runs no longer drowns a bandwidth that moves 1 %, and
+/// no single metric can take an objective over. Fewer than 4 reference runs: equal weights.
+fn metric_weights(refs: &[&Run], ms: &[Metric]) -> BTreeMap<Metric, f64> {
+    let sd = |m: Metric| -> Option<f64> {
+        let v: Vec<f64> = refs.iter().filter_map(|r| r.s.get(&m)).filter(|x| **x + m.eps() > 0.0).map(|x| (x + m.eps()).ln()).collect();
+        if v.len() < 4 { return None; }
+        let mut a = v.clone();
+        let med = calib::median(&mut a)?;
+        let mut d: Vec<f64> = v.iter().map(|x| (x - med).abs()).collect();
+        Some(1.4826 * calib::median(&mut d)?)
+    };
+    let mut out = BTreeMap::new();
+    for o in 0..4 {
+        let mo: Vec<Metric> = ms.iter().copied().filter(|m| obj_index(*m) == o).collect();
+        if mo.is_empty() { continue; }
+        let sds: Vec<Option<f64>> = mo.iter().map(|m| sd(*m)).collect();
+        if sds.iter().any(Option::is_none) { for m in &mo { out.insert(*m, 1.0); } continue; }
+        let var: Vec<f64> = sds.iter().map(|x| x.unwrap().powi(2)).collect();
+        let mean = (var.iter().sum::<f64>() / var.len() as f64).max(1e-6);
+        let raw: Vec<f64> = var.iter().map(|v| 1.0 / (v + mean)).collect();
+        let avg = raw.iter().sum::<f64>() / raw.len() as f64;
+        for (m, w) in mo.iter().zip(&raw) { out.insert(*m, (w / avg).clamp(1.0 / 3.0, 3.0)); }
+    }
+    out
+}
+
 /// Runs -> rows: per metric the log-ratio to the session's reference runs (all runs when there
 /// are fewer than 3), sign so that + is better, each clipped to +-0.5 (a stray outlier cannot
-/// dominate), averaged per objective. A metric counts only if at least 80 % of the runs have it,
-/// so every run is judged on the same set. Each row keeps its run's time (drift model) and weight.
+/// dominate), averaged per objective with the metric's noise weight (`metric_weights`). A metric
+/// counts only if at least 80 % of the runs have it, so every run is judged on the same set.
+/// Each row keeps its run's time (drift model) and weight.
 fn compute_rows(runs: &[Run], phase: Phase, sess: u64, kernel: &str, n_total: usize) -> Vec<Row> {
     if runs.len() < 4 { return Vec::new(); }
     let refs: Vec<&Run> = runs.iter().filter(|r| r.cfg.is_empty()).collect();
-    let base_runs: Vec<&Run> = if refs.len() >= 3 { refs } else { runs.iter().collect() };
+    let base_runs: Vec<&Run> = if refs.len() >= 3 { refs.clone() } else { runs.iter().collect() };
     let mut base: BTreeMap<Metric, f64> = BTreeMap::new();
     for m in Metric::ALL {
         if runs.iter().filter(|r| r.s.contains_key(&m)).count() * 5 < runs.len() * 4 { continue; }
         let mut v: Vec<f64> = base_runs.iter().filter_map(|r| r.s.get(&m).copied()).collect();
         if let Some(b) = calib::median(&mut v) { base.insert(m, b); }
     }
+    // Weights over the metrics this phase actually measured (the others are not in any row).
+    let wts = metric_weights(&refs, &base.keys().copied().collect::<Vec<_>>());
     runs.iter().map(|r| {
-        let mut acc = [(0.0f64, 0usize); 4];
+        let mut acc = [(0.0f64, 0.0f64); 4];
         for (m, b) in &base {
             let Some(&v) = r.s.get(m) else { continue };
             let e = m.eps();
             if v + e <= 0.0 || b + e <= 0.0 { continue; }
             let mut d = ((v + e) / (b + e)).ln();
             if !m.higher_better() { d = -d; }
-            let i = obj_index(*m);
-            acc[i].0 += d.clamp(-0.5, 0.5); acc[i].1 += 1;
+            let (i, w) = (obj_index(*m), wts.get(m).copied().unwrap_or(1.0));
+            acc[i].0 += w * d.clamp(-0.5, 0.5); acc[i].1 += w;
         }
         let mut y = [f64::NAN; 4];
-        for i in 0..4 { if acc[i].1 > 0 { y[i] = acc[i].0 / acc[i].1 as f64; } }
+        for i in 0..4 { if acc[i].1 > 0.0 { y[i] = acc[i].0 / acc[i].1; } }
         Row { phase, sess, pos: (r.order as f64 / n_total.max(runs.len()) as f64).min(1.0), t: r.t, kernel: kernel.into(), cfg: r.cfg.clone(), y, w: r.w, bv: calib::BENCH_VERSION }
     }).collect()
 }
@@ -538,13 +604,18 @@ impl Runner<'_> {
     fn run(&mut self, phase: Phase, b: Benches, cfg: &Cfg, note: &str) -> Result<Option<Done>, String> {
         if STOP.load(Ordering::SeqCst) { let _ = self.j.restore(); return Err("interrupted".into()); }
         if phase == Phase::Load { self.need_ballast()?; }
+        // No memory pressure behind the storage suite: the ballast would turn it into a swap test.
+        if phase != Phase::Load { if let Some(b) = self.ballast.take() { b.stop(); } }
         self.runs += 1;
         let names: Vec<String> = cfg.iter().take(3).map(|(k, v)| format!("{k}={v}")).collect();
-        eprint!("\r[{:>3} runs {:>4.1} min] {:<4} {:<64}", self.runs, self.t0.elapsed().as_secs_f64() / 60.0, if phase == Phase::Idle { "idle" } else { "load" },
+        eprint!("\r[{:>3} runs {:>4.1} min] {:<4} {:<64}", self.runs, self.t0.elapsed().as_secs_f64() / 60.0, phase.name(),
                 if cfg.is_empty() { format!("reference {note}") } else { format!("{} change(s): {}{}", cfg.len(), names.join(" "), if cfg.len() > 3 { " ..." } else { "" }) });
         let _ = std::io::stderr().flush();
-        let base: Vec<(String, String)> = self.base.iter().filter(|(k, _)| !cfg.iter().any(|(c, _)| c == k)).cloned().collect();
-        for (k, v) in base.iter().chain(cfg.iter()) {
+        let mut todo: Vec<(String, String)> = self.base.iter().filter(|(k, _)| !cfg.iter().any(|(c, _)| c == k)).cloned().collect();
+        todo.extend(cfg.iter().cloned());
+        // The elevator first: switching it resets nr_requests and (bfq) writeback throttling.
+        todo.sort_by_key(|(k, _)| k != "blk.scheduler");
+        for (k, v) in &todo {
             if let Err(e) = apply(&mut self.j, k, v, self.rate, self.ram) {
                 eprintln!("\n{k} = {v}: {e} — run skipped");
                 let _ = self.j.restore();
@@ -553,7 +624,8 @@ impl Runner<'_> {
         }
         let skip: Vec<u32> = self.ballast.as_ref().map(|b| b.child.id()).into_iter().collect();
         let (fg, t1) = (bench::Foreign::snapshot(&skip), Instant::now());
-        let r = match phase { Phase::Idle => run_idle(b, self.c).map(|s| (s, false)), Phase::Load => run_load(b, self.c) };
+        let r = match phase { Phase::Idle => run_idle(b, self.c).map(|s| (s, false)), Phase::Load => run_load(b, self.c),
+                              Phase::Io => run_io(self.c).map(|s| (s, false)) };
         let busy = fg.busy_cpus(&skip, t1.elapsed().as_secs_f64());
         for e in self.j.restore() { eprintln!("\nrestore: {e}"); }
         // Other programs keeping more than 0.6 CPU busy disturb the figures: such a run counts less.
@@ -585,11 +657,17 @@ fn oom_cull(cal: &mut Calibration, rn: &mut Runner, phase: Phase, b: Benches, cf
 
 struct Analysis { risk: f64, doubt_pairs: usize, optima: Vec<(Goal, Cfg, f64, f64)>, picks: Vec<Cfg>, r2: f64, cover: f64 }
 
-fn goal_wts(g: Goal) -> [f64; 4] { let w = Weights::for_goal(g); [w.latency, w.throughput, w.power, w.footprint] }
+/// A goal's objective weights in one phase: the IO phase's objectives count with the storage
+/// weight, exactly as autotune weighs them, so the margin means the same in both.
+fn goal_wts(g: Goal, phase: Phase) -> [f64; 4] {
+    let w = Weights::for_goal(g);
+    let k = if phase == Phase::Io { w.storage } else { 1.0 };
+    [w.latency * k, w.throughput * k, w.power * k, w.footprint * k]
+}
 
 /// Every goal's utility over one phase's per-objective fits (no refit per goal).
-fn goal_models(space: &Arc<model::Space>, fits: &[Option<Arc<model::Fit>>; 4]) -> Vec<(Goal, Model)> {
-    Goal::ALL.iter().filter_map(|&g| Model::new(space.clone(), fits.clone(), goal_wts(g)).map(|m| (g, m))).collect()
+fn goal_models(space: &Arc<model::Space>, fits: &[Option<Arc<model::Fit>>; 4], phase: Phase) -> Vec<(Goal, Model)> {
+    Goal::ALL.iter().filter_map(|&g| Model::new(space.clone(), fits.clone(), goal_wts(g, phase)).map(|m| (g, m))).collect()
 }
 
 /// Per goal: the best combination, how much doubt is left in its decisions (and, with
@@ -598,8 +676,9 @@ fn goal_models(space: &Arc<model::Space>, fits: &[Option<Arc<model::Fit>>; 4]) -
 fn analyse(models: Vec<(Goal, Model)>, phase: Phase, factors: &[Factor], bad: &[Cfg], want: usize, pair_k: usize, crowd: usize, rng: &mut Rng) -> Option<Analysis> {
     let (r2, cover) = (models.first()?.1.r2(), models.first()?.1.cover90());
     let joints: Vec<(Goal, Joint)> = models.into_iter().map(|(g, m)| {
-        let (idle, load) = if phase == Phase::Idle { (Some(m), None) } else { (None, Some(m)) };
-        (g, Joint { idle, load, share: 0.5 })
+        let (mut idle, mut load, mut io) = (None, None, None);
+        match phase { Phase::Idle => idle = Some(m), Phase::Load => load = Some(m), Phase::Io => io = Some(m) }
+        (g, Joint { idle, load, io, share: 0.5 })
     }).collect();
     let keys: Vec<String> = factors.iter().map(|f| f.key.clone()).collect();
     let cands: Vec<Vec<(String, f64)>> = factors.iter().map(|f| {
@@ -649,7 +728,11 @@ fn save(cal: &Calibration) {
     let _ = lpm_helpers::write_root_file(calib::FILE, &serde_json::to_vec(&cal.to_json()).unwrap());
 }
 
-fn union_benches(its: &[&Item]) -> Benches {
+/// Benchmarks of a phase's runs: idle/load measure CPU, memory and (idle) power on every run,
+/// whatever the knobs, so every goal is decided from the same data; the IO phase runs the
+/// storage suite alone.
+fn union_benches(phase: Phase, its: &[&Item]) -> Benches {
+    if phase == Phase::Io { return Benches { io: true, ..Default::default() }; }
     let mut b = Benches { cpu_mem: true, cpu: true, ..Default::default() };
     for i in its { b.io |= i.benches.io; b.idle |= i.benches.idle; }
     b
@@ -740,14 +823,14 @@ impl Design<'_> {
 
 fn phase_analysis(cal: &Calibration, phase: Phase, factors: &[Factor], dp: &Depth, want: usize, rng: &mut Rng) -> Option<Analysis> {
     let pf = cal.phase_fit(phase)?;
-    analyse(goal_models(&pf.set.space, &pf.fits), phase, factors, &cal.unsafe_sets, want, dp.pairs, dp.crowd, rng)
+    analyse(goal_models(&pf.set.space, &pf.fits, phase), phase, factors, &cal.unsafe_sets, want, dp.pairs, dp.crowd, rng)
 }
 
 fn design_phase(cal: &mut Calibration, rn: &mut Runner, phase: Phase, its: &[&Item], budget: f64, dp: &Depth, kernel: &str, seed: u64, confirm: bool,
                 refs: &BTreeMap<String, String>) -> Result<(), String> {
-    let name = if phase == Phase::Idle { "idle" } else { "load" };
+    let name = phase.name();
     let mut factors: Vec<Factor> = its.iter().map(|i| Factor { key: i.key.clone(), reference: i.reference.clone(), values: i.values.clone() }).collect();
-    let bs = union_benches(its);
+    let bs = union_benches(phase, its);
     // vm.dirty's reference is window "1" (what autotune reads it as), not the live limits: every run of
     // this phase starts from it, so the reference runs are what the label says.
     let dirty_ok = tune::find("vm.dirty_bytes").map_or(false, |t| !tune::files(t).is_empty());
@@ -755,7 +838,7 @@ fn design_phase(cal: &mut Calibration, rn: &mut Runner, phase: Phase, its: &[&It
     let cost = est_secs(phase, bs, rn.c.scale).max(1.0);
     let n_total = ((budget / cost) as usize).clamp(12, dp.cap);
     let n_init = ((n_total as f64 * dp.init) as usize).clamp(8, n_total);
-    let sess = now() + (phase == Phase::Load) as u64;
+    let sess = now() + phase.idx() as u64;
     let mut rng = Rng::new(seed ^ sess);
     let mut d = Design { phase, bs, sess, n_total, kernel, refs, runs: Vec::new(), oom_left: 12, t0: Instant::now(), secs: budget, spent: 0.0 };
     let prior: Vec<Cfg> = cal.rows.iter().filter(|r| r.phase == phase).map(|r| r.cfg.clone()).collect();
@@ -838,7 +921,7 @@ fn design_phase(cal: &mut Calibration, rn: &mut Runner, phase: Phase, its: &[&It
                 let rows = compute_rows(&d.runs, phase, sess, kernel, n_total);
                 for (cfg, gs) in &uniq {
                     for (g, mu, sd) in gs {
-                        let ws = goal_wts(*g);
+                        let ws = goal_wts(*g, phase);
                         let obs: Vec<f64> = rows.iter().filter(|r| &r.cfg == cfg).map(|r| (0..4).map(|o| if r.y[o].is_nan() { 0.0 } else { ws[o] * r.y[o] }).sum()).collect();
                         if obs.is_empty() { continue; }
                         let m = obs.iter().sum::<f64>() / obs.len() as f64;
@@ -858,9 +941,9 @@ fn design_phase(cal: &mut Calibration, rn: &mut Runner, phase: Phase, its: &[&It
 
 /// Phases with at least two testable knobs and their share of the time budget (each knob gets a similar number of runs).
 fn split(items: &[Item], scale: f64, budget: f64) -> Vec<(Phase, Vec<&Item>, f64)> {
-    let mut v: Vec<(Phase, Vec<&Item>, f64)> = [Phase::Idle, Phase::Load].into_iter()
+    let mut v: Vec<(Phase, Vec<&Item>, f64)> = Phase::ALL.into_iter()
         .map(|ph| (ph, items.iter().filter(|i| i.phase == ph).collect::<Vec<_>>(), 0.0)).filter(|(_, its, _)| its.len() >= 2).collect();
-    let w: Vec<f64> = v.iter().map(|(ph, its, _)| its.len() as f64 * est_secs(*ph, union_benches(its), scale)).collect();
+    let w: Vec<f64> = v.iter().map(|(ph, its, _)| its.len() as f64 * est_secs(*ph, union_benches(*ph, its), scale)).collect();
     let sum: f64 = w.iter().sum();
     for (e, w) in v.iter_mut().zip(&w) { e.2 = if budget.is_finite() { budget * w / sum } else { f64::INFINITY }; }
     v
@@ -880,7 +963,7 @@ fn design_main(cal: &mut Calibration, items: &[Item], ctx: &Ctx, rate: u64, ram:
     for (ph, its, secs) in &phases {
         let pdp = if progressive {
             let p = progress(cal, *ph, &phase_factors(its));
-            eprintln!("\n{}: progressive stage {:?} - {}\n  log: {}", if *ph == Phase::Idle { "idle" } else { "load" }, p.stage(), p.stage().what(), p.line());
+            eprintln!("\n{}: progressive stage {:?} - {}\n  log: {}", ph.name(), p.stage(), p.stage().what(), p.line());
             Depth::progressive(p.stage(), its.len(), p.polish)
         } else { *dp };
         if let Err(e) = design_phase(cal, &mut rn, *ph, its, *secs, &pdp, kernel, seed, confirm, &refs) { eprintln!("\n{e}"); if STOP.load(Ordering::SeqCst) { break; } }
@@ -890,12 +973,12 @@ fn design_main(cal: &mut Calibration, items: &[Item], ctx: &Ctx, rate: u64, ram:
     save(cal);
     eprintln!();
     if STOP.load(Ordering::SeqCst) { println!("interrupted: measured runs are saved, everything is restored"); }
-    for ph in [Phase::Idle, Phase::Load] {
+    for ph in Phase::ALL {
         let its: Vec<&Item> = items.iter().filter(|i| i.phase == ph).collect();
         let Some(pf) = cal.phase_fit(ph) else { continue };
         let factors: Vec<Factor> = its.iter().map(|i| Factor { key: i.key.clone(), reference: i.reference.clone(), values: i.values.clone() }).collect();
-        let Some(an) = analyse(goal_models(&pf.set.space, &pf.fits), ph, &factors, &cal.unsafe_sets, 0, dp.pairs, dp.crowd, &mut Rng::new(seed)) else { continue };
-        println!("{}: {} run(s), model R² {:.2}, 90 % interval coverage {:.0} %, decision doubt {:.2}, interactions up to {}", if ph == Phase::Idle { "idle" } else { "load" },
+        let Some(an) = analyse(goal_models(&pf.set.space, &pf.fits, ph), ph, &factors, &cal.unsafe_sets, 0, dp.pairs, dp.crowd, &mut Rng::new(seed)) else { continue };
+        println!("{}: {} run(s), model R² {:.2}, 90 % interval coverage {:.0} %, decision doubt {:.2}, interactions up to {}", ph.name(),
                  pf.set.nrows(), an.r2, an.cover * 100.0, an.risk, if pf.set.space.order >= 3 { "triples" } else { "pairs" });
         for (g, cfg, mu, sd) in &an.optima { println!("  {:<30} {} change(s), predicted {:+.3} ± {:.3}", g.label(), cfg.len(), mu, sd); }
         if let Some(m) = cal.phase_model(ph, [1.0; 4]) { report_interactions(&m, 5, "  "); }
@@ -903,7 +986,7 @@ fn design_main(cal: &mut Calibration, items: &[Item], ctx: &Ctx, rate: u64, ram:
     if progressive {
         for (ph, its, _) in &phases {
             let p = progress(cal, *ph, &phase_factors(its));
-            println!("{}: next lean session: stage {:?} ({})", if *ph == Phase::Idle { "idle" } else { "load" }, p.stage(), p.line());
+            println!("{}: next lean session: stage {:?} ({})", ph.name(), p.stage(), p.line());
         }
     }
     println!("signature: {} design run(s) stored. `lpm-calibrate --show` for effects and interactions; run again to add evidence.", cal.rows.len());
@@ -913,9 +996,9 @@ fn design_main(cal: &mut Calibration, items: &[Item], ctx: &Ctx, rate: u64, ram:
 fn show_model(c: &Calibration) {
     if c.rows.is_empty() { return; }
     println!("\nexperiment log: {} run(s), {} unsafe combination(s)", c.rows.len(), c.unsafe_sets.len());
-    for ph in [Phase::Idle, Phase::Load] {
+    for ph in Phase::ALL {
         let Some(m) = c.phase_model(ph, [1.0; 4]) else { continue };
-        println!("  {:<5} {} knob(s), {} run(s), noise {:.3}, model R² {:.2}, 90 % interval coverage {:.0} %, interactions up to {}", if ph == Phase::Idle { "idle" } else { "load" },
+        println!("  {:<5} {} knob(s), {} run(s), noise {:.3}, model R² {:.2}, 90 % interval coverage {:.0} %, interactions up to {}", ph.name(),
                  m.space.factors.len(), m.nobs(), m.noise(), m.r2(), m.cover90() * 100.0, if m.space.order >= 3 { "triples" } else { "pairs" });
         report_interactions(&m, 8, "        ");
     }
@@ -931,10 +1014,10 @@ fn show(c: &Calibration) {
     for (k, gs) in &c.keys {
         for g in gs {
             for (v, s) in &g.values {
-                for ph in [Phase::Idle, Phase::Load] {
+                for ph in Phase::ALL {
                     let Some(m) = c.get_phase(k, &g.reference, v, ph) else { continue };
                     println!("  {k:<30} {:<24} {:<5} {} {} {} {} {:>5.1}{}", format!("{v} vs {}", g.reference),
-                             if ph == Phase::Idle { "idle" } else { "load" }, pct(m.lat), pct(m.thr), pct(m.pwr), pct(m.mem), m.n,
+                             ph.name(), pct(m.lat), pct(m.thr), pct(m.pwr), pct(m.mem), m.n,
                              if s.unsafe_ { "  UNSAFE (OOM kill)" } else { "" });
                 }
             }
@@ -968,17 +1051,21 @@ fn main() {
     let phase = opt("--phase").unwrap_or_else(|| "both".into());
     let budget = if flag("--all") { f64::INFINITY } else { opt("--budget").and_then(|s| s.parse::<f64>().ok()).unwrap_or(15.0) * 60.0 };
     let ram = bench::meminfo_kb("MemTotal:").unwrap_or(0) * 1024;
-    let (items, skipped) = plan(rounds, scale, ram, &only, &phase, &cal);
+    // The storage suite's disk: --dir, else the first of these on a local disk (not tmpfs).
+    let dir = opt("--dir").unwrap_or_else(|| ["/var/tmp", "/var/cache", "/home", "/"].iter()
+        .find(|d| bench::disk_of(d).is_ok()).unwrap_or(&"/var/tmp").to_string());
+    let disk = bench::disk_of(&dir);
+    let (items, skipped) = plan(rounds, scale, ram, &only, &phase, &cal, &disk);
     let total_secs: f64 = items.iter().map(|i| i.secs).sum();
     let depth_opt = opt("--depth");
     if let Some(d) = &depth_opt { if !["lean", "deep", "max"].contains(&d.as_str()) { die("--depth: lean, deep or max"); } }
-    let nf = [Phase::Idle, Phase::Load].iter().map(|ph| items.iter().filter(|i| i.phase == *ph).count()).max().unwrap_or(0);
+    let nf = Phase::ALL.iter().map(|ph| items.iter().filter(|i| i.phase == *ph).count()).max().unwrap_or(0);
     let dp = Depth::pick(budget / 60.0, nf, depth_opt.as_deref());
     // Short sessions without an explicit depth build on each other (see Stage).
     let progressive = depth_opt.is_none() && dp.name == "lean";
     if flag("--list") {
         for i in &items {
-            println!("  {:<5} {:<30} ref {:<20} try {:<40} ~{:>4.0} s  measured {}x", if i.phase == Phase::Idle { "idle" } else { "load" },
+            println!("  {:<5} {:<30} ref {:<20} try {:<40} ~{:>4.0} s  measured {}x", i.phase.name(),
                      i.key, i.reference, i.values.join(","), i.secs, cal.coverage(&i.key, i.phase));
         }
         if flag("--oat") {
@@ -989,7 +1076,7 @@ fn main() {
                 for (ph, its, _) in split(&items, scale, budget) {
                     let p = progress(&cal, ph, &phase_factors(&its));
                     let d = Depth::progressive(p.stage(), its.len(), p.polish);
-                    println!("  {:<5} progressive stage {:?} ({}): {}\n        log: {}", if ph == Phase::Idle { "idle" } else { "load" }, p.stage(), d.name, p.stage().what(), p.line());
+                    println!("  {:<5} progressive stage {:?} ({}): {}\n        log: {}", ph.name(), p.stage(), d.name, p.stage().what(), p.line());
                 }
                 println!("  (lean sessions build on each other; --depth lean runs the fixed lean shape)");
             }
@@ -999,12 +1086,13 @@ fn main() {
                      dp.batch, dp.reps, if dp.pairs > 0 { format!(", up to {} doubtful interactions chased", dp.pairs) } else { String::new() },
                      if dp.ladder > 0 { format!(", up to {} dose refinements", dp.ladder) } else { String::new() }); }
             for (ph, its, secs) in split(&items, scale, budget) {
-                let cost = est_secs(ph, union_benches(&its), scale).max(1.0);
+                let cost = est_secs(ph, union_benches(ph, &its), scale).max(1.0);
                 let logged = cal.rows.iter().filter(|r| r.phase == ph).count();
-                println!("  {:<5} {} knob(s), ~{:.0} s per run, up to {} runs in {:.0} min ({} logged; interactions: all pairs{})", if ph == Phase::Idle { "idle" } else { "load" }, its.len(), cost,
+                println!("  {:<5} {} knob(s), ~{:.0} s per run, up to {} runs in {:.0} min ({} logged; interactions: all pairs{})", ph.name(), its.len(), cost,
                          ((secs / cost) as usize).clamp(12, dp.cap), secs.min(1e6) / 60.0, logged,
                          format!(", all triples from {} runs", 150.max(4 * its.len())));
             }
+            match &disk { Ok(d) => println!("storage suite on {dir} ({d}); --dir PATH measures another disk"), Err(e) => println!("storage suite off: {e}") }
             println!("sequential design: every run changes several knobs; the runs stop early once the decisions are settled. Not tested:");
         }
         for (k, w) in &skipped { println!("  {k:<32} {w}"); }
@@ -1037,13 +1125,18 @@ fn main() {
     let src = bench::power_source();
     let ctx = Ctx {
         exe: std::env::current_exe().unwrap_or_else(|_| die("cannot find own executable")),
-        dir: opt("--dir").unwrap_or_else(|| "/var/tmp".into()),
+        dir: dir.clone(),
+        disk: disk.clone().ok(),
         io_size: if thorough { 512 } else { 256 } << 20,
         scale,
         battery: src == "battery",
     };
     let rate = lpm_helpers::iorate::gather().bps;
     if src != "battery" { eprintln!("note: on AC — power is RAPL (CPU package) only; device-level power needs a run on battery"); }
+    match &ctx.disk {
+        Some(d) => eprintln!("storage suite: {} on {d} ({} MiB written per IO run, unlinked temp files)", ctx.dir, ctx.io_size * 3 / 2 >> 20),
+        None => eprintln!("storage suite off: {}", disk.as_ref().err().map_or("", String::as_str)),
+    }
     cal.on_battery = src == "battery";
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_owned();
 
@@ -1062,6 +1155,8 @@ fn main() {
     let mut chosen = Vec::new();
     let mut spent = 0.0;
     for i in items {
+        // The legacy flow keeps idle/load records only; storage is calibrated by the design.
+        if i.phase == Phase::Io { continue; }
         if spent > 0.0 && spent + i.secs > budget { continue; }
         spent += i.secs;
         chosen.push(i);
@@ -1106,7 +1201,8 @@ fn main() {
                     let _ = j.restore();
                     continue;
                 }
-                let r = match it.phase { Phase::Idle => run_idle(it.benches, &ctx).map(|s| (s, false)), Phase::Load => run_load(it.benches, &ctx) };
+                let r = match it.phase { Phase::Idle => run_idle(it.benches, &ctx).map(|s| (s, false)), Phase::Load => run_load(it.benches, &ctx),
+                                         Phase::Io => run_io(&ctx).map(|s| (s, false)) };
                 match r {
                     Ok((s, oom)) => { if oom && *v != it.reference { unsafe_vals.push(v.clone()); } samples.entry(v.clone()).or_default().push(s); }
                     Err(e) => eprintln!("\n{}: {v}: {e}", it.key),
@@ -1132,8 +1228,8 @@ fn main() {
     let _ = lpm_helpers::secure_dir(lpm_helpers::defaults::DIR);
     if let Err(e) = lpm_helpers::write_root_file(calib::FILE, &serde_json::to_vec(&cal.to_json()).unwrap()) { die(&format!("save: {e}")); }
     if STOP.load(Ordering::SeqCst) { println!("interrupted: measured knobs are saved, everything is restored"); }
-    let (left, _) = plan(rounds, scale, ram, &None, "both", &cal);
-    let uncovered = left.iter().filter(|i| cal.coverage(&i.key, i.phase) == 0).count();
+    let (left, _) = plan(rounds, scale, ram, &None, "both", &cal, &disk);
+    let uncovered = left.iter().filter(|i| i.phase != Phase::Io && cal.coverage(&i.key, i.phase) == 0).count();
     println!("signature: {} key(s) measured; {uncovered} measurement(s) never run yet. `lpm-calibrate --show` for details; run again to extend/refine it.",
              cal.keys.len());
     println!("autotune uses it on its next run (GUI Autotune or lpm-autotune <goal>).");
@@ -1150,8 +1246,33 @@ mod tests {
         assert_eq!(runs_for(3, 1), 5);
         assert_eq!(runs_for(3, 2), 9);
         let cpu = Benches { cpu: true, idle: true, ..Default::default() };
-        // A CPU knob with 3 candidates: was 2 x 4 runs x 8.5 s = 68 s, now 5 x 5.1 s.
-        assert!(est_secs(Phase::Idle, cpu, 1.0) * runs_for(3, 1) as f64 <= 26.0);
+        // A CPU knob with 3 candidates: was 2 x 4 runs x 8.5 s = 68 s, now 5 x 5.4 s (frame probe included).
+        assert!(est_secs(Phase::Idle, cpu, 1.0) * runs_for(3, 1) as f64 <= 28.0);
+        assert!(est_secs(Phase::Io, Benches { io: true, ..Default::default() }, 1.0) < 6.0);
+        assert!(selects("@io", "blk.read_ahead_kb", "Storage") && selects("@io", "vm.dirty", "Memory") && !selects("@io", "vm.swappiness", "Memory"));
+        assert_eq!(union_benches(Phase::Io, &[]), Benches { io: true, ..Default::default() });
+    }
+
+    fn run(cfg: Cfg, s: &[(Metric, f64)]) -> Run { Run { cfg, s: s.iter().copied().collect(), order: 0, t: 0, w: 1.0 } }
+
+    #[test]
+    fn noisy_metrics_weigh_less_inside_their_objective() {
+        // Reference runs: wake tail scatters +-30 %, frame tail +-2 %.
+        let refs: Vec<Run> = [1.0, 1.3, 0.75, 1.25, 0.8, 1.0].iter().zip([1.0, 1.02, 0.98, 1.01, 0.99, 1.0])
+            .map(|(a, b)| run(vec![], &[(Metric::WakeP99Us, 100.0 * a), (Metric::FrameP99Us, 500.0 * b)])).collect();
+        let r: Vec<&Run> = refs.iter().collect();
+        let w = metric_weights(&r, &[Metric::WakeP99Us, Metric::FrameP99Us]);
+        // Two metrics, one far noisier: the shrinkage settles at 3:1 (1.5 / 0.5 of the equal share).
+        assert!(w[&Metric::FrameP99Us] > 1.45 && w[&Metric::WakeP99Us] < 0.55, "{w:?}");
+        // Too few references: equal weights.
+        let w2 = metric_weights(&r[..3], &[Metric::WakeP99Us, Metric::FrameP99Us]);
+        assert_eq!(w2[&Metric::WakeP99Us], 1.0);
+        // A run 10 % better on the steady metric only now shows clearly more than half of it.
+        let mut runs = refs;
+        runs.push(run(vec![("k".into(), "1".into())], &[(Metric::WakeP99Us, 100.0), (Metric::FrameP99Us, 450.0)]));
+        let rows = compute_rows(&runs, Phase::Idle, 1, "", 10);
+        let y = rows.last().unwrap().y[0];
+        assert!(y > 0.07, "{y}");
     }
     #[test]
     fn depth_grows_with_budget_and_ladders_refine_doses() {
@@ -1268,7 +1389,7 @@ mod sim {
         let an_of = |runs: &[(Cfg, f64)], want: usize, rng: &mut Rng| -> Option<Analysis> {
             let ps = PhaseSet::build(fs.to_vec(), rows(runs))?;
             let fits = std::array::from_fn(|o| ps.fit_obj(o, None, 1));
-            analyse(goal_models(&ps.space, &fits), Phase::Load, fs, &[], want, 0, 6, rng)
+            analyse(goal_models(&ps.space, &fits, Phase::Load), Phase::Load, fs, &[], want, 0, 6, rng)
         };
         let mut last: Option<Cfg> = None;
         while runs.len() + 6 <= budget {

@@ -21,6 +21,17 @@ pub fn p99(v: &mut Vec<f64>) -> Option<f64> {
     Some(v[((v.len() as f64 * 0.99) as usize).min(v.len() - 1)])
 }
 
+/// Latency tail of one window: the mean of the worst 1 % of the samples, at least 5 (all of
+/// a smaller sample) - the expected shortfall at p99. A single order statistic of a short
+/// window jitters far more than the effects being measured (p99 of 40 fsyncs is simply the
+/// maximum); the mean of the worst few keeps the tail's meaning at a fraction of the noise.
+pub fn tail(v: &mut Vec<f64>) -> Option<f64> {
+    if v.is_empty() { return None; }
+    v.sort_by(|a, b| b.total_cmp(a));
+    let k = ((v.len() as f64 * 0.01).ceil() as usize).max(5).min(v.len());
+    Some(v[..k].iter().sum::<f64>() / k as f64)
+}
+
 fn anon(len: usize) -> Option<&'static mut [u8]> {
     let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
                                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
@@ -60,7 +71,7 @@ pub fn wake_p99_us(dur: Duration) -> Option<f64> {
     }
     stop.store(true, Ordering::Relaxed);
     let _ = churn.join();
-    p99(&mut lat)
+    tail(&mut lat)
 }
 
 fn smaps_kb(field: &str) -> Option<f64> {
@@ -113,7 +124,7 @@ fn fault_in(m: &mut [u8]) -> (Option<f64>, f64) {
         for i in (chunk..(chunk + 2 * MIB).min(m.len())).step_by(4096) { m[i] = 1; }
         per.push(a.elapsed().as_nanos() as f64 / 1000.0);
     }
-    (p99(&mut per), t0.elapsed().as_secs_f64() * 1000.0)
+    (tail(&mut per), t0.elapsed().as_secs_f64() * 1000.0)
 }
 
 /// Runs inside the disposable child (`lpm-calibrate __probe`): sparse heap footprint, dense
@@ -222,9 +233,97 @@ fn tmpfile(dir: &str, direct: bool) -> std::io::Result<std::fs::File> {
         .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC | if direct { libc::O_DIRECT } else { 0 }).open(dir)
 }
 
-/// Buffered streaming write (with an fsync prober alongside), cold sequential
-/// read, 4 KiB O_DIRECT random reads. `size` bytes on `dir`'s file system.
+fn dev_split(dev: u64) -> (u64, u64) { (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff), (dev & 0xff) | ((dev >> 12) & !0xff)) }
+
+/// Whole disk (nvme0n1, sda, ...) holding `dir`'s file system: the mount from mountinfo
+/// (btrfs and overlay report an anonymous st_dev), through device-mapper / md slaves (LUKS,
+/// LVM, RAID: the first member) and partitions. Err for tmpfs, network and other file systems
+/// without a local disk: the storage benchmark would measure RAM or the network there.
+pub fn disk_of(dir: &str) -> Result<String, String> {
+    let path = std::fs::canonicalize(dir).map_err(|e| format!("{dir}: {e}"))?;
+    let mi = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| format!("mountinfo: {e}"))?;
+    let unesc = |s: &str| s.replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\");
+    let mut best: Option<(usize, String, String, String)> = None;
+    for l in mi.lines() {
+        let Some((pre, post)) = l.split_once(" - ") else { continue };
+        let f: Vec<&str> = pre.split_whitespace().collect();
+        let g: Vec<&str> = post.split_whitespace().collect();
+        if f.len() < 5 || g.len() < 2 { continue; }
+        let mp = unesc(f[4]);
+        if !path.starts_with(&mp) { continue; }
+        // Later lines win on the same mount point (stacked mounts).
+        if best.as_ref().map_or(true, |b| mp.len() >= b.0) { best = Some((mp.len(), f[2].to_owned(), g[0].to_owned(), unesc(g[1]))); }
+    }
+    let (_, majmin, fstype, source) = best.ok_or_else(|| format!("{dir}: no mount found"))?;
+    if ["tmpfs", "ramfs", "devtmpfs", "overlay", "nfs", "nfs4", "cifs", "smb3", "9p", "virtiofs", "zfs", "squashfs", "fuse"].contains(&fstype.as_str()) {
+        return Err(format!("{dir} is on {fstype}, not on a local disk"));
+    }
+    let mut mm = majmin.clone();
+    if mm.starts_with("0:") {
+        use std::os::unix::fs::MetadataExt;
+        let rdev = std::fs::metadata(&source).map_err(|_| format!("{dir}: {fstype} on {source}, no block device"))?.rdev();
+        let (a, b) = dev_split(rdev);
+        if a == 0 { return Err(format!("{dir}: {fstype} on {source}, no block device")); }
+        mm = format!("{a}:{b}");
+    }
+    let mut node = std::fs::canonicalize(format!("/sys/dev/block/{mm}")).map_err(|_| format!("{dir}: block device {mm} not in sysfs"))?;
+    for _ in 0..8 {
+        if node.join("partition").is_file() { node = node.parent().map(|p| p.to_path_buf()).unwrap_or(node); continue; }
+        let slave = std::fs::read_dir(node.join("slaves")).ok().and_then(|d| d.flatten().map(|e| e.file_name()).min());
+        match slave {
+            Some(sl) => node = std::fs::canonicalize(std::path::Path::new("/sys/class/block").join(sl)).map_err(|e| e.to_string())?,
+            None => break,
+        }
+    }
+    let name = node.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if crate::tune::block_devs().iter().any(|d| d.file_name().map_or(false, |n| n.to_string_lossy() == name)) { Ok(name) }
+    else { Err(format!("{dir} is on {name}, which the Storage rows do not cover")) }
+}
+
+/// Busy CPU time of the whole machine (user, system, irq, softirq; µs) from /proc/stat:
+/// block-layer completion work runs in interrupt context, outside any process's own time.
+fn busy_cpu_us() -> Option<f64> {
+    let st = std::fs::read_to_string("/proc/stat").ok()?;
+    let f: Vec<u64> = st.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+    if f.len() < 7 { return None; }
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    Some((f[0] + f[1] + f[2] + f[5] + f[6]) as f64 * 1e6 / hz)
+}
+
+/// 4 KiB O_DIRECT reads at random page offsets of `fd` (queue depth 1) until `max_n` reads,
+/// `until` or `stop`: latency of each in µs.
+fn rand_reads(fd: i32, pages: u64, max_n: usize, until: Instant, seed: u64, stop: Option<&AtomicBool>) -> Vec<f64> {
+    let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+    let p = unsafe { std::alloc::alloc(layout) };
+    if p.is_null() || pages == 0 { return Vec::new(); }
+    let mut x = seed | 1;
+    let mut lat = Vec::with_capacity(max_n.min(1 << 16));
+    while lat.len() < max_n && Instant::now() < until && !stop.map_or(false, |s| s.load(Ordering::Relaxed)) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        let off = (x % pages) * 4096;
+        let a = Instant::now();
+        if unsafe { libc::pread(fd, p as *mut libc::c_void, 4096, off as libc::off_t) } != 4096 { break; }
+        lat.push(a.elapsed().as_nanos() as f64 / 1000.0);
+    }
+    unsafe { std::alloc::dealloc(p, layout) };
+    lat
+}
+
+/// Storage suite for the Storage rows and the dirty window: `size` bytes on `dir`'s disk.
+///  * streaming buffered write + fsync, a 4 KiB fsync prober every 10 ms alongside
+///    (WriteMbs; FsyncP99Ms = what a save waits for behind a big write);
+///  * cold sequential read in 128 KiB reads (ReadMbs: read-ahead, merging);
+///  * 4 KiB O_DIRECT random reads at queue depth 1 (RandReadP99Us);
+///  * the same from several threads at once (IopsK; IoCpuUs = busy CPU per read, interrupt
+///    time included: accounting, entropy hook, merge lookups, completion placement);
+///  * random reads while a second writer streams and commits (MixedReadP99Us: asset loading
+///    during a download or a shader-cache write - writeback throttling, scheduler, queue depth);
+///  * random first touches of a cold mmap of the file (MmapFaultP99Us; RaFootprintMib = page
+///    cache the fault read-around brought in, i.e. what read-ahead costs a program that maps
+///    a big pack and touches it sparsely).
+/// Every file is an unlinked O_TMPFILE: nothing is left behind.
 pub fn io(dir: &str, size: usize, s: &mut Sample) -> Result<(), String> {
+    let size = size.max(16 * MIB) / MIB * MIB;
     let mut f = tmpfile(dir, false).map_err(|e| format!("{dir}: {e}"))?;
     let stop = Arc::new(AtomicBool::new(false));
     let s2 = stop.clone();
@@ -238,7 +337,7 @@ pub fn io(dir: &str, size: usize, s: &mut Sample) -> Result<(), String> {
             let a = Instant::now();
             if g.write_all(&buf).is_err() || g.sync_data().is_err() { break; }
             lat.push(a.elapsed().as_secs_f64() * 1000.0);
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(10));
         }
         lat
     });
@@ -254,7 +353,7 @@ pub fn io(dir: &str, size: usize, s: &mut Sample) -> Result<(), String> {
     let mut fl = prober.join().unwrap_or_default();
     res?;
     s.insert(Metric::WriteMbs, size as f64 / MIB as f64 / wsecs);
-    if let Some(p) = p99(&mut fl) { s.insert(Metric::FsyncP99Ms, p); }
+    if let Some(p) = tail(&mut fl) { s.insert(Metric::FsyncP99Ms, p); }
     // Cold read: clean pages dropped from the cache, 128 KiB reads so read-ahead matters.
     unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED); }
     let _ = f.seek(SeekFrom::Start(0));
@@ -263,24 +362,71 @@ pub fn io(dir: &str, size: usize, s: &mut Sample) -> Result<(), String> {
     let mut got = 0usize;
     while got < size { match f.read(&mut rb) { Ok(0) | Err(_) => break, Ok(n) => got += n } }
     s.insert(Metric::ReadMbs, got as f64 / MIB as f64 / t1.elapsed().as_secs_f64());
-    // Random 4 KiB direct reads through /proc/self/fd (the file has no name).
-    if let Ok(g) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT)
-        .open(format!("/proc/self/fd/{}", f.as_raw_fd())) {
-        let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
-        let p = unsafe { std::alloc::alloc(layout) };
-        if !p.is_null() {
-            let mut lat = Vec::with_capacity(2000);
-            let pages = (size / 4096) as u64;
-            for _ in 0..2000 {
-                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-                let off = (x % pages) * 4096;
-                let a = Instant::now();
-                if unsafe { libc::pread(g.as_raw_fd(), p as *mut libc::c_void, 4096, off as libc::off_t) } != 4096 { break; }
-                lat.push(a.elapsed().as_nanos() as f64 / 1000.0);
-            }
-            unsafe { std::alloc::dealloc(p, layout) };
-            if let Some(v) = p99(&mut lat) { s.insert(Metric::RandReadP99Us, v); }
+    let pages = (size / 4096) as u64;
+    // Direct reads through /proc/self/fd (the file has no name). Without O_DIRECT (some file
+    // systems refuse it) only the buffered figures are taken.
+    if let Ok(g) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(format!("/proc/self/fd/{}", f.as_raw_fd())) {
+        let fd = g.as_raw_fd();
+        let mut lat = rand_reads(fd, pages, 1500, Instant::now() + Duration::from_secs(2), 0x5EED_0101, None);
+        if let Some(v) = tail(&mut lat) { s.insert(Metric::RandReadP99Us, v); }
+        // Parallel: completion work, accounting and lock contention scale with the request rate.
+        let threads = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).clamp(2, 16);
+        let (c0, t2) = (busy_cpu_us(), Instant::now());
+        let until = t2 + Duration::from_millis(600);
+        let hs: Vec<_> = (0..threads as u64).map(|i| std::thread::spawn(move || rand_reads(fd, pages, usize::MAX, until, 0x5EED_0200 + i, None).len())).collect();
+        let n: usize = hs.into_iter().map(|h| h.join().unwrap_or(0)).sum();
+        let (c1, secs) = (busy_cpu_us(), t2.elapsed().as_secs_f64());
+        if n > 0 {
+            s.insert(Metric::IopsK, n as f64 / secs / 1000.0);
+            if let (Some(a), Some(b)) = (c0, c1) { if b > a { s.insert(Metric::IoCpuUs, (b - a) / n as f64); } }
         }
+        // Mixed: a second writer streams 1 MiB writes and commits every 16 MiB (a download or
+        // installer) while the reader keeps reading; only reads issued while it writes count.
+        let wstop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ws, wn, d3, wbuf) = (wstop.clone(), written.clone(), dir.to_owned(), buf.clone());
+        let wmax = (size / 2).max(32 * MIB);
+        let writer = std::thread::spawn(move || {
+            let Ok(mut b) = tmpfile(&d3, false) else { ws.store(true, Ordering::Relaxed); return };
+            let mut done = 0usize;
+            while done < wmax && !ws.load(Ordering::Relaxed) {
+                if b.write_all(&wbuf).is_err() { break; }
+                done += MIB;
+                wn.store(done, Ordering::Relaxed);
+                if done % (16 * MIB) == 0 && b.sync_data().is_err() { break; }
+            }
+            let _ = b.sync_data();
+            ws.store(true, Ordering::Relaxed);
+        });
+        let t3 = Instant::now();
+        while written.load(Ordering::Relaxed) < 16 * MIB && !wstop.load(Ordering::Relaxed) && t3.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut mixed = rand_reads(fd, pages, 4000, Instant::now() + Duration::from_secs(3), 0x5EED_0300, Some(&wstop));
+        wstop.store(true, Ordering::Relaxed);
+        let _ = writer.join();
+        if mixed.len() >= 20 { if let Some(v) = tail(&mut mixed) { s.insert(Metric::MixedReadP99Us, v); } }
+    }
+    // Cold mmap, sparse touches: each fault reads around it as far as read-ahead allows.
+    unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED); }
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+    if p != libc::MAP_FAILED {
+        let mut lat = Vec::with_capacity(256);
+        let mut acc = 0u8;
+        for _ in 0..256 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let off = (x % pages) as usize * 4096;
+            let a = Instant::now();
+            acc ^= unsafe { std::ptr::read_volatile((p as *const u8).add(off)) };
+            lat.push(a.elapsed().as_nanos() as f64 / 1000.0);
+        }
+        std::hint::black_box(acc);
+        if let Some(v) = tail(&mut lat) { s.insert(Metric::MmapFaultP99Us, v); }
+        let mut vec = vec![0u8; size / 4096];
+        if unsafe { libc::mincore(p, size, vec.as_mut_ptr()) } == 0 {
+            s.insert(Metric::RaFootprintMib, vec.iter().filter(|b| **b & 1 != 0).count() as f64 * 4096.0 / MIB as f64);
+        }
+        unsafe { libc::munmap(p, size); }
     }
     Ok(())
 }
@@ -385,8 +531,24 @@ mod tests {
         let mut s = Sample::new();
         io("/tmp", 16 << 20, &mut s).unwrap();
         assert!(s[&Metric::WriteMbs] > 0.0 && s[&Metric::ReadMbs] > 0.0);
+        assert!(s.get(&Metric::RaFootprintMib).map_or(false, |m| *m > 0.0) && s.contains_key(&Metric::MmapFaultP99Us));
         assert!(wake_p99_us(Duration::from_millis(200)).is_some());
+        assert!(frame_tail_us(Duration::from_millis(120)).map_or(false, |v| v > 0.0));
         assert_eq!(p99(&mut vec![]), None);
+        assert_eq!(tail(&mut vec![]), None);
+        // Worst 1 %, at least 5: 1000 samples -> the 10 largest; 8 samples -> the 5 largest.
+        let mut v: Vec<f64> = (1..=1000).map(|x| x as f64).collect();
+        assert!((tail(&mut v).unwrap() - 995.5).abs() < 1e-9);
+        let mut w: Vec<f64> = (1..=8).map(|x| x as f64).collect();
+        assert!((tail(&mut w).unwrap() - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn disk_of_refuses_ram_file_systems() {
+        // /dev/shm is tmpfs on every Linux system that has it.
+        if std::path::Path::new("/dev/shm").is_dir() { assert!(disk_of("/dev/shm").is_err()); }
+        assert_eq!(dev_split((259u64 << 8) | 3), (259, 3));
+        assert_eq!(dev_split(((300u64 & 0xfff) << 8) | ((1000u64 & 0xff) | ((1000u64 & !0xff) << 12))), (300, 1000));
     }
 
     #[test]
@@ -545,7 +707,7 @@ pub fn pingpong_p99_us(rounds: usize) -> Option<f64> {
         let burst = std::thread::spawn(move || pingpong_burst(rounds / 4 + 8)).join().ok().flatten()?;
         lat.extend(burst.into_iter().skip(8));
     }
-    p99(&mut lat)
+    tail(&mut lat)
 }
 
 fn pingpong_burst(rounds: usize) -> Option<Vec<f64>> {
@@ -572,4 +734,49 @@ fn pingpong_burst(rounds: usize) -> Option<Vec<f64>> {
     let _ = echo.join();
     unsafe { for fd in [ar, aw, br, bw] { libc::close(fd); } }
     Some(lat)
+}
+
+fn mono_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts); }
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+/// Work of one frame: fixed (never scaled to the clock), so a core that is still ramping up
+/// takes visibly longer. About 0.3 ms at 5 GHz.
+const FRAME_WORK: u64 = 250_000;
+const FRAME_NS: i64 = 4_000_000;
+
+/// Burst response tail (µs): a thread wakes every 4 ms (240 Hz) on an absolute deadline, runs
+/// a fixed piece of work over a 256 KiB working set and records deadline -> work done. That is
+/// what a game's frame loop or a compositor meets: timer wake-up, C-state exit and how fast the
+/// clock comes up for a short burst after idling (EPP, boost, idle governor, wake-up latency
+/// QoS). A bare sleep (wake p99) or a sustained spin (1-thread work) each see only part of it.
+/// Three fresh threads one after another, so one placement does not decide the run; a missed
+/// deadline is recorded and the loop re-aligns to the next period.
+pub fn frame_tail_us(dur: Duration) -> Option<f64> {
+    let mut all = Vec::with_capacity(512);
+    for i in 0..3u64 {
+        let part = std::thread::spawn(move || {
+            let buf = vec![1u8; 256 * 1024];
+            let mut v = Vec::with_capacity(256);
+            let mut next = mono_ns() + FRAME_NS;
+            let end = next + (dur / 3).as_nanos() as i64;
+            let mut acc = i;
+            while next < end {
+                let t = libc::timespec { tv_sec: (next / 1_000_000_000) as libc::time_t, tv_nsec: (next % 1_000_000_000) as libc::c_long };
+                unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &t, std::ptr::null_mut()); }
+                acc = spin(FRAME_WORK, acc);
+                for j in (0..buf.len()).step_by(64) { acc = acc.wrapping_add(unsafe { std::ptr::read_volatile(buf.as_ptr().add(j)) } as u64); }
+                let done = mono_ns();
+                v.push((done - next).max(0) as f64 / 1000.0);
+                next += FRAME_NS;
+                if done >= next { next += ((done - next) / FRAME_NS + 1) * FRAME_NS; }
+            }
+            std::hint::black_box(acc);
+            v
+        });
+        all.extend(part.join().unwrap_or_default());
+    }
+    tail(&mut all)
 }

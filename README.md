@@ -151,7 +151,7 @@ lpm-autotune gaming --save           # save it as "Auto Gaming"
 sudo lpm-autotune probe              # measure disk write speed (<= 512 MiB, <= 4 s)
 lpm-autotune audit [--fix]           # find/repair unsafe values in scenes and presets
 lpm-autotune report [SECONDS]        # memory, THP, writeback, PSI, vmstat deltas
-sudo lpm-calibrate [--budget MIN]    # measure the machine: knobs, their pair/triple interactions and THP (sequential design; depth grows with the budget), idle + under load
+sudo lpm-calibrate [--budget MIN]    # measure the machine: knobs, their pair/triple interactions and THP (sequential design; depth grows with the budget), idle, under load and on the disk (storage suite)
 ```
 
 After updating from an older version run `lpm-autotune audit --fix`, then

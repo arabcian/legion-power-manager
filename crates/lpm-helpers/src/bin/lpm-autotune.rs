@@ -9,7 +9,7 @@
 //!                                              deltas over SECONDS (default 10), for bug reports
 //!
 //! goal: powersave | gaming | throughput | desktop
-//! weights: latency, throughput, power, footprint, stability (0..3; stability >= 0.5)
+//! weights: latency, throughput, power, footprint, stability, storage (0..3; stability >= 0.5)
 //! --save writes ~/.config/legion-power-manager/tune-presets/<NAME>.json.
 //! Nothing is applied here. Runs unprivileged (except probe).
 

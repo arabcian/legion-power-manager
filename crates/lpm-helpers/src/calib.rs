@@ -21,9 +21,14 @@
 //! scales per phase and objective are kept (`hyp`), so autotune reuses them
 //! instead of searching again.
 //!
-//! Two phases: IDLE (quiet machine) and LOAD (ballast holding memory near a
-//! safe headroom, churning allocations, half the CPUs busy). Stability risk is
-//! never taken from a benchmark; a candidate that caused an OOM kill is unsafe.
+//! Three phases: IDLE (quiet machine), LOAD (ballast holding memory near a
+//! safe headroom, churning allocations, half the CPUs busy) and IO (the storage
+//! suite on a local disk, for the Storage rows and the dirty window). Each knob
+//! belongs to the phases whose benchmarks can see it, and the I/O knobs only to IO:
+//! storage metrics no longer dilute the CPU/memory objectives (nor their noise the
+//! CPU/memory knobs), and the I/O objectives are weighed per goal by its storage
+//! weight. Stability risk is never taken from a benchmark; a candidate that caused
+//! an OOM kill is unsafe.
 
 use crate::model::{self, Cfg, Factor, Fit, Hyper, Joint, Model, PhaseSet};
 use serde_json::{json, Map, Value};
@@ -61,39 +66,58 @@ pub enum Metric {
     TlbHugeNs,      // the same over a MADV_HUGEPAGE heap: what THP gives programs that opt in (throughput, lower better)
     ShmRandNs,      // the same over shared memory (memfd): THP shmem_enabled (throughput, lower better)
     FaultHugeP99Us, // fault time p99 per 2 MiB of a MADV_HUGEPAGE heap: defrag/compaction stalls (latency, lower better)
+    FrameP99Us,     // 240 Hz frame loop: deadline -> fixed work done, tail (latency: wake-up + clock ramp, lower better)
+    MixedReadP99Us, // 4 KiB direct random read tail while another writer streams and commits (latency, lower better)
+    MmapFaultP99Us, // first-touch fault tail on a cold mmap of a file (latency, lower better)
+    IopsK,          // 4 KiB direct random reads per second from several threads, thousands (throughput, higher better)
+    IoCpuUs,        // busy CPU time (irq included) per random read (power, lower better)
+    RaFootprintMib, // page cache brought in by sparse mmap touches: read-around waste (footprint, lower better)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Objective { Lat, Thr, Pwr, Mem }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase { Idle, Load }
+pub enum Phase { Idle, Load, Io }
+
+impl Phase {
+    pub const ALL: [Phase; 3] = [Phase::Idle, Phase::Load, Phase::Io];
+    pub fn idx(self) -> usize { match self { Phase::Idle => 0, Phase::Load => 1, Phase::Io => 2 } }
+    pub fn from_idx(i: u64) -> Phase { match i { 0 => Phase::Idle, 2 => Phase::Io, _ => Phase::Load } }
+    pub fn name(self) -> &'static str { match self { Phase::Idle => "idle", Phase::Load => "load", Phase::Io => "io" } }
+}
+
+/// Keys measured by the storage suite (IO phase only).
+pub fn io_key(key: &str) -> bool { key == "vm.dirty" || key.starts_with("blk.") }
 
 impl Metric {
-    pub const ALL: [Metric; 21] = [Metric::WakeP99Us, Metric::FaultP99Us, Metric::FsyncP99Ms, Metric::RandReadP99Us,
+    pub const ALL: [Metric; 27] = [Metric::WakeP99Us, Metric::FaultP99Us, Metric::FsyncP99Ms, Metric::RandReadP99Us,
         Metric::PingPongP99Us, Metric::StallsPerSec, Metric::MemBwGbs, Metric::AllocMs, Metric::WriteMbs, Metric::ReadMbs,
         Metric::ThpPct, Metric::CpuSingle, Metric::CpuMulti, Metric::IdleW, Metric::PkgW, Metric::CpuEff, Metric::ProbeRssMib,
-        Metric::TlbRandNs, Metric::TlbHugeNs, Metric::ShmRandNs, Metric::FaultHugeP99Us];
+        Metric::TlbRandNs, Metric::TlbHugeNs, Metric::ShmRandNs, Metric::FaultHugeP99Us, Metric::FrameP99Us, Metric::MixedReadP99Us,
+        Metric::MmapFaultP99Us, Metric::IopsK, Metric::IoCpuUs, Metric::RaFootprintMib];
     pub fn objective(self) -> Objective {
         use Metric::*;
         match self {
-            WakeP99Us | FaultP99Us | FsyncP99Ms | RandReadP99Us | PingPongP99Us | StallsPerSec | FaultHugeP99Us => Objective::Lat,
-            MemBwGbs | AllocMs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | TlbRandNs | TlbHugeNs | ShmRandNs => Objective::Thr,
-            IdleW | PkgW | CpuEff => Objective::Pwr,
-            ProbeRssMib => Objective::Mem,
+            WakeP99Us | FaultP99Us | FsyncP99Ms | RandReadP99Us | PingPongP99Us | StallsPerSec | FaultHugeP99Us | FrameP99Us
+            | MixedReadP99Us | MmapFaultP99Us => Objective::Lat,
+            MemBwGbs | AllocMs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | TlbRandNs | TlbHugeNs | ShmRandNs | IopsK => Objective::Thr,
+            IdleW | PkgW | CpuEff | IoCpuUs => Objective::Pwr,
+            ProbeRssMib | RaFootprintMib => Objective::Mem,
         }
     }
     /// Smallest relative change that counts as real in the one-at-a-time path. p99 tails
     /// jitter far more than means and counters.
     pub fn noise_floor(self) -> f64 {
         use Metric::*;
-        match self { WakeP99Us | FaultP99Us | FsyncP99Ms | RandReadP99Us | PingPongP99Us | FaultHugeP99Us => 0.05, _ => 0.02 }
+        match self { WakeP99Us | FaultP99Us | FsyncP99Ms | RandReadP99Us | PingPongP99Us | FaultHugeP99Us | FrameP99Us | MixedReadP99Us
+                     | MmapFaultP99Us => 0.05, _ => 0.02 }
     }
     /// Offset that keeps log-ratios finite for counters that can be zero.
     pub fn eps(self) -> f64 { match self { Metric::StallsPerSec | Metric::ThpPct => 1.0, _ => 0.0 } }
     pub fn higher_better(self) -> bool {
         use Metric::*;
-        matches!(self, MemBwGbs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | CpuEff)
+        matches!(self, MemBwGbs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | CpuEff | IopsK)
     }
     pub fn name(self) -> &'static str {
         use Metric::*;
@@ -103,15 +127,19 @@ impl Metric {
             WriteMbs => "write", ReadMbs => "read", ThpPct => "THP coverage", CpuSingle => "1-thread work", CpuMulti => "all-thread work",
             IdleW => "idle power", PkgW => "package power", CpuEff => "work/joule", ProbeRssMib => "sparse RSS",
             TlbRandNs => "TLB random (plain)", TlbHugeNs => "TLB random (madvise)", ShmRandNs => "TLB random (shmem)",
-            FaultHugeP99Us => "huge fault p99",
+            FaultHugeP99Us => "huge fault p99", FrameP99Us => "frame tail", MixedReadP99Us => "read tail under writes",
+            MmapFaultP99Us => "mmap fault tail", IopsK => "random-read IOPS", IoCpuUs => "CPU per I/O", RaFootprintMib => "read-around cache",
         }
     }
 }
 
 /// Version of the benchmark set: rows measured by another set count less (their
 /// objectives average other metrics). 2 = THP probes (TLB reach, madvised faults,
-/// shmem) and a fragmented load phase.
-pub const BENCH_VERSION: u8 = 2;
+/// shmem) and a fragmented load phase. 3 = tails as expected shortfall (worst 1 %,
+/// at least 5 samples), the frame-loop probe, metrics weighted by their measured
+/// noise inside an objective, and the storage suite in its own IO phase (idle/load
+/// objectives without I/O metrics).
+pub const BENCH_VERSION: u8 = 3;
 
 /// Which benchmark groups a knob can influence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -120,6 +148,16 @@ pub struct Benches { pub cpu_mem: bool, pub io: bool, pub idle: bool, pub cpu: b
 /// Weight of the load phase when autotune blends both, per goal key.
 pub fn load_share(goal: &str) -> f64 {
     match goal { "throughput" => 0.7, "gaming" => 0.6, "desktop" => 0.4, _ => 0.2 }
+}
+
+/// How a goal combines the phases: `load` = weight of the load phase against the idle one,
+/// `io` = weight of the IO phase's objectives (the storage weight; the I/O knobs are only
+/// measured there, so it scales their effects instead of blending).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blend { pub load: f64, pub io: f64 }
+
+impl Blend {
+    pub fn new(goal: &str, storage: f64) -> Blend { Blend { load: load_share(goal), io: storage } }
 }
 
 pub type Sample = BTreeMap<Metric, f64>;
@@ -201,6 +239,8 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("kernel.cfs_bandwidth_slice_us", "only with CPU quotas"), ("kernel.sched_util_clamp_min_rt_default", "RT tasks only"),
     ("wq.cpumask", "topology (structural)"), ("irq.affinity", "topology (structural)"),
     ("kernel.sched_burst_cache_lifetime", "fork-time cache: no fork benchmark"),
+    ("vm.dirty_writeback_centisecs", "periodic flush every 5-15 s: longer than a run, unmeasurable"),
+    ("vm.dirty_expire_centisecs", "30-60 s data age: longer than a run, unmeasurable"),
 ];
 
 /// Candidate values per key where the generic rule (Choice: its options;
@@ -218,8 +258,15 @@ pub fn override_values(key: &str, live: &str, ram_kb: u64) -> Option<Vec<String>
         "vm.watermark_scale_factor" => Some(vec!["@wsf".into()]),
         "vm.min_free_kbytes" => v(&[r / 2, r * 2].map(|x| x.clamp(16_384, (ram_kb / 100) as i64))),
         "mm.lru_gen_min_ttl" => v(&[0, 1000]),
-        "vm.dirty_writeback_centisecs" => v(&[500, 1500]),
-        "vm.dirty_expire_centisecs" => v(&[3000, 6000]),
+        // Storage (IO phase). Doses stay inside autotune's 2x (+1 doubling with evidence) trust
+        // region around the boot value: a level it could never pick is a wasted run.
+        "blk.read_ahead_kb" if r > 0 => v(&[r / 4, r / 2, r * 2, r * 4].map(|x| x.clamp(4, 16_384))),
+        // 0 switches throttling off (a mode, not a dose); the others bracket the target.
+        "blk.wbt_lat_usec" => if r > 0 { v(&[0, r / 2, r * 2, r * 4].map(|x| x.min(1_000_000))) } else { v(&[1000, 2000, 5000]) },
+        // The device's tag depth is the ceiling (writes above it fail): only shorter queues.
+        "blk.nr_requests" if r > 0 => v(&[(r / 4).max(16), (r / 2).max(16)]),
+        "blk.nomerges" => v(&[0, 1, 2]),
+        "blk.rq_affinity" => v(&[0, 1, 2]),
         // deny/force are the kernel's emergency/testing switches, not settings.
         "thp.shmem_enabled" => Some(["always", "within_size", "advise", "never"].iter().filter(|x| **x != live).map(|x| x.to_string()).collect()),
         "vm.stat_interval" => v(&[1, 10]),
@@ -252,17 +299,17 @@ pub fn generic_values(kind: &crate::tune::Kind, live: &str, options: &[String]) 
 /// Phases and benchmarks for a key, by what it can influence.
 pub fn phases_for(key: &str, group: &str) -> Vec<(Phase, Benches)> {
     let b = |cpu_mem, io, idle, cpu| Benches { cpu_mem, io, idle, cpu };
+    if io_key(key) { return vec![(Phase::Io, b(false, true, false, false))]; }
     match key {
-        "vm.dirty" => vec![(Phase::Idle, b(false, true, false, false)), (Phase::Load, b(true, true, false, false))],
         // THP modes change TLB reach (idle and loaded) and fault/compaction cost (loaded, fragmented).
         k if k == "thp" || k == "thp.shmem_enabled" || k.starts_with("thp.mthp_") =>
             vec![(Phase::Idle, b(true, false, false, false)), (Phase::Load, b(true, false, false, false))],
-        "vm.dirty_writeback_centisecs" | "vm.dirty_expire_centisecs" => vec![(Phase::Idle, b(false, true, true, false))],
         "vm.stat_interval" => vec![(Phase::Idle, b(false, false, true, true))],
         _ => match group {
             "CPU" => vec![(Phase::Idle, b(false, false, true, true)), (Phase::Load, b(false, false, false, true))],
             "Scheduler" => vec![(Phase::Idle, b(false, false, false, true)), (Phase::Load, b(true, false, false, true))],
             "Memory" => vec![(Phase::Load, b(true, false, false, false))],
+            "Storage" => vec![(Phase::Io, b(false, true, false, false))],
             _ => Vec::new(),
         },
     }
@@ -313,15 +360,15 @@ pub struct PhaseFit { pub set: PhaseSet, pub fits: [Option<Arc<Fit>>; 4] }
 
 /// Fits derived from the rows, per phase (built on first use, dropped when that phase's rows change).
 #[derive(Default)]
-pub struct ModelCache([RefCell<Option<Option<Arc<PhaseFit>>>>; 2]);
+pub struct ModelCache([RefCell<Option<Option<Arc<PhaseFit>>>>; 3]);
 impl Clone for ModelCache { fn clone(&self) -> Self { ModelCache::default() } }
 impl PartialEq for ModelCache { fn eq(&self, _: &Self) -> bool { true } }
 impl std::fmt::Debug for ModelCache { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ModelCache") } }
 
 const MAX_ROWS: usize = 1600;
 
-fn pidx(phase: Phase) -> usize { if phase == Phase::Idle { 0 } else { 1 } }
-fn hyp_key(phase: Phase, o: usize) -> String { format!("{}{o}", if phase == Phase::Idle { "idle" } else { "load" }) }
+fn pidx(phase: Phase) -> usize { phase.idx() }
+fn hyp_key(phase: Phase, o: usize) -> String { format!("{}{o}", phase.name()) }
 
 /// The machine signature.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -376,7 +423,7 @@ impl Calibration {
             .or_else(|| gs.iter().max_by_key(|g| g.values.values().map(|s| s.idle.len() + s.load.len()).sum::<usize>()))
     }
     fn agg(&self, s: &Slot, phase: Phase) -> Option<Measured> {
-        aggregate(if phase == Phase::Idle { &s.idle } else { &s.load }, self.now, &self.kernel)
+        match phase { Phase::Idle => aggregate(&s.idle, self.now, &self.kernel), Phase::Load => aggregate(&s.load, self.now, &self.kernel), Phase::Io => None }
     }
     /// Effects of `value` relative to `reference` in one phase (re-based through the stored reference).
     pub fn get_phase(&self, key: &str, reference: &str, value: &str, phase: Phase) -> Option<Measured> {
@@ -391,9 +438,17 @@ impl Calibration {
         let d = |x: Option<f64>, y: Option<f64>| Some(x? - y?);
         Some(Measured { lat: d(a.lat, b.lat), thr: d(a.thr, b.thr), pwr: d(a.pwr, b.pwr), mem: d(a.mem, b.mem), n: a.n.min(b.n) })
     }
-    /// Both phases blended: `load` = weight of the load phase (0..1). A phase
-    /// without data leaves the other in full.
-    pub fn get(&self, key: &str, reference: &str, value: &str, load: f64) -> Option<Measured> {
+    /// The phases blended for a goal: idle and load by `b.load` (a phase without data leaves
+    /// the other in full); a knob of the IO phase is measured there only and its effects are
+    /// scaled by the storage weight `b.io`, as the joint model weighs that phase's objectives.
+    pub fn get(&self, key: &str, reference: &str, value: &str, b: Blend) -> Option<Measured> {
+        if io_key(key) {
+            if let Some(m) = self.get_phase(key, reference, value, Phase::Io) {
+                let sc = |x: Option<f64>| x.map(|v| v * b.io);
+                return Some(Measured { lat: sc(m.lat), thr: sc(m.thr), pwr: sc(m.pwr), mem: sc(m.mem), n: m.n });
+            }
+        }
+        let load = b.load;
         let (i, l) = (self.get_phase(key, reference, value, Phase::Idle), self.get_phase(key, reference, value, Phase::Load));
         let mix = |a: Option<f64>, b: Option<f64>| match (a, b) {
             (Some(x), Some(y)) => Some((1.0 - load) * x + load * y),
@@ -415,15 +470,20 @@ impl Calibration {
     }
     /// Rows of one phase as model input: weights carry recency and kernel age; the one-at-a-time
     /// records join as single-knob rows worth half their evidence.
+    /// The I/O knobs belong to the IO phase alone: idle/load rows of an older benchmark set that
+    /// changed one are left out (their objectives mixed storage metrics in), so the two
+    /// models never share a knob with the IO model.
     fn pre_rows(&self, phase: Phase) -> Vec<model::Row> {
         let mm = major_minor(&self.kernel);
-        let mut out: Vec<model::Row> = self.rows.iter().filter(|r| r.phase == phase).map(|r| {
+        let foreign = |k: &str| (phase == Phase::Io) != io_key(k);
+        let mut out: Vec<model::Row> = self.rows.iter().filter(|r| r.phase == phase && !r.cfg.iter().any(|(k, _)| foreign(k))).map(|r| {
             let age = self.now.saturating_sub(r.t) as f64 / 86_400.0;
             let k = if self.kernel.is_empty() || major_minor(&r.kernel) == mm { 1.0 } else { 0.5 };
             let b = if r.bv == BENCH_VERSION { 1.0 } else { 0.6 };
             model::Row { cfg: r.cfg.clone(), y: r.y, w: r.w * 0.5f64.powf(age / HALF_LIFE_DAYS) * k * b, sess: r.sess, pos: r.pos, t: r.t as f64 }
         }).collect();
         for (key, gs) in &self.keys {
+            if phase == Phase::Io || io_key(key) { continue; }
             let Some(reference) = self.ref_of(key) else { continue };
             let Some(g) = gs.iter().find(|g| g.reference == reference) else { continue };
             for (value, slot) in &g.values {
@@ -498,11 +558,12 @@ impl Calibration {
         let pf = self.phase_fit(phase)?;
         Model::new(pf.set.space.clone(), pf.fits.clone(), wts)
     }
-    /// Joint utility model for objective weights and load share.
-    pub fn joint(&self, wts: [f64; 4], share: f64) -> Option<Joint> {
+    /// Joint utility model for objective weights and a goal's phase blend.
+    pub fn joint(&self, wts: [f64; 4], b: Blend) -> Option<Joint> {
         if self.rows.is_empty() { return None; }
         let (idle, load) = (self.phase_model(Phase::Idle, wts), self.phase_model(Phase::Load, wts));
-        (idle.is_some() || load.is_some()).then_some(Joint { idle, load, share })
+        let io = if b.io > 0.0 { self.phase_model(Phase::Io, wts.map(|w| w * b.io)) } else { None };
+        (idle.is_some() || load.is_some() || io.is_some()).then_some(Joint { idle, load, io, share: b.load })
     }
     /// Phase sets (for reports and the calibration loop).
     pub fn phase_set(&self, phase: Phase) -> Option<PhaseSet> { self.phase_fit(phase).map(|p| p.set.clone()) }
@@ -559,7 +620,7 @@ impl Calibration {
         };
         let s = g.values.entry(value.to_owned()).or_default();
         if unsafe_ { s.unsafe_ = true; }
-        if let Some(m) = m {
+        if let (Some(m), true) = (m, phase != Phase::Io) {
             let v = if phase == Phase::Idle { &mut s.idle } else { &mut s.load };
             v.push(Rec { m, t, kernel: kernel.to_owned() });
             let drop = v.len().saturating_sub(KEEP);
@@ -570,7 +631,7 @@ impl Calibration {
     pub fn coverage(&self, key: &str, phase: Phase) -> usize {
         self.rows.iter().filter(|r| r.phase == phase && r.cfg.iter().any(|(k, _)| k == key)).count() +
         self.keys.get(key).map_or(0, |gs| gs.iter().flat_map(|g| g.values.values())
-            .map(|s| if phase == Phase::Idle { s.idle.len() } else { s.load.len() }).sum())
+            .map(|s| match phase { Phase::Idle => s.idle.len(), Phase::Load => s.load.len(), Phase::Io => 0 }).sum())
     }
 
     pub fn to_json(&self) -> Value {
@@ -582,7 +643,7 @@ impl Calibration {
         }).collect()))).collect();
         let num = |x: f64| if x.is_finite() { json!(x) } else { Value::Null };
         let rows: Vec<Value> = self.rows.iter().map(|r| json!({
-            "ph": if r.phase == Phase::Idle { 0 } else { 1 }, "s": r.sess, "p": r.pos, "t": r.t, "k": r.kernel, "w": r.w, "bv": r.bv,
+            "ph": r.phase.idx(), "s": r.sess, "p": r.pos, "t": r.t, "k": r.kernel, "w": r.w, "bv": r.bv,
             "c": r.cfg.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "y": r.y.iter().map(|v| num(*v)).collect::<Vec<_>>()})).collect();
 json!({"version": 5, "fingerprint": self.fingerprint.to_json(), "on_battery": self.on_battery, "keys": keys, "rows": rows,
                "refs": self.refs, "hyp": self.hyp, "strategies": self.strategies, "unsafe_sets": self.unsafe_sets.iter().map(|u| u.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>()).collect::<Vec<_>>()})
@@ -615,7 +676,7 @@ json!({"version": 5, "fingerprint": self.fingerprint.to_json(), "on_battery": se
         for r in v["rows"].as_array().into_iter().flatten() {
             let mut y = [f64::NAN; 4];
             for (i, e) in r["y"].as_array().into_iter().flatten().take(4).enumerate() { y[i] = e.as_f64().unwrap_or(f64::NAN); }
-            c.rows.push(Row { phase: if r["ph"].as_u64() == Some(0) { Phase::Idle } else { Phase::Load }, sess: r["s"].as_u64().unwrap_or(0),
+            c.rows.push(Row { phase: Phase::from_idx(r["ph"].as_u64().unwrap_or(1)), sess: r["s"].as_u64().unwrap_or(0),
                               pos: r["p"].as_f64().unwrap_or(0.5), t: r["t"].as_u64().unwrap_or(0), kernel: r["k"].as_str().unwrap_or("").into(),
                               cfg: r["c"].as_array().into_iter().flatten().filter_map(pair).collect(), y, w: r["w"].as_f64().unwrap_or(1.0),
                               bv: r["bv"].as_u64().unwrap_or(1) as u8 });
@@ -635,12 +696,12 @@ json!({"version": 5, "fingerprint": self.fingerprint.to_json(), "on_battery": se
     }
     /// Notes a finished design session's strategy for a phase (the last 64 are kept).
     pub fn note_strategy(&mut self, phase: Phase, name: &str) {
-        let v = self.strategies.entry(if phase == Phase::Idle { "idle" } else { "load" }.into()).or_default();
+        let v = self.strategies.entry(phase.name().into()).or_default();
         v.push(name.to_owned());
         if v.len() > 64 { v.remove(0); }
     }
     pub fn strategies_of(&self, phase: Phase) -> &[String] {
-        self.strategies.get(if phase == Phase::Idle { "idle" } else { "load" }).map_or(&[], |v| v.as_slice())
+        self.strategies.get(phase.name()).map_or(&[], |v| v.as_slice())
     }
     /// The signature of this machine (older single-run results are migrated;
     /// a signature of other hardware is ignored).
@@ -661,12 +722,13 @@ json!({"version": 5, "fingerprint": self.fingerprint.to_json(), "on_battery": se
 /// Returns interpolated candidates at the geometric midpoints between
 /// measured values; their evidence weight is half the weaker neighbour's.
 pub fn curve(points: &[(i64, Measured)]) -> Vec<(i64, Measured)> {
+    // 0 switches a feature off: no dose lies between it and the next level.
     let mut p: Vec<&(i64, Measured)> = points.iter().filter(|(v, _)| *v >= 0).collect();
     p.sort_by_key(|(v, _)| *v);
     let mut out = Vec::new();
     for w in p.windows(2) {
         let ((a, ma), (b, mb)) = (w[0], w[1]);
-        if b - a < 2 { continue; }
+        if *a <= 0 || b - a < 2 { continue; }
         let mid = (((*a as f64 + 1.0) * (*b as f64 + 1.0)).sqrt() - 1.0).round() as i64;
         if mid <= *a || mid >= *b { continue; }
         let t = ((mid as f64 + 1.0).log2() - (*a as f64 + 1.0).log2()) / ((*b as f64 + 1.0).log2() - (*a as f64 + 1.0).log2());
@@ -715,7 +777,7 @@ mod tests {
         c2.kernel = "7.3.0".into();
         assert!((c2.get_phase("k", "128", "256", Phase::Idle).unwrap().n - 0.5).abs() < 1e-9);
         // Blend + rebase + unsafe + roundtrip.
-        let b = c.get("k", "128", "1024", 0.6).unwrap();
+        let b = c.get("k", "128", "1024", Blend { load: 0.6, io: 1.0 }).unwrap();
         assert!((b.lat.unwrap() - 0.6 * -0.2).abs() < 1e-9);
         assert!((c.get_phase("k", "256", "1024", Phase::Idle).unwrap().thr.unwrap() - (0.25 / 1.5 - 0.04)).abs() < 1e-9);
         assert!(c.is_unsafe("k", "4096"));
@@ -750,6 +812,12 @@ mod tests {
         assert!(mf.iter().all(|x| x.parse::<u64>().unwrap() <= 320_000));
         assert!(EXCLUDED.iter().any(|(k, _)| *k == "kernel.watchdog"));
         assert_eq!(phases_for("vm.swappiness", "Memory").len(), 1);
+        assert_eq!(phases_for("vm.dirty", "Memory"), vec![(Phase::Io, Benches { io: true, ..Default::default() })]);
+        assert_eq!(phases_for("blk.read_ahead_kb", "Storage")[0].0, Phase::Io);
+        assert!(phases_for("vm.dirty_writeback_centisecs", "Memory").iter().all(|p| p.0 == Phase::Load), "excluded from the plan, not an IO knob");
+        assert_eq!(override_values("blk.read_ahead_kb", "128", 0).unwrap(), vec!["32", "64", "256", "512"]);
+        assert_eq!(override_values("blk.nr_requests", "1023", 0).unwrap(), vec!["255", "511"]);
+        assert!(override_values("blk.wbt_lat_usec", "2000", 0).unwrap().contains(&"0".to_string()));
         assert_eq!(phases_for("sched.preempt", "Scheduler").len(), 2);
     }
 
@@ -785,14 +853,14 @@ mod tests {
         assert_eq!(back.refs, c.refs);
         assert!(back.unsafe_cfg(&[("vm.a".into(), "64".into()), ("vm.b".into(), "1".into()), ("x".into(), "1".into())]) && !back.unsafe_cfg(&[("vm.a".into(), "64".into())]));
         // Stand-alone effects come from the joint model: the dose ladder is monotone, the inert knob ~0, the untouched objective absent.
-        let e64 = back.get("vm.a", "8", "64", 1.0).unwrap();
-        let e16 = back.get("vm.a", "8", "16", 1.0).unwrap();
-        let eb = back.get("vm.b", "0", "1", 1.0).unwrap();
+        let e64 = back.get("vm.a", "8", "64", Blend { load: 1.0, io: 1.0 }).unwrap();
+        let e16 = back.get("vm.a", "8", "16", Blend { load: 1.0, io: 1.0 }).unwrap();
+        let eb = back.get("vm.b", "0", "1", Blend { load: 1.0, io: 1.0 }).unwrap();
         assert!(e64.lat.unwrap() > e16.lat.unwrap() && e16.lat.unwrap() > 0.02, "dose-response {e16:?} {e64:?}");
         assert!(e64.lat.unwrap() > 0.07 && eb.lat.unwrap().abs() < 0.03, "{e64:?} {eb:?}");
         assert!(e64.thr.is_none() && e64.n > 1.0);
         assert!(back.has_key("vm.a") && back.key_names().contains(&"vm.b".to_string()) && back.values("vm.a", "8").unwrap().1.len() == 2);
-        assert!(back.get("vm.a", "999", "64", 1.0).is_none(), "another reference: not comparable");
+        assert!(back.get("vm.a", "999", "64", Blend { load: 1.0, io: 1.0 }).is_none(), "another reference: not comparable");
         // A changed reference invalidates the rows that used it.
         let mut c2 = back.clone();
         c2.forget_key("vm.a");
@@ -800,10 +868,41 @@ mod tests {
     }
 
     #[test]
+    fn io_phase_is_separate_and_scaled_by_storage_weight() {
+        let mut c = Calibration::default();
+        let mut rng = crate::model::Rng::new(9);
+        let mut rows = Vec::new();
+        for i in 0..40usize {
+            let cfg: Cfg = match i % 4 { 0 => vec![], 1 | 2 => vec![("blk.read_ahead_kb".into(), "512".into())], _ => vec![("blk.nomerges".into(), "2".into())] };
+            let ra = cfg.iter().any(|(k, _)| k == "blk.read_ahead_kb");
+            let noise = ((rng.unit() + rng.unit()) - 1.0) * 0.02;
+            rows.push(Row { phase: Phase::Io, sess: 3, pos: i as f64 / 40.0, t: i as u64, kernel: String::new(), cfg,
+                            y: [0.0 + noise, if ra { 0.2 } else { 0.0 } + noise, 0.0, if ra { -0.1 } else { 0.0 }], w: 1.0, bv: BENCH_VERSION });
+        }
+        c.put_session(Phase::Io, 3, rows);
+        c.refs.insert("blk.read_ahead_kb".into(), "128".into());
+        c.refs.insert("blk.nomerges".into(), "0".into());
+        // An old idle row that changed an I/O knob stays out of the idle model.
+        c.rows.push(Row { phase: Phase::Idle, sess: 1, pos: 0.0, t: 0, kernel: String::new(), cfg: vec![("blk.nomerges".into(), "2".into())],
+                          y: [0.5, 0.5, 0.5, 0.5], w: 1.0, bv: 2 });
+        assert!(c.phase_fit(Phase::Idle).is_none());
+        let full = c.get("blk.read_ahead_kb", "128", "512", Blend { load: 0.5, io: 1.0 }).unwrap();
+        let half = c.get("blk.read_ahead_kb", "128", "512", Blend { load: 0.5, io: 0.5 }).unwrap();
+        assert!(full.thr.unwrap() > 0.12 && (half.thr.unwrap() - full.thr.unwrap() * 0.5).abs() < 1e-9, "{full:?} {half:?}");
+        let j = c.joint([0.0, 1.0, 0.0, 0.0], Blend { load: 0.5, io: 0.5 }).unwrap();
+        assert!(j.io.is_some() && j.idle.is_none());
+        let (mu, _) = j.eval(&[("blk.read_ahead_kb".into(), "512".into())]);
+        assert!((mu - half.thr.unwrap()).abs() < 0.03, "joint io term weighs like the per-knob effect: {mu}");
+        assert!(c.joint([1.0; 4], Blend { load: 0.5, io: 0.0 }).is_none(), "storage weight 0: no IO model");
+        let back = Calibration::from_json(&c.to_json());
+        assert_eq!(back.rows.iter().filter(|r| r.phase == Phase::Io).count(), 40);
+    }
+
+    #[test]
     fn joint_blends_phases_by_share() {
         let mut c = Calibration::default();
         synthetic(&mut c);
-        let j = c.joint([1.0, 0.0, 0.0, 0.0], 0.5).unwrap();
+        let j = c.joint([1.0, 0.0, 0.0, 0.0], Blend { load: 0.5, io: 1.0 }).unwrap();
         assert!(j.idle.is_none() && j.load.is_some());
         let with_a = vec![("vm.a".to_string(), "64".to_string())];
         let (mu, var) = j.eval(&with_a);

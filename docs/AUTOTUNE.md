@@ -30,17 +30,26 @@ beats the reference by 0.03 — otherwise the setting is left alone. Effects are
 ordinal estimates taken from kernel documentation plus this machine's evidence;
 a knob that fixes a problem the machine does not show earns nothing.
 
-Default weights (latency, throughput, power, footprint, stability):
+Default weights (latency, throughput, power, footprint, stability, storage):
 
-| goal       | lat | thr | pwr  | mem | stab |
-|------------|-----|-----|------|-----|------|
-| Gaming     | 1.0 | 0.6 | 0.15 | 0.4 | 1.0 |
-| Desktop    | 0.7 | 0.3 | 0.7  | 0.6 | 1.0 |
-| Throughput | 0.2 | 1.0 | 0.2  | 0.5 | 1.0 |
-| Power save | 0.2 | 0.1 | 1.0  | 0.5 | 1.0 |
+| goal       | lat | thr | pwr  | mem | stab | storage |
+|------------|-----|-----|------|-----|------|---------|
+| Gaming     | 1.0 | 0.6 | 0.15 | 0.4 | 1.0 | 0.5 |
+| Desktop    | 0.7 | 0.3 | 0.7  | 0.6 | 1.0 | 0.6 |
+| Throughput | 0.2 | 1.0 | 0.2  | 0.5 | 1.0 | 0.7 |
+| Power save | 0.2 | 0.1 | 1.0  | 0.5 | 1.0 | 0.4 |
+
+**Storage** is a relevance, not a fifth objective: the calibrated I/O knobs
+(Storage rows and the dirty window) are measured by their own benchmark suite
+(the IO phase below), and its latency / throughput / power / footprint count
+with the four weights above *times* the storage weight. 0 = the disk does not
+matter for this goal (those knobs keep their rule-based values), 1 = an I/O
+effect counts as much as the same CPU/memory effect. A game streams assets but
+is mostly CPU/GPU-bound, a desktop waits on saves and launches, bulk work moves
+data — hence the defaults.
 
 Change them per goal with **Weights…** next to the Autotune button, or
-`lpm-autotune <goal> --weights latency=1.2,footprint=0.8`. Range 0–3;
+`lpm-autotune <goal> --weights latency=1.2,footprint=0.8,storage=1`. Range 0–3;
 stability cannot go below 0.5. The weights used are stored in the preset's
 `autotune` block.
 
@@ -61,6 +70,12 @@ For every scored knob:
 - distance from it costs modesty (log2 for numbers), and a number may move at
   most **2×** away (up to 8× for evidence-driven knobs such as
   `watermark_scale_factor`, in proportion to the reclaim evidence);
+- **0 is a mode, not a dose**: where 0 switches a feature off (writeback
+  throttling, boosted reclaim, background compaction, NVMe APST, codec
+  power-down, …) going to or from 0 costs like a choice. As a dose it sat ten or
+  more doublings from any boot value, so earlier versions silently dropped every
+  "off" candidate whenever a boot snapshot existed. No dose is interpolated
+  between 0 and a setting either;
 - the THP group starts from the boot THP configuration when the kernel honours it;
 - **learning:** every apply of a guarded knob and every guard rollback is
   counted per key (`outcomes.json`). A rollback adds a stability cost of
@@ -73,19 +88,24 @@ nothing about the disk, so those two stay derived from the write rate.
 ## Machine signature (calibration)
 
 `sudo lpm-calibrate` builds a **signature** of this machine: what every CPU,
-scheduler and memory knob does here, alone and next to the others, idle and under load. Records accumulate
+scheduler, memory and storage knob does here, alone and next to the others, idle,
+under load and on the disk. Records accumulate
 across runs in `/var/lib/legion-power-manager/signature.json`, tied to a
 hardware fingerprint (DMI product, CPU model, RAM ±2 %; a signature of other
 hardware is set aside, not merged).
 
-**Plan.** Generated from the tunable table (CPU, Scheduler, Memory groups),
+**Plan.** Generated from the tunable table (CPU, Scheduler, Memory, Storage groups),
 minus keys that are structural or unsafe to flip — CCD/core-type roles,
 CPU offlining, driver switches, firmware power/thermal limits, the watchdog,
-khugepaged pacing (needs minutes) and the like (`lpm-calibrate --list` shows
-the plan, every excluded key and why). Candidates: all options for choice
-rows, the flip for switches, live ÷2 / ×2 for numbers, and per-key ladders
-where that is wrong (swappiness 60…180, watermark headroom 128/256/512 MiB,
-boost ≤ 15000, CCD frequency caps 100/90/80/70 %, …).
+khugepaged pacing (needs minutes), the periodic writeback interval and data age
+(5–60 s: longer than a run, so a run cannot see them) and the like
+(`lpm-calibrate --list` shows the plan, every excluded key and why). Candidates:
+all options for choice rows, the flip for switches, live ÷2 / ×2 for numbers, and
+per-key ladders where that is wrong (swappiness 60…180, watermark headroom
+128/256/512 MiB, boost ≤ 15000, CCD frequency caps 100/90/80/70 %, read-ahead
+¼…4× the live value, writeback throttling off / ½ / 2× / 4×, shorter queue depths
+only, …). Ladders stay inside autotune's trust region: a dose it could never pick
+is a wasted run.
 
 **Design, not a queue.** The old flow measured one knob at a time (`ref, c1 … cn,
 ref`), so every effect rested on two or three runs, interactions were never
@@ -152,16 +172,21 @@ union of the benches the phase's knobs need), so any goal or custom weights are
 decided from the same data — experiments are goal-agnostic, fits are per
 objective and combined per goal without refitting.
 
-**Phases.** Idle: quiet machine (CPU knobs: idle power, single/all-thread
-work, work per joule, wake-up and thread ping-pong latency; I/O and heap
-probes where relevant). Load: a ballast child holds memory down to
+**Phases.** Idle: quiet machine (idle power, single/all-thread work, work per
+joule, wake-up, frame-loop and thread ping-pong latency, heap probes). Load: a
+ballast child holds memory down to
 max(1 GiB, 5 % RAM) free, re-faults 64 MiB blocks and keeps half the CPUs busy
 (wake-up and ping-pong latency, allocation stalls/s, heap probe, package power).
 Every 4th ballast block is small pages with every other page freed again and is
 re-made now and then (compaction heals it): free memory without a free 2 MiB
 block, as on a machine that has been up for days — what THP defrag and the
 compaction knobs really meet.
-Single-thread work, the wake-up sleeper and the ping-pong pair run as fresh threads in
+IO: the storage suite (below) on the disk holding `--dir`, nothing else running
+and no ballast — the I/O knobs live here only, so storage metrics no longer
+dilute the CPU/memory objectives (nor their noise the CPU/memory knobs; before,
+every idle run carried the I/O benchmark and a 20 % fsync gain shrank to a
+seventh of the latency objective).
+Single-thread work, the frame loop, the wake-up sleeper and the ping-pong pair run as fresh threads in
 several short sub-runs, so one scheduler placement (V-Cache vs frequency CCD, same core
 vs another) does not decide a whole run. Package power reads only the RAPL package
 domain (not psys or the MMIO duplicate) and survives counter wrap-around; the power
@@ -186,10 +211,49 @@ fault p99 — defrag/compaction stalls) and over shared memory (memfd,
 `shmem_enabled`). `lpm-calibrate --only @thp` runs just this family (`@mem`,
 `@cpu`, `@sched` likewise).
 
+**Measuring tails.** Every latency figure is the expected shortfall at p99 —
+the mean of the worst 1 % of the window's samples, at least 5. A single order
+statistic of a short window jitters more than the effects being measured (p99
+of 40 fsyncs is simply the maximum).
+
+**Frame loop.** A thread wakes every 4 ms (240 Hz) on an absolute deadline,
+runs a fixed piece of work over a 256 KiB working set and records deadline →
+done. That is what a game's frame loop or a compositor meets: timer wake-up,
+C-state exit and how fast the clock comes up for a short burst after idling
+(EPP, boost, idle governor, wake-up QoS). The sleeper (wake p99) and the
+sustained spin (1-thread work) each see only part of it.
+
+**Storage suite** (IO phase, `size` = 256 MiB, 512 with `--thorough`; unlinked
+temp files):
+
+| step | metric (objective) | what moves it |
+|---|---|---|
+| streaming buffered write + fsync, a 4 KiB fsync prober every 10 ms | write MB/s (thr), fsync tail (lat) | dirty window, scheduler, merging |
+| cold sequential read, 128 KiB reads | read MB/s (thr) | read-ahead, merging |
+| 4 KiB O_DIRECT random reads, queue depth 1 | random-read tail (lat) | scheduler |
+| the same from several threads | IOPS (thr), busy CPU per read incl. irq (pwr) | iostats, add_random, nomerges, rq_affinity, scheduler |
+| random reads while a second writer streams and commits | read tail under writes (lat) | writeback throttling, scheduler, queue depth, dirty window |
+| sparse first touches of a cold mmap | mmap fault tail (lat), page cache brought in (mem) | read-ahead (fault read-around) |
+
+The disk is the one holding `--dir` (default: the first of `/var/tmp`,
+`/var/cache`, `/home`, `/` on a local disk; found through mountinfo, LUKS/LVM
+slaves and partitions). tmpfs and network file systems are refused — they would
+measure RAM. The Storage rows write every disk the same value, so the measured
+disk speaks for all; point `--dir` at a game library to measure that drive.
+A Storage row whose disks disagree (a USB stick next to the NVMe drives) is
+measured from the suite disk's value; unplug removable disks before
+calibrating. One IO run writes about 1.5 × `size`. The idle phase no longer
+runs the I/O benchmark, so a full session writes less than before.
+
 **From runs to a model** (`src/model.rs`). Per run and metric: log-ratio to the
-session's reference runs (+ = better), clipped to ±0.5, averaged per objective
-— no noise thresholding, so small real effects are not thrown away; a metric
-counts only if 80 % of the runs have it. The model is an additive Gaussian
+session's reference runs (+ = better), clipped to ±0.5, then averaged per
+objective **weighted by the metric's noise**: from the session's reference runs
+(robust sd of the log values) w = 1 / (sd² + mean sd² of the objective) —
+halfway between equal weights and inverse variance — kept within ⅓…3× of the
+equal share (fewer than 4 reference runs: equal weights). A tail that jumps
+30 % between identical runs no longer drowns a bandwidth that moves 1 %, and no
+single metric can take an objective over. No noise thresholding, so small real
+effects are not thrown away; a metric counts only if 80 % of the runs have it. The model is an additive Gaussian
 process per objective (Bayesian regression in kernel form):
 
 - main effects per value; numeric ladders use a random-walk prior over their
@@ -213,7 +277,9 @@ process per objective (Bayesian regression in kernel form):
   half-life, another kernel (major.minor) counts half, rows from an older
   benchmark version 0.6, at most 1600 rows kept (1100 fitted). The old
   one-at-a-time records stay valid: they join as single-knob rows worth half
-  their evidence.
+  their evidence. Idle/load rows of an older benchmark set that changed an
+  I/O knob stay out of the idle/load models (their objectives mixed storage
+  metrics in); the I/O knobs are learned in the IO phase from scratch.
 
 **Decisions (autotune).** Every quantity is a posterior. For a goal's weights:
 
@@ -233,7 +299,7 @@ process per objective (Bayesian regression in kernel form):
   the model has evidence for), unsafe values and unsafe sets, retired keys,
   the phase blend per goal (load share: throughput 70 %, gaming 60 %,
   desktop 40 %, power saving 20 %; a knob only one phase models keeps its full
-  weight there), scoped roles (cpu.epp vs cpu.epp_ccd0 — CCD roles stay
+  weight there; the IO model adds with the storage weight), scoped roles (cpu.epp vs cpu.epp_ccd0 — CCD roles stay
   structural), THP and the dirty window as fixed context;
 - the `why` of a changed knob says what it gains alone and in context; the
   notes carry the predicted weighted gain ± sd of the whole combination.
@@ -251,7 +317,8 @@ lpm-calibrate --list [--budget N]            # knobs, excluded keys, depth, runs
 sudo lpm-calibrate                           # 15-minute progressive lean session (next stage of what the log lacks)
 sudo lpm-calibrate --sessions 4              # four of them back to back: start it and walk away
 sudo lpm-calibrate --budget 60               # max depth: crowded runs, interactions chased, doses refined
-sudo lpm-calibrate --budget 30 --only @thp   # the THP family only (also @mem, @cpu, @sched)
+sudo lpm-calibrate --budget 30 --only @thp   # the THP family only (also @mem, @cpu, @sched, @io)
+sudo lpm-calibrate --only @io --dir /mnt/games   # storage only, measured on the games disk
 sudo lpm-calibrate --budget 30 --phase load  # load phase only
 sudo lpm-calibrate --seed 7 --no-confirm     # other random design; skip the confirmation runs
 sudo lpm-calibrate --oat                     # legacy one-knob-at-a-time flow
@@ -266,13 +333,13 @@ All options:
 | `--all` | no time limit: max depth up to its run cap (1000 per phase) |
 | `--depth lean\|deep\|max` | fixed shape regardless of budget; `lean` turns progression off |
 | `--sessions N` | N sessions back to back (1–48); progressive ones each take the next stage |
-| `--phase idle\|load\|both` | only one phase (default both) |
-| `--only K1,K2,…` | only these keys; group aliases `@thp` (thp group, defrag, shmem, mTHP sizes), `@mem` (Memory), `@cpu` (CPU), `@sched` (Scheduler) |
+| `--phase idle\|load\|io\|both` | only one phase (default `both` = all three) |
+| `--only K1,K2,…` | only these keys; group aliases `@thp` (thp group, defrag, shmem, mTHP sizes), `@mem` (Memory), `@cpu` (CPU), `@sched` (Scheduler), `@io` (Storage rows + dirty window) |
 | `--thorough` | every measurement window ×1.6 and a 512 MiB I/O file (less noise, slower runs; `--oat`: two rounds per knob) |
-| `--dir PATH` | directory for the I/O benchmark's temporary files (default `/var/tmp`; use the disk you care about) |
+| `--dir PATH` | directory for the storage suite's temporary files, on the disk to measure (default: first of `/var/tmp`, `/var/cache`, `/home`, `/` on a local disk) |
 | `--seed N` | another random design (default fixed, so a session is reproducible) |
 | `--no-confirm` | skip the confirmation runs of the predicted optima |
-| `--oat` | legacy one-knob-at-a-time flow (no interactions) |
+| `--oat` | legacy one-knob-at-a-time flow (no interactions, no IO phase) |
 | `--list` | the plan: knobs and values, excluded keys and why, depth or progressive stage per phase, runs and time, rows logged (no root needed) |
 | `--show` | the signature: effects per value and phase, model quality, pair/triple interactions (no root needed) |
 | `--restore` | put back every value an interrupted run left changed (journal in `/run/legion-power-manager/calibrate.json`) |
@@ -292,13 +359,23 @@ lpm-helpers --bin lpm-calibrate sequential`; the noise/budget sweep is
 
 | knob | rule |
 |------|------|
-| `vm.dirty_bytes` / `dirty_background_bytes` | sustained write rate × window (1 s / 0.25 s by default; 0.25–2 s scored), capped at 2 % of RAM and 1 GiB, floors 32 / 8 MiB, MiB-aligned. Rate: probe → `/sys/block/*/stat` → device class |
+| `vm.dirty_bytes` / `dirty_background_bytes` | sustained write rate × window (1 s / 0.25 s by default; 0.25–2 s scored, calibrated in the IO phase), capped at 2 % of RAM and 1 GiB, floors 32 / 8 MiB, MiB-aligned. Rate: probe → `/sys/block/*/stat` → device class |
 | THP group (`enabled`, `max_ptes_none`, khugepaged pace, mTHP sizes) | searched jointly. `always` costs footprint (a touched 2 MB range takes a whole huge page; the split shrinker only returns it under pressure). With any mTHP size on, `max_ptes_none` is only 0 or 511 (kernel 7.x). Pace never above 2× the default. A `transparent_hugepage=` boot parameter is left alone |
 | `vm.watermark_scale_factor` | raised only with evidence (direct-reclaim share, allocstall, `kswapd_low_wmark_hit_quickly`); max 300 and 2 % of RAM / 1 GiB of headroom. That headroom leaves MemAvailable |
 | `vm.watermark_boost_factor` | never above 15000. Note: boosting *frees* page cache after fragmentation events; it does not hold memory |
 | `vm.min_free_kbytes` | never raised; a live value above 1 % of RAM / 256 MiB is repaired |
 | `mm.lru_gen_min_ttl` | scored against OOM risk; with the default weights it stays off |
 | `vm.compaction_proactiveness`, `vm.vfs_cache_pressure` | scored; at least one defrag path stays on with THP `always` |
+
+## Storage
+
+Without a signature: flash-only machines get `none`, a spinning disk
+`bfq`/`mq-deadline`; read-ahead 256 KiB for gaming, 512 KiB (2 MiB on a
+spinning disk) for throughput; writeback throttling is scored. With an IO-phase
+signature every Storage row (`scheduler`, `wbt_lat_usec`, `read_ahead_kb`,
+`rq_affinity`, `nomerges`, `iostats`, `add_random`, `nr_requests`) and the dirty
+window are decided by measurement, jointly with their interactions (elevator ×
+queue depth × throttling × dirty window), weighed by the storage weight.
 
 ## Devices
 

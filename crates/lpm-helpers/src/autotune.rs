@@ -9,7 +9,9 @@
 //!          (pstate mode, CCD roles, amdgpu DPM auto, bring a parked CCD back);
 //!        * scored knobs: every knob with a real trade-off is a set of candidate
 //!          values, each with an effect vector over five objectives
-//!          (latency, throughput, power, memory footprint, stability risk).
+//!          (latency, throughput, power, memory footprint, stability risk);
+//!          the storage weight says how much the I/O objectives measured by
+//!          lpm-calibrate's IO phase count for the goal.
 //!          U = sum(w_o * effect_o) - MODESTY * deviation; the reference
 //!          ("leave it", or the kernel default) wins unless a candidate beats
 //!          it by MARGIN. Effects are ordinal estimates from kernel docs and
@@ -78,18 +80,26 @@ impl Goal {
 /// Objective weights. The goal gives the defaults; the user (GUI / CLI /
 /// scene) may override each one. Stability never drops below 0.5: weights
 /// shift trade-offs, hard constraints are not for sale.
+///
+/// `storage` is a relevance, not an objective: the calibrated I/O knobs (Storage rows, dirty
+/// window) are measured by their own benchmark suite, whose latency / throughput / power /
+/// footprint are weighed with the four weights above times `storage`. 0 = storage does not
+/// matter for this goal (the I/O knobs keep their rule-based values), 1 = an I/O effect counts
+/// as much as the same CPU/memory effect. The defaults follow what each goal waits on: a game
+/// streams assets but is mostly CPU/GPU-bound, a desktop waits on saves and launches, bulk work
+/// moves data.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Weights { pub latency: f64, pub throughput: f64, pub power: f64, pub footprint: f64, pub stability: f64 }
+pub struct Weights { pub latency: f64, pub throughput: f64, pub power: f64, pub footprint: f64, pub stability: f64, pub storage: f64 }
 
 impl Weights {
-    pub const KEYS: [&'static str; 5] = ["latency", "throughput", "power", "footprint", "stability"];
+    pub const KEYS: [&'static str; 6] = ["latency", "throughput", "power", "footprint", "stability", "storage"];
     pub fn for_goal(g: Goal) -> Weights {
-        let w = |latency, throughput, power, footprint| Weights { latency, throughput, power, footprint, stability: 1.0 };
+        let w = |latency, throughput, power, footprint, storage| Weights { latency, throughput, power, footprint, stability: 1.0, storage };
         match g {
-            Goal::Gaming => w(1.0, 0.6, 0.15, 0.4),
-            Goal::Desktop => w(0.7, 0.3, 0.7, 0.6),
-            Goal::Throughput => w(0.2, 1.0, 0.2, 0.5),
-            Goal::PowerSave => w(0.2, 0.1, 1.0, 0.5),
+            Goal::Gaming => w(1.0, 0.6, 0.15, 0.4, 0.5),
+            Goal::Desktop => w(0.7, 0.3, 0.7, 0.6, 0.6),
+            Goal::Throughput => w(0.2, 1.0, 0.2, 0.5, 0.7),
+            Goal::PowerSave => w(0.2, 0.1, 1.0, 0.5, 0.4),
         }
     }
     /// {"latency": 1.2, ...}; unknown keys and non-numbers are ignored.
@@ -100,14 +110,14 @@ impl Weights {
             let n = n.clamp(0.0, 3.0);
             match k.as_str() {
                 "latency" => self.latency = n, "throughput" => self.throughput = n, "power" => self.power = n,
-                "footprint" => self.footprint = n, "stability" => self.stability = n.max(0.5), _ => {}
+                "footprint" => self.footprint = n, "stability" => self.stability = n.max(0.5), "storage" => self.storage = n, _ => {}
             }
         }
         self
     }
     pub fn to_json(&self) -> Value {
         json!({"latency": self.latency, "throughput": self.throughput, "power": self.power,
-               "footprint": self.footprint, "stability": self.stability})
+               "footprint": self.footprint, "stability": self.stability, "storage": self.storage})
     }
 }
 
@@ -523,8 +533,8 @@ impl Profile {
     fn cur(&self, k: &str) -> Option<&str> { self.current.get(k).map(String::as_str) }
     /// Replaces a candidate's estimated latency/throughput/power/memory effects
     /// with calibrated ones (stability risk stays the model's).
-    fn apply_measured(&self, g: Goal, key: &str, reference: &str, value: &str, c: &mut Cand) {
-        let Some(m) = self.calibration.as_ref().and_then(|cal| cal.get(key, reference, value, calib::load_share(g.key()))) else { return };
+    fn apply_measured(&self, b: calib::Blend, key: &str, reference: &str, value: &str, c: &mut Cand) {
+        let Some(m) = self.calibration.as_ref().and_then(|cal| cal.get(key, reference, value, b)) else { return };
         overlay(&mut c.fx, m);
         c.why.push_str(" (effects measured on this machine)");
     }
@@ -615,6 +625,8 @@ pub const LIVE_KEYS: &[&str] = &[
     "vm.watermark_scale_factor", "vm.watermark_boost_factor", "vm.compaction_proactiveness",
     "vm.zone_reclaim_mode", "vm.vfs_cache_pressure", "vm.max_map_count", "mm.lru_gen_min_ttl",
     "zswap.enabled", "vm.dirty_bytes", "vm.dirty_background_bytes", "kernel.watchdog",
+    "blk.scheduler", "blk.wbt_lat_usec", "blk.read_ahead_kb", "blk.rq_affinity", "blk.nomerges", "blk.iostats",
+    "blk.add_random", "blk.nr_requests",
 ];
 
 const MTHP: [(&str, u32); 7] = [("thp.mthp_16k", 16), ("thp.mthp_32k", 32), ("thp.mthp_64k", 64), ("thp.mthp_128k", 128),
@@ -649,6 +661,8 @@ impl<'a> Rules<'a> {
         self.set(key, value, why);
     }
     fn is(&self, g: Goal) -> bool { self.g == g }
+    /// How this goal combines the calibration phases (load share, storage weight).
+    fn blend(&self) -> calib::Blend { calib::Blend::new(self.g.key(), self.w.storage) }
     fn u(&self, c: &Cand) -> f64 { c.fx.u(&self.w) - MODESTY * c.dev }
     /// Index of the winning alternative, None = the reference stays.
     fn pick(&mut self, key: &str, reference: &Cand, alts: &[Cand]) -> Option<usize> {
@@ -677,7 +691,7 @@ impl<'a> Rules<'a> {
             self.p.cur(key).map(str::to_owned).or_else(|| self.p.calibration.as_ref().and_then(|c| c.values(key, "")).map(|(r, _)| r))
         };
         alts.retain(|c| !self.p.measured_unsafe(key, &vstr(&c.value)));
-        if let Some(r) = ref_str { for c in alts.iter_mut() { self.p.apply_measured(self.g, key, &r, &vstr(&c.value), c); } }
+        if let Some(r) = ref_str { let b = self.blend(); for c in alts.iter_mut() { self.p.apply_measured(b, key, &r, &vstr(&c.value), c); } }
         self.choose_raw(key, reference, alts)
     }
 
@@ -693,7 +707,7 @@ impl<'a> Rules<'a> {
         alts.retain(|c| vstr(&c.value) != d0);
         match learned { Some(l) => for c in alts.iter_mut() { c.fx.risk += l; }, None => alts.clear() }
         let cal = self.p.calibration.as_ref();
-        let share = calib::load_share(self.g.key());
+        let share = self.blend();
         let seen = |v: &str| cal.and_then(|c| c.get(key, &d0, v, share)).map_or(0.0, |m| m.n);
         alts.retain_mut(|c| match anchor_dist(&vstr(&c.value), &d0) {
             // Measured twice or more: one more doubling is allowed.
@@ -731,7 +745,7 @@ impl<'a> Rules<'a> {
         let reference = self.p.boot_default(key).or_else(|| self.p.cur(key)).map(str::to_owned).unwrap_or_default();
         let Some((stored_ref, vals)) = cal.values(key, &reference) else { return false };
         let reference = if reference.is_empty() { stored_ref } else { reference };
-        let share = calib::load_share(self.g.key());
+        let share = self.blend();
         let mut alts: Vec<Cand> = vals.iter().filter(|v| **v != reference).map(|v| {
             let val = v.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(v));
             cand(val, Fx::default(), 0.2, format!("{key} = {v}."))
@@ -763,9 +777,14 @@ impl<'a> Rules<'a> {
 
 fn round2(x: f64) -> f64 { (x * 100.0).round() / 100.0 }
 
-/// log2 distance of two numeric values (+1 so 0 is reachable); None for text.
+/// log2 distance of two numeric values; None for text and for 0 against a non-zero value:
+/// 0 switches the feature off (writeback throttling, boosted reclaim, background compaction,
+/// APST, codec power-down), a mode change that costs like a choice. As a dose it sat ten or
+/// more doublings away from any boot value, so the 2x trust region silently dropped every
+/// "off" candidate whenever a boot snapshot existed.
 fn anchor_dist(a: &str, b: &str) -> Option<f64> {
     let (x, y) = (a.parse::<f64>().ok()?, b.parse::<f64>().ok()?);
+    if (x == 0.0) != (y == 0.0) { return None; }
     Some(((x.abs() + 1.0) / (y.abs() + 1.0)).log2().abs() + if x.signum() != y.signum() && x != 0.0 && y != 0.0 { 1.0 } else { 0.0 })
 }
 
@@ -813,7 +832,7 @@ impl<'a> Rules<'a> {
         let Some(learned) = self.p.learned_risk(key) else { return out };
         let d0 = self.p.boot_default(key).map(str::to_owned);
         let cal = self.p.calibration.as_ref();
-        let share = calib::load_share(self.g.key());
+        let share = self.blend();
         let strength = if key == "vm.watermark_scale_factor" { self.p.evidence.reclaim_strength() } else { 0.0 };
         let max_dist = 1.0 + 2.0 * strength;
         for v in values {
@@ -852,7 +871,7 @@ impl<'a> Rules<'a> {
 fn joint_pass(r: &mut Rules) {
     let Some(cal) = r.p.calibration.as_ref() else { return };
     let wts = [r.w.latency, r.w.throughput, r.w.power, r.w.footprint];
-    let Some(joint) = cal.joint(wts, calib::load_share(r.g.key())) else { return };
+    let Some(joint) = cal.joint(wts, r.blend()) else { return };
     let (mut keys, mut cands, mut fixed) = (Vec::new(), Vec::new(), Vec::new());
     for key in joint.keys() {
         let Some(reference) = cal.refs.get(&key).cloned() else { continue };
@@ -931,11 +950,11 @@ type Combo = (bool, bool, u32, Pace);
 
 /// Swaps the fault-time part of a THP combination (mode + mTHP) for the
 /// calibrated one; khugepaged's slow effects (max_ptes_none, pace) stay modelled.
-fn thp_measured(p: &Profile, g: Goal, c: Combo, f: &mut Fx) {
+fn thp_measured(p: &Profile, b: calib::Blend, c: Combo, f: &mut Fx) {
     let Some(cal) = p.calibration.as_ref() else { return };
     let label = format!("{}{}", if c.0 { "always" } else { "madvise" }, if c.1 { "+mthp" } else { "" });
     let m = if label == "madvise" { calib::Measured { lat: Some(0.0), thr: Some(0.0), pwr: Some(0.0), mem: Some(0.0), n: 99.0 } }
-            else { match cal.get("thp", "madvise", &label, calib::load_share(g.key())) { Some(m) => m, None => return } };
+            else { match cal.get("thp", "madvise", &label, b) { Some(m) => m, None => return } };
     let (em, _) = thp_fx(c.0, c.1, 511, Pace::Default);
     let mut model = *f;
     model.lat -= em.lat; model.thr -= em.thr; model.pwr -= em.pwr; model.mem -= em.mem;
@@ -977,7 +996,7 @@ fn thp_rules(r: &mut Rules) {
     let refc: Combo = anchor.unwrap_or((boot.as_deref() == Some("always"), false, 511, Pace::Default));
     let label = |c: Combo| json!(format!("{}{}/{}/{:?}", if c.0 { "always" } else { "madvise" }, if c.1 { "+mthp" } else { "" }, c.2, c.3));
     let (mut rf, rd0) = thp_fx(refc.0, refc.1, refc.2, refc.3);
-    thp_measured(p, r.g, refc, &mut rf);
+    thp_measured(p, r.blend(), refc, &mut rf);
     let reference = Cand { value: label(refc), fx: rf, dev: if anchor.is_some() { 0.0 } else { rd0 }, why: String::new() };
     let keys = ["thp.enabled", "thp.khp_max_ptes_none", "thp.khp_pages_to_scan", "thp.khp_scan_sleep_ms", "thp.mthp_16k", "thp.mthp_32k", "thp.mthp_64k"];
     let learned: Option<f64> = keys.iter().map(|k| p.learned_risk(k)).sum();
@@ -996,7 +1015,7 @@ fn thp_rules(r: &mut Rules) {
                     let Some(risk) = learned else { continue };
                     let (mut f, d) = thp_fx(always, mthp, pt, pace);
                     if p.measured_unsafe("thp", &format!("{}{}", if always { "always" } else { "madvise" }, if mthp { "+mthp" } else { "" })) { continue; }
-                    thp_measured(p, r.g, c, &mut f);
+                    thp_measured(p, r.blend(), c, &mut f);
                     f.risk += risk;
                     let dev = if anchor.is_some() { combo_dist(c, refc) } else { d };
                     alts.push(Cand { value: label(c), fx: f, dev, why: String::new() });
@@ -1081,7 +1100,7 @@ fn dirty_rules(r: &mut Rules) {
     alts.retain(|c| { let b = dirty_pair(rate, ram, c.value.as_f64().unwrap_or(1.0)); if seen.contains(&b) { false } else { seen.push(b); true } });
     for c in alts.iter_mut() {
         let t = format!("{}", c.value.as_f64().unwrap_or(1.0));
-        p.apply_measured(r.g, "vm.dirty", "1", &t, c);
+        p.apply_measured(r.blend(), "vm.dirty", "1", &t, c);
     }
     let win = r.pick("vm.dirty_bytes", &reference, &alts);
     let (t, c) = match win { Some(i) => (alts[i].value.as_f64().unwrap_or(1.0), &alts[i]), None => (1.0, &reference) };
@@ -2120,6 +2139,41 @@ mod tests {
         p.evidence = Evidence::default();
         p.current.insert("vm.vfs_cache_pressure".into(), "50".into());
         assert_eq!(get(&decide(Goal::Throughput, &p), "vm.vfs_cache_pressure"), Some(&json!(100)));
+    }
+
+    #[test]
+    fn off_is_a_mode_not_a_dose_for_the_trust_region() {
+        assert_eq!(anchor_dist("0", "15000"), None);
+        assert!((anchor_dist("7500", "15000").unwrap() - 1.0).abs() < 1e-3);
+        // Boot snapshot with boosted reclaim on, heavy file refaults: "off" must stay reachable
+        // (as a dose it was 14 doublings away and silently dropped by the 2x region).
+        let mut p = with_defaults(legion(), &[("vm.watermark_boost_factor", "15000")]);
+        p.evidence = Evidence { uptime_s: 86_400, workingset_refault_file: 86_400 * 4000, ..Default::default() };
+        let (d, sc, _) = decide_weighted(Goal::Gaming, &p, Weights::for_goal(Goal::Gaming));
+        assert_eq!(get(&d, "vm.watermark_boost_factor"), Some(&json!(0)), "{:?}", sc.get("vm.watermark_boost_factor"));
+    }
+
+    #[test]
+    fn storage_weight_scales_calibrated_io_knobs() {
+        let mut p = legion();
+        let mut cal = calib::Calibration::default();
+        let mut rng = model::Rng::new(4);
+        let rows: Vec<calib::Row> = (0..48).map(|i| {
+            let cfg: model::Cfg = if i % 3 == 0 { vec![] } else { vec![("blk.nomerges".into(), "2".into())] };
+            let on = !cfg.is_empty();
+            let n = ((rng.unit() + rng.unit()) - 1.0) * 0.01;
+            calib::Row { phase: calib::Phase::Io, sess: 2, pos: i as f64 / 48.0, t: i, kernel: String::new(), cfg,
+                         y: [n, if on { 0.12 } else { 0.0 } + n, n, n], w: 1.0, bv: calib::BENCH_VERSION }
+        }).collect();
+        cal.put_session(calib::Phase::Io, 2, rows);
+        cal.refs.insert("blk.nomerges".into(), "0".into());
+        p.calibration = Some(cal);
+        p.current.insert("blk.nomerges".into(), "0".into());
+        let w = Weights::for_goal(Goal::Throughput);
+        assert_eq!(get(&decide_weighted(Goal::Throughput, &p, w).0, "blk.nomerges"), Some(&json!(2)), "measured +12 % I/O throughput");
+        let off = Weights { storage: 0.0, ..w };
+        assert!(get(&decide_weighted(Goal::Throughput, &p, off).0, "blk.nomerges").is_none(), "storage weight 0: the I/O gain counts for nothing");
+        assert_eq!(Weights::for_goal(Goal::Gaming).with_overrides(&json!({"storage": 2.5})).storage, 2.5);
     }
 
     #[test]

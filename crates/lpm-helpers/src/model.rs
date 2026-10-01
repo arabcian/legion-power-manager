@@ -88,8 +88,13 @@ pub fn cluster(key: &str) -> u8 {
 fn pos(x: f64) -> f64 { (x.abs() + 1.0).log2() * if x < 0.0 { -1.0 } else { 1.0 } }
 
 /// log2 distance of two values on the dose axis (None for text).
+/// 0 against a non-zero value is no distance at all (None): 0 switches the feature off
+/// (writeback throttling, boosted reclaim, background compaction, APST, ...), a mode change
+/// costed like a choice, not a dose ten doublings away.
 pub fn dose_dist(a: &str, b: &str) -> Option<f64> {
-    Some((pos(a.trim().parse::<f64>().ok()?) - pos(b.trim().parse::<f64>().ok()?)).abs())
+    let (x, y) = (a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?);
+    if (x == 0.0) != (y == 0.0) { return None; }
+    Some((pos(x) - pos(y)).abs())
 }
 
 /// Utility cost of leaving the reference (same modesty as autotune's default).
@@ -104,7 +109,8 @@ pub fn with_mids(reference: &str, values: &[String]) -> Vec<String> {
     let mut out: Vec<String> = values.to_vec();
     for w in nums.windows(2) {
         let (a, b) = (w[0], w[1]);
-        if a < 0 || b - a < 2 { continue; }
+        // No dose between "off" (0) and a setting: 0 is a mode, not the end of the ladder.
+        if a <= 0 || b - a < 2 { continue; }
         let mid = (((a as f64 + 1.0) * (b as f64 + 1.0)).sqrt() - 1.0).round() as i64;
         let s = mid.to_string();
         if mid > a && mid < b && !out.contains(&s) { out.push(s); }
@@ -758,30 +764,34 @@ impl Model {
     }
 }
 
-/// Idle and load models blended by the goal's load share. A knob only one phase
-/// models keeps its full weight there.
-pub struct Joint { pub idle: Option<Model>, pub load: Option<Model>, pub share: f64 }
+/// Idle and load models blended by the goal's load share (a knob only one of them models
+/// keeps its full weight there), plus the IO model, whose knobs no other phase models: its
+/// objective weights already carry the goal's storage weight, so it simply adds.
+pub struct Joint { pub idle: Option<Model>, pub load: Option<Model>, pub io: Option<Model>, pub share: f64 }
 
 impl Joint {
-    pub fn model(&self, which: usize) -> Option<&Model> { if which == 0 { self.idle.as_ref() } else { self.load.as_ref() } }
+    pub fn model(&self, which: usize) -> Option<&Model> { match which { 0 => self.idle.as_ref(), 1 => self.load.as_ref(), _ => self.io.as_ref() } }
     pub fn single_phase(&self) -> Option<usize> {
-        match (self.idle.is_some(), self.load.is_some()) { (true, false) => Some(0), (false, true) => Some(1), _ => None }
+        let have: Vec<usize> = (0..3).filter(|w| self.model(*w).is_some()).collect();
+        (have.len() == 1).then(|| have[0])
     }
+    fn models(&self) -> impl Iterator<Item = &Model> + '_ { [&self.idle, &self.load, &self.io].into_iter().filter_map(|m| m.as_ref()) }
     pub fn keys(&self) -> Vec<String> {
-        let mut k: Vec<String> = [&self.idle, &self.load].iter().filter_map(|m| m.as_ref()).flat_map(|m| m.space.factors.iter().map(|f| f.key.clone())).collect();
+        let mut k: Vec<String> = self.models().flat_map(|m| m.space.factors.iter().map(|f| f.key.clone())).collect();
         k.sort(); k.dedup();
         k
     }
     pub fn values(&self, key: &str) -> Vec<String> {
-        let mut v: Vec<String> = [&self.idle, &self.load].iter().filter_map(|m| m.as_ref()).filter_map(|m| m.space.fidx(key).map(|i| m.space.factors[i].values.clone())).flatten().collect();
+        let mut v: Vec<String> = self.models().filter_map(|m| m.space.fidx(key).map(|i| m.space.factors[i].values.clone())).flatten().collect();
         v.sort(); v.dedup();
         v
     }
     /// The configuration as a functional of one phase's model: terms made only of knobs both
-    /// phases model count with the phase's blend share, all others in full.
+    /// idle and load model count with the phase's blend share, all others in full.
     pub fn feats(&self, cfg: &[(String, String)], which: usize) -> Func {
         let Some(m) = self.model(which) else { return Func::default() };
         let Some(p) = m.space.parse(cfg, false) else { return Func::default() };
+        if which == 2 { return Func::of(p); }
         let Some(other) = self.model(1 - which) else { return Func::of(p) };
         let f = if which == 1 { self.share } else { 1.0 - self.share };
         let shared = p.keep(|i| other.space.has(&m.space.factors[i as usize].key));
@@ -789,22 +799,22 @@ impl Joint {
         Func(vec![(p, 1.0), (shared, f - 1.0)])
     }
     pub fn mean(&self, cfg: &[(String, String)]) -> f64 {
-        (0..2).filter_map(|w| self.model(w).map(|m| m.mean(&self.feats(cfg, w)))).sum()
+        (0..3).filter_map(|w| self.model(w).map(|m| m.mean(&self.feats(cfg, w)))).sum()
     }
     pub fn eval(&self, cfg: &[(String, String)]) -> (f64, f64) {
         let (mut mu, mut var) = (0.0, 0.0);
-        for w in 0..2 { if let Some(m) = self.model(w) { let f = self.feats(cfg, w); mu += m.mean(&f); var += m.var(&f); } }
+        for w in 0..3 { if let Some(m) = self.model(w) { let f = self.feats(cfg, w); mu += m.mean(&f); var += m.var(&f); } }
         (mu, var)
     }
     /// Effect of `a` minus effect of `b`: (mean, variance) of the difference.
     pub fn eval_diff(&self, a: &[(String, String)], b: &[(String, String)]) -> (f64, f64) {
         let (mut mu, mut var) = (0.0, 0.0);
-        for w in 0..2 { if let Some(m) = self.model(w) { let f = sub(&self.feats(a, w), &self.feats(b, w)); mu += m.mean(&f); var += m.var(&f); } }
+        for w in 0..3 { if let Some(m) = self.model(w) { let f = sub(&self.feats(a, w), &self.feats(b, w)); mu += m.mean(&f); var += m.var(&f); } }
         (mu, var)
     }
     fn pair_strength(&self) -> HashMap<(String, String), f64> {
         let mut out = HashMap::new();
-        for w in 0..2 { if let Some(m) = self.model(w) { for (k, s) in m.pair_strength() { *out.entry(k).or_insert(0.0) += s; } } }
+        for w in 0..3 { if let Some(m) = self.model(w) { for (k, s) in m.pair_strength() { *out.entry(k).or_insert(0.0) += s; } } }
         out
     }
 }
@@ -1132,7 +1142,7 @@ mod tests {
             cfg: cfg.clone(), y: [truth(cfg) + ((rng.unit() + rng.unit() + rng.unit()) - 1.5) * sd, f64::NAN, f64::NAN, f64::NAN],
             w: 1.0, sess: 1, pos: i as f64 / design.len() as f64, t: i as f64 * 5.0 }).collect()
     }
-    fn joint_of(m: Model) -> Joint { Joint { idle: Some(m), load: None, share: 0.5 } }
+    fn joint_of(m: Model) -> Joint { Joint { idle: Some(m), load: None, io: None, share: 0.5 } }
 
     /// Synthetic machine: a synergy (a+b), a redundancy (c or d), a dose-response (e), a harmful knob (f), noise.
     fn truth(cfg: &Cfg) -> f64 {
@@ -1217,6 +1227,9 @@ mod tests {
         let d = sub(&Func::of(p160.clone()), &Func::of(p40));
         assert_eq!((d.0.len(), d.0[1].1), (2, -1.0));
         assert_eq!(with_mids("128", &["256".into(), "1024".into()]).len(), 4);
+        assert_eq!(with_mids("2000", &["0".into(), "1000".into()]), vec!["0", "1000", "1414"], "nothing between off and a dose");
+        assert_eq!(dose_dist("0", "15000"), None);
+        assert!((dose_dist("64", "128").unwrap() - (129f64 / 65.0).log2()).abs() < 1e-9);
         assert!(norm_cdf(0.0) - 0.5 < 1e-6 && norm_cdf(3.0) > 0.99);
         assert!(modest_cost("1", "8") < modest_cost("1", "2"));
         assert_eq!(s.step_value(0, 1), "160");
@@ -1332,7 +1345,7 @@ mod tests {
             let f1 = ps.fit_obj(1, Some(f0.hyper), 0).unwrap();
             let t3 = t.elapsed();
             let m = Model::new(ps.space.clone(), [Some(f0), Some(f1), None, None], [1.0, 0.6, 0.0, 0.0]).unwrap();
-            let j = Joint { idle: None, load: Some(m), share: 0.5 };
+            let j = Joint { idle: None, load: Some(m), io: None, share: 0.5 };
             let cfg: Cfg = d[3].clone();
             let t4 = std::time::Instant::now();
             let mut acc = 0.0;
