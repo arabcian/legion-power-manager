@@ -364,7 +364,8 @@ void OptimizeTab::buildUi() {
                                         "Nothing is written until you press Apply checked; Save turns it into a preset."));
     connect(autoBtn_, &QPushButton::clicked, this, &OptimizeTab::runAutotune);
     auto *weightsBtn = new QPushButton(QStringLiteral("Weights…"));
-    weightsBtn->setToolTip(QStringLiteral("How much this base values latency, throughput, power, memory footprint and stability.\n"
+    weightsBtn->setToolTip(QStringLiteral("How much this base values latency, throughput, power, memory footprint, stability\n"
+                                          "and how much the calibrated storage benchmarks count.\n"
                                           "Autotune writes a setting only when its expected gain under these weights beats leaving it alone;\n"
                                           "hard safety limits cannot be bought with weights."));
     connect(weightsBtn, &QPushButton::clicked, this, &OptimizeTab::editAutotuneWeights);
@@ -1315,12 +1316,13 @@ void OptimizeTab::runAutotune() {
 
 // Mirror of lpm_helpers::autotune::Weights::for_goal (only used to prefill the editor).
 static QList<double> defaultWeights(const QString &goal) {
-    if (goal == QLatin1String("gaming")) return {1.0, 0.6, 0.15, 0.4, 1.0};
-    if (goal == QLatin1String("throughput")) return {0.2, 1.0, 0.2, 0.5, 1.0};
-    if (goal == QLatin1String("powersave")) return {0.2, 0.1, 1.0, 0.5, 1.0};
-    return {0.7, 0.3, 0.7, 0.6, 1.0};
+    if (goal == QLatin1String("gaming")) return {1.0, 0.6, 0.15, 0.4, 1.0, 0.5};
+    if (goal == QLatin1String("throughput")) return {0.2, 1.0, 0.2, 0.5, 1.0, 0.7};
+    if (goal == QLatin1String("powersave")) return {0.2, 0.1, 1.0, 0.5, 1.0, 0.4};
+    return {0.7, 0.3, 0.7, 0.6, 1.0, 0.6};
 }
-static const char *const WEIGHT_KEYS[] = {"latency", "throughput", "power", "footprint", "stability"};
+static const char *const WEIGHT_KEYS[] = {"latency", "throughput", "power", "footprint", "stability", "storage"};
+static constexpr int N_WEIGHTS = int(sizeof(WEIGHT_KEYS) / sizeof(WEIGHT_KEYS[0]));
 
 QJsonObject OptimizeTab::autotuneWeights(const QString &goal) const {
     const QByteArray raw = QSettings().value(QStringLiteral("autotune/weights/") + goal).toByteArray();
@@ -1335,11 +1337,13 @@ void OptimizeTab::editAutotuneWeights() {
     dlg.setWindowTitle(QStringLiteral("Autotune weights — %1").arg(autoGoal_->currentText()));
     auto *form = new QFormLayout(&dlg);
     form->addRow(muted(QStringLiteral("0 = ignore this objective, 1 = the goal's normal emphasis, up to 3.\n"
-                                      "Stability cannot go below 0.5. Saved per goal.")));
+                                      "Stability cannot go below 0.5. Saved per goal.\n"
+                                      "Storage: how much the calibrated disk benchmarks count (Storage rows, dirty window);\n"
+                                      "their latency/throughput/power/footprint are weighed with the weights above times this.")));
     const QStringList labels = {QStringLiteral("Latency / smoothness"), QStringLiteral("Throughput"), QStringLiteral("Power / heat"),
-                                QStringLiteral("Memory footprint"), QStringLiteral("Stability")};
+                                QStringLiteral("Memory footprint"), QStringLiteral("Stability"), QStringLiteral("Storage (I/O) relevance")};
     QList<QDoubleSpinBox *> boxes;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < N_WEIGHTS; ++i) {
         auto *b = new QDoubleSpinBox;
         b->setRange(i == 4 ? 0.5 : 0.0, 3.0);
         b->setSingleStep(0.1);
@@ -1349,14 +1353,14 @@ void OptimizeTab::editAutotuneWeights() {
         boxes << b;
     }
     auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel | QDialogButtonBox::RestoreDefaults);
-    connect(bb->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, &dlg, [&] { for (int i = 0; i < 5; ++i) boxes[i]->setValue(def[i]); });
+    connect(bb->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, &dlg, [&] { for (int i = 0; i < N_WEIGHTS; ++i) boxes[i]->setValue(def[i]); });
     connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     form->addRow(bb);
     if (dlg.exec() != QDialog::Accepted) return;
     QJsonObject w;
     bool custom = false;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < N_WEIGHTS; ++i) {
         w[WEIGHT_KEYS[i]] = boxes[i]->value();
         custom |= qAbs(boxes[i]->value() - def[i]) > 1e-6;
     }
