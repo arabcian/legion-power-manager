@@ -192,6 +192,18 @@ fn wmae_get(id: u32) -> Result<i64, String> {
     parse_u64(&acpi_raw(&expr)?).map(|v| v as i64).ok_or_else(|| "WMAE get: unparseable".into())
 }
 
+/// dGPU temperature as the EC measures it (WMAE GPUCurrentTemperature,
+/// 0x05050000). An EC field read: it does not touch the NVIDIA driver, so it
+/// neither wakes a suspended GPU nor resets its idle timer. None = the EC has
+/// no plausible reading (GPU powered off reads 0). Err = no acpi_call / the
+/// firmware does not implement the feature.
+pub fn ec_gpu_temp() -> Result<Option<i64>, String> {
+    if !acpi_available() { modprobe_acpi_call(); }
+    if !acpi_available() { return Err("acpi_call is not loaded (modprobe acpi_call)".into()); }
+    let t = wmae_get(0x0505_0000)?;
+    Ok((1..=125).contains(&t).then_some(t))
+}
+
 fn wmae_set(id: u32, value: i64) -> Result<(), String> {
     let a = id.to_le_bytes();
     let v = (value as u32).to_le_bytes();

@@ -39,6 +39,16 @@
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/nvcurve-sensors</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
+  <action id="com.legion-power-manager.ec.sensors">
+    <description>Read the GPU temperature from the embedded controller (read-only)</description>
+    <description xml:lang="tr">GPU sıcaklığını gömülü denetleyiciden (EC) oku (salt okunur)</description>
+    <message>Authentication is required to read EC sensors</message>
+    <message xml:lang="tr">EC sensörlerini okumak için kimlik doğrulama gerekiyor</message>
+    <!-- Read-only, one fixed WMI feature id, no input: the active local session gets it without a prompt. -->
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>yes</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/legion-ec-sensors</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
   <action id="com.legion-power-manager.amdgpu.tune">
     <description>Change AMD GPU clocks, voltage, power limit and fan settings via Legion Power Manager</description>
     <description xml:lang="tr">Legion Power Manager üzerinden AMD GPU saat, voltaj, güç limiti ve fan ayarlarını değiştir</description>
