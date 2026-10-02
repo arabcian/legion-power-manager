@@ -1903,9 +1903,22 @@ fn usb_pm_files(rel: &str) -> Vec<PathBuf> {
     v
 }
 
+/// Samsung OLED laptop panels ("ATNA...") have no backlight for ABM to modulate;
+/// the knob answers EBUSY on every write, so such connectors are not offered.
+fn edid_is_oled(edid: &Path) -> bool {
+    let Ok(b) = std::fs::read(edid) else { return false };
+    if b.len() < 128 { return false; }
+    [54usize, 72, 90, 108].iter().any(|&o| {
+        b[o..o + 3] == [0, 0, 0] && b[o + 3] == 0xFC
+            && String::from_utf8_lossy(&b[o + 5..o + 18]).trim_start().starts_with("ATNA")
+    })
+}
+
 fn amdgpu_abm_files() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten()
         .filter(|e| { let n = e.file_name().to_string_lossy().into_owned(); n.starts_with("card") && n.contains("-eDP-") })
+        .filter(|e| read(&e.path().join("enabled")).as_deref() == Some("enabled"))
+        .filter(|e| !edid_is_oled(&e.path().join("edid")))
         .map(|e| e.path().join("amdgpu/panel_power_savings"))
         .filter(|p| p.is_file())
         .filter_map(|p| canonical_in_sysfs(&p))
