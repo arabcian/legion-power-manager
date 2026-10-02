@@ -21,7 +21,7 @@ required, no telemetry, works on OpenRC and systemd.
 | **NVIDIA Curve Optimizer** | Drag-and-edit V/F curve, core/memory offsets, named profiles, apply at boot |
 | **Ryzen Curve Optimizer** *(AMD)* | Per-core and all-core Curve Optimizer, CPPC-ranked cores, profiles |
 | **Intel Undervolt** *(Intel)* | Voltage offsets, IccMax, TCC offset, PL1/PL2, AC/battery profiles, ThrottleStop.ini import, live throttle monitor |
-| **Optimizations** | ~80 documented CPU/memory/scheduler/power/storage knobs, weighted, hardware-aware **Autotune** (power saving · gaming · throughput · desktop; see [Autotune](#autotune) below), built-in presets, game launch hooks for Lutris and Steam, boot-parameter advisor, one-click *Restore originals* |
+| **Optimizations** | ~80 documented CPU/memory/scheduler/power/storage knobs, weighted, hardware-aware **Autotune** (power saving · gaming · throughput · desktop; see [Autotune](#autotune) below), built-in presets, game launch hooks for Lutris and Steam, boot-parameter advisor, one-click *Restore originals* and *Return to boot-guard defaults* (pauses Scenes, rewrites every knob to the value `lpm-boot-guard` captured at boot — the clean baseline before calibrating) |
 | **Lighting** *(Gen10 Spectrum keyboards)* | Per-key RGB editor on a drawing of your own keyboard, firmware effects, 6 hardware profiles, brightness, lid logo, accent lights |
 
 Everything important is also in the **tray menu**. Every setting has a tooltip
