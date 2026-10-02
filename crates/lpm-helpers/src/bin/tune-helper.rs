@@ -21,6 +21,8 @@
 //!   {"op":"prune"}                                     end sessions whose launcher died
 //!   {"op":"restore"}                                   write every saved original back now
 //!   {"op":"restore_keys","keys":[k,..]}                restore only these knobs
+//!   {"op":"restore_defaults"}                          restore, then write every knob to the value lpm-boot-guard
+//!       captured early in this boot (defaults.json) — also what TLP or anything else changed since; calibration anchor
 //!   {"op":"snapshot"}                                  refresh the readable copy of debugfs values (also done after every root op)
 //!   {"op":"boost","nice":-5,"autogroup":true}          renice the process that ran pkexec
 //!   {"op":"set_boot","values":{..}|null,"preset":".."} store/clear the boot preset (root-owned file)
@@ -92,7 +94,7 @@ fn profile_role() -> bool { env!("CARGO_BIN_NAME") == "tune-profile-helper" }
 /// Ops tune-profile-helper serves as root. None can put a value on the kernel that the user has not approved:
 /// stored presets by name, restoring saved originals, game-session bookkeeping, fixed read-only tools, and the
 /// root-owned boot preset. (Read-only ops that need no root are answered before this check.)
-const PROFILE_OPS: &[&str] = &["snapshot", "apply_preset", "release", "prune", "restore", "restore_keys", "boost", "isolate_join", "tool", "boot"];
+const PROFILE_OPS: &[&str] = &["snapshot", "apply_preset", "release", "prune", "restore", "restore_keys", "restore_defaults", "boost", "isolate_join", "tool", "boot"];
 
 struct Lock(#[allow(dead_code)] fs::File);
 
@@ -586,6 +588,33 @@ fn op_restore(req: &Value) -> Value {
     })
 }
 
+/// Back to the boot defaults lpm-boot-guard captured (defaults.json): first everything LPM changed goes
+/// back (ends game mode), then every knob in the snapshot is written to its boot value, including what TLP
+/// or another tool changed after the snapshot. The root-owned snapshot is the only source of values.
+fn op_restore_defaults() -> Value {
+    let Some(d) = lpm_helpers::defaults::load() else {
+        return json!({"ok": false, "error": "no boot-default snapshot yet: lpm-boot-guard writes it early in every boot (enable the lpm-boot-guard service and reboot)"});
+    };
+    let values: Map<String, Value> = d.values.iter().filter(|(k, _)| tune::find(k).is_some())
+        .map(|(k, v)| (k.clone(), json!(v))).collect();
+    if values.is_empty() { return json!({"ok": false, "error": "the boot-default snapshot holds no known settings"}); }
+    locked(|st| {
+        let r = restore_entries(st, None);
+        let (results, all_ok) = apply_values(st, &values);
+        let failed: Vec<String> = results.iter().filter(|x| x["ok"] == json!(false))
+            .filter_map(|x| x["key"].as_str().map(str::to_owned)).collect();
+        // A knob now at its boot value has nothing left to undo; one that failed keeps its recorded original.
+        st.baseline.retain(|(k, _, _)| !values.contains_key(k) || failed.contains(k));
+        if st.baseline.is_empty() { st.sessions.clear(); st.preset = None; st.source = None; }
+        let written: u64 = results.iter().filter_map(|x| x["written"].as_u64()).sum();
+        let restore_ok = r["errors"].as_array().map_or(true, |a| a.is_empty());
+        let ok = all_ok && restore_ok;
+        json!({"ok": ok, "results": [r], "applied": results, "written": written, "failed": failed,
+               "snapshot": {"clean": d.clean, "kernel": d.kernel, "keys": values.len()},
+               "error": (!ok).then_some("some settings could not be returned to their boot default")})
+    })
+}
+
 /// Real uid of `pid` from /proc/<pid>/status.
 fn proc_ruid(pid: i32) -> Option<u32> {
     let s = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -876,6 +905,7 @@ fn run() -> Value {
         // Ends game sessions whose launcher died (pruning runs in every locked op).
         "prune" => locked(|_| json!({"ok": true})),
         "restore" | "restore_keys" => op_restore(&req),
+        "restore_defaults" => op_restore_defaults(),
         "boost" => op_boost(&req),
         "isolate_join" => op_isolate_join(&req),
         "tool" => lpm_helpers::tools::run(req["tool"].as_str().unwrap_or("")),
@@ -905,7 +935,7 @@ fn run() -> Value {
         _ => json!({"ok": false, "error": "unknown op"}),
     };
     // Unprivileged describe reads the debugfs values from this copy (debugfs stays root-only).
-    if matches!(op, "snapshot" | "apply" | "apply_preset" | "release" | "restore" | "restore_keys" | "boot" | "prune") { tune::write_debugfs_snapshot(); }
+    if matches!(op, "snapshot" | "apply" | "apply_preset" | "release" | "restore" | "restore_keys" | "restore_defaults" | "boot" | "prune") { tune::write_debugfs_snapshot(); }
     out
 }
 
