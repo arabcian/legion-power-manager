@@ -11,7 +11,11 @@ There are two kinds of rules.
 **Structural rules** have one right answer for the hardware: amd-pstate active,
 V-Cache CCD roles, game affinity / IRQ steering on X3D, amdgpu DPM `auto`,
 bringing a parked CCD back, BBR + fq, swap cost model (kernel doc: swappiness
-> 100 for in-memory swap).
+> 100 for in-memory swap), and amd-pstate's per-core **EPP boost** (`cpu.epp_boost`,
+patched kernels): on for **Gaming** and **Throughput** as part of the goal itself -
+neither the signature nor the joint model can take it away (it stays in the model
+as fixed context, so the other knobs are decided next to it). Desktop turns it on
+by rule, power saving off; there the measurements may overrule the rule (below).
 
 **Scored knobs** are every setting with a real trade-off. Each candidate value
 has an effect vector over five objectives relative to the reference
@@ -29,6 +33,29 @@ has an effect vector over five objectives relative to the reference
 beats the reference by 0.03 — otherwise the setting is left alone. Effects are
 ordinal estimates taken from kernel documentation plus this machine's evidence;
 a knob that fixes a problem the machine does not show earns nothing.
+
+## Rules and measurements
+
+A rule's choice is prior knowledge (kernel documentation plus this machine's
+evidence); a calibration run is a measurement with a field of view. Two things
+keep a benchmark that cannot see a knob from voting on it:
+
+- **Seen or not.** A knob counts as *seen* when at least one of its values moves
+  this goal's utility by 2 posterior standard deviations in the joint model. Only
+  then do measured effects replace the rule's estimates (in proportion to the
+  evidence, as before). For a knob the benchmarks do not see, "measured: no
+  effect" is the benchmark's blindness: the estimate stays.
+- **A rule's choice needs credible evidence against it.** In the joint pass a
+  value chosen by a rule pays neither margin nor modesty and goes back to the
+  reference only when the model puts it below the reference with confidence
+  (mean + 1 sd < 0, in the context of the other choices). Values picked from the
+  measurements alone (keys no rule knows) and every *additional* change still
+  have to clear the margin in context.
+
+Before this, every calibrated knob had to prove itself again in the benchmarks:
+whatever they could not measure went back to its boot default, and the more a
+machine was calibrated the less autotune changed. The notes of a run say how
+many rule-based choices were kept and how many of them sit on unseen knobs.
 
 Default weights (latency, throughput, power, footprint, stability, storage):
 
@@ -172,11 +199,11 @@ union of the benches the phase's knobs need), so any goal or custom weights are
 decided from the same data — experiments are goal-agnostic, fits are per
 objective and combined per goal without refitting.
 
-**Phases.** Idle: quiet machine (idle power, single/all-thread work, work per
-joule, wake-up, frame-loop and thread ping-pong latency, heap probes). Load: a
-ballast child holds memory down to
+**Phases.** Idle: quiet machine (idle power, single-thread work, wake-up, frame-loop
+and thread ping-pong latency, the game loop, the contended window, short jobs,
+heap probes). Load: a ballast child holds memory down to
 max(1 GiB, 5 % RAM) free, re-faults 64 MiB blocks and keeps half the CPUs busy
-(wake-up and ping-pong latency, allocation stalls/s, heap probe, package power).
+(the same CPU suite, allocation stalls/s, heap probe, package power).
 Every 4th ballast block is small pages with every other page freed again and is
 re-made now and then (compaction heals it): free memory without a free 2 MiB
 block, as on a machine that has been up for days — what THP defrag and the
@@ -223,6 +250,25 @@ C-state exit and how fast the clock comes up for a short burst after idling
 (EPP, boost, idle governor, wake-up QoS). The sleeper (wake p99) and the
 sustained spin (1-thread work) each see only part of it.
 
+**Workloads the knobs act on** (benchmark set 4). The earlier CPU suite had two
+kinds of load: a core that is 7 % busy (frame loop) and cores that are 100 % busy
+(1-thread and all-thread spin) on a machine with free CPUs. Most CPU and scheduler
+knobs do their work in between, or only when CPUs are short:
+
+| probe | metric (objective) | what moves it |
+|---|---|---|
+| **game loop**: 125 Hz frame, main thread ~60 % busy (4.8 ms fixed work, 1 MiB set), a 2.4 ms job to each of 3 worker threads per frame; frame ends when all are done | typical frame time (thr = fps), frame tail (lat = 1 % lows) | EPP, per-core EPP boost (acts on cores more than half busy), boost, CCD clock caps, C-states, where job threads wake up |
+| frame loop, 240 Hz, 7 % busy | tail and now also the **median** (lat) | timer wake-up, C-state exit, clock given to a mostly idle core; the median carries the same effect at a fraction of the tail's noise |
+| **contended window**: 1.5 spinning threads per CPU plus the frame loop | all-thread work, work/joule, frame tail with every CPU taken (lat) | slice, preemption, wake-up placement, migration cost, BORE - with free CPUs these have nothing to decide |
+| **short jobs**: half the CPUs keep starting a child that faults a fresh 8 MiB heap, works 2 ms and exits | jobs/s (thr) | placement and clock ramp of new tasks, exec/fault path, THP; under load: reclaim on every fresh heap |
+
+The fixed work is sized once per session, before any knob is touched (iterations
+per millisecond at full clock, best of 12 windows), so it never scales with the
+clock a setting gives. A CPU run takes about 6.7 s idle and 4.2 s loaded (5.4 / 2.5
+before): fewer runs per session, each of which can see the knob it changes.
+`kernel.sched_burst_cache_lifetime` (BORE) is no longer excluded - the short jobs
+are the fork benchmark it lacked.
+
 **Storage suite** (IO phase, `size` = 256 MiB, 512 with `--thorough`; unlinked
 temp files):
 
@@ -245,9 +291,23 @@ measured from the suite disk's value; unplug removable disks before
 calibrating. One IO run writes about 1.5 × `size`. The idle phase no longer
 runs the I/O benchmark, so a full session writes less than before.
 
+**Objective scale.** An objective used to be the mean of its metrics. A knob moves
+the one or two metrics it acts on, so every benchmark added made every knob look
+smaller: a 10 % better frame tail among eight latency metrics came out as 1.3 %,
+under the 0.03 margin whatever the evidence. An objective is now the gain *summed*
+over its metrics, counted as if two of them carried it (noise-weighted mean × k/2,
+never below the mean): that frame tail is worth 5 %, and a knob lands on the same
+scale whether or not the session also ran the memory probes.
+
+**Older signatures.** Idle/load rows and one-at-a-time records of benchmark sets
+1-3 are dropped when the file is read (they were blind to most CPU and scheduler
+knobs and would vote "no effect" against the new runs); those phases start over.
+IO rows are kept and rescaled (the storage suite is unchanged), unsafe values and
+unsafe sets stay. `lpm-calibrate` says so once; a few lean sessions rebuild it.
+
 **From runs to a model** (`src/model.rs`). Per run and metric: log-ratio to the
-session's reference runs (+ = better), clipped to ±0.5, then averaged per
-objective **weighted by the metric's noise**: from the session's reference runs
+session's reference runs (+ = better), clipped to ±0.5, then combined per
+objective (scale above) **weighted by the metric's noise**: from the session's reference runs
 (robust sd of the log values) w = 1 / (sd² + mean sd² of the objective) —
 halfway between equal weights and inverse variance — kept within ⅓…3× of the
 equal share (fewer than 4 reference runs: equal weights). A tail that jumps
@@ -290,7 +350,10 @@ process per objective (Bayesian regression in kernel form):
   together — coordinate ascent, joint moves of coupled pairs, restarts — on the
   posterior mean minus 0.5 sd, minus modesty and learned rollback risk, and a
   margin (0.03) that every change must pay by itself. The per-knob choices are
-  the starting point, so the outcome is never worse under the model;
+  the starting point, so the outcome is never worse under the model; a rule's
+  choice among them is held unless the model credibly contradicts it (see
+  *Rules and measurements*), and a rule's value that was never measured is left
+  out of the search;
 - every change is then checked *in context*: gain of the whole combination
   minus the combination without that knob, lower bound `mean − 0.5·sd ≥ margin`,
   else the knob goes back to its reference (this is what drops a redundant

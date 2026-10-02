@@ -218,6 +218,14 @@ struct Ctx { exe: PathBuf, dir: String, disk: Option<String>, io_size: usize, sc
 
 fn ms(c: &Ctx, base: u64) -> Duration { Duration::from_millis((base as f64 * c.scale) as u64) }
 
+/// Latency side of the CPU benchmarks, the same on a quiet and on a loaded machine: thread
+/// ping-pong, the light frame loop (tail and median) and the game loop (frame time and tail).
+fn cpu_suite(c: &Ctx, s: &mut Sample) {
+    if let Some(p) = bench::pingpong_p99_us(2000) { s.insert(Metric::PingPongP99Us, p); }
+    if let Some((t, m)) = bench::frame_us(ms(c, 600)) { s.insert(Metric::FrameP99Us, t); s.insert(Metric::FrameMedUs, m); }
+    if let Some((m, t)) = bench::game_loop(ms(c, 720)) { s.insert(Metric::GameFrameMs, m); s.insert(Metric::GameTailMs, t); }
+}
+
 fn run_idle(b: Benches, c: &Ctx) -> Result<Sample, String> {
     // Page cache and fragmentation only matter to the heap and I/O probes.
     if b.io || b.cpu_mem { bench::settle(); } else { std::thread::sleep(Duration::from_millis(300)); }
@@ -230,13 +238,14 @@ fn run_idle(b: Benches, c: &Ctx) -> Result<Sample, String> {
         if let Some(w) = bench::wake_p99_us(ms(c, 600)) { s.insert(Metric::WakeP99Us, w); }
     }
     if b.cpu {
-        if let Some(f) = bench::frame_tail_us(ms(c, 600)) { s.insert(Metric::FrameP99Us, f); }
+        cpu_suite(c, &mut s);
         s.insert(Metric::CpuSingle, bench::cpu_single(ms(c, 400)));
-        let (rate, eff) = bench::cpu_multi(ms(c, 600));
-        s.insert(Metric::CpuMulti, rate);
-        if let Some(e) = eff { s.insert(Metric::CpuEff, e); }
-        if let Some(p) = bench::pingpong_p99_us(2000) { s.insert(Metric::PingPongP99Us, p); }
+        let k = bench::contended(ms(c, 600));
+        s.insert(Metric::CpuMulti, k.rate);
+        if let Some(e) = k.eff { s.insert(Metric::CpuEff, e); }
+        if let Some(f) = k.frame_tail { s.insert(Metric::BusyFrameP99Us, f); }
     }
+    if b.cpu || b.cpu_mem { if let Some(j) = bench::jobs_per_sec(&c.exe, ms(c, 450)) { s.insert(Metric::JobsPerSec, j); } }
     if b.cpu_mem { bench::probe_child(&c.exe, 512, &mut s)?; }
     if b.io { bench::io(&c.dir, c.io_size, &mut s)?; }
     Ok(s)
@@ -251,10 +260,15 @@ fn run_load(b: Benches, c: &Ctx) -> Result<(Sample, bool), String> {
         let mut s = Sample::new();
         if let Some(w) = bench::wake_p99_us(ms(c, 600)) { s.insert(Metric::WakeP99Us, w); }
         if b.cpu {
-            if let Some(p) = bench::pingpong_p99_us(2000) { s.insert(Metric::PingPongP99Us, p); }
-            if let Some(f) = bench::frame_tail_us(ms(c, 600)) { s.insert(Metric::FrameP99Us, f); }
+            cpu_suite(c, &mut s);
             s.insert(Metric::CpuSingle, bench::cpu_single(ms(c, 400)));
+            // The ballast's spinners hold half the CPUs already: 1.5 threads per CPU on top of them.
+            let k = bench::contended(ms(c, 450));
+            s.insert(Metric::CpuMulti, k.rate);
+            if let Some(f) = k.frame_tail { s.insert(Metric::BusyFrameP99Us, f); }
         }
+        // Short jobs under memory pressure: every fresh heap is paid for by reclaim.
+        if let Some(j) = bench::jobs_per_sec(&c.exe, ms(c, 450)) { s.insert(Metric::JobsPerSec, j); }
         if b.cpu_mem { bench::probe_child(&c.exe, 256, &mut s)?; }
         if b.io { bench::io(&c.dir, c.io_size / 4, &mut s)?; }
         Ok(s)
@@ -279,9 +293,9 @@ fn run_io(c: &Ctx) -> Result<Sample, String> {
 /// Seconds per run (default windows; --thorough scales them).
 fn est_secs(ph: Phase, b: Benches, scale: f64) -> f64 {
     let s = match ph {
-        Phase::Idle => 0.3 + if b.io || b.cpu_mem { 0.8 } else { 0.0 } + if b.idle { 2.8 } else { 0.0 } + if b.cpu || b.cpu_mem { 0.6 } else { 0.0 }
-            + if b.cpu { 1.7 } else { 0.0 } + if b.cpu_mem { 1.8 } else { 0.0 } + if b.io { 4.0 } else { 0.0 },
-        Phase::Load => 1.4 + if b.cpu { 1.1 } else { 0.0 } + if b.cpu_mem { 1.0 } else { 0.0 } + if b.io { 2.0 } else { 0.0 },
+        Phase::Idle => 0.3 + if b.io || b.cpu_mem { 0.8 } else { 0.0 } + if b.idle { 2.8 } else { 0.0 } + if b.cpu || b.cpu_mem { 1.1 } else { 0.0 }
+            + if b.cpu { 2.5 } else { 0.0 } + if b.cpu_mem { 1.8 } else { 0.0 } + if b.io { 4.0 } else { 0.0 },
+        Phase::Load => 1.9 + if b.cpu { 2.3 } else { 0.0 } + if b.cpu_mem { 1.0 } else { 0.0 } + if b.io { 2.0 } else { 0.0 },
         Phase::Io => 0.6 + 4.0,
     };
     s * scale
@@ -547,7 +561,9 @@ fn metric_weights(refs: &[&Run], ms: &[Metric]) -> BTreeMap<Metric, f64> {
 
 /// Runs -> rows: per metric the log-ratio to the session's reference runs (all runs when there
 /// are fewer than 3), sign so that + is better, each clipped to +-0.5 (a stray outlier cannot
-/// dominate), averaged per objective with the metric's noise weight (`metric_weights`). A metric
+/// dominate), averaged per objective with the metric's noise weight (`metric_weights`) and brought
+/// to the objective's scale (`calib::objective_gain`: the gain summed over the objective's metrics,
+/// not diluted by the ones a knob does not touch). A metric
 /// counts only if at least 80 % of the runs have it, so every run is judged on the same set.
 /// Each row keeps its run's time (drift model) and weight.
 fn compute_rows(runs: &[Run], phase: Phase, sess: u64, kernel: &str, n_total: usize) -> Vec<Row> {
@@ -562,6 +578,9 @@ fn compute_rows(runs: &[Run], phase: Phase, sess: u64, kernel: &str, n_total: us
     }
     // Weights over the metrics this phase actually measured (the others are not in any row).
     let wts = metric_weights(&refs, &base.keys().copied().collect::<Vec<_>>());
+    let mut gain = [0usize; 4];
+    for m in base.keys() { gain[obj_index(*m)] += 1; }
+    let gain = gain.map(calib::objective_gain);
     runs.iter().map(|r| {
         let mut acc = [(0.0f64, 0.0f64); 4];
         for (m, b) in &base {
@@ -574,7 +593,7 @@ fn compute_rows(runs: &[Run], phase: Phase, sess: u64, kernel: &str, n_total: us
             acc[i].0 += w * d.clamp(-0.5, 0.5); acc[i].1 += w;
         }
         let mut y = [f64::NAN; 4];
-        for i in 0..4 { if acc[i].1 > 0.0 { y[i] = acc[i].0 / acc[i].1; } }
+        for i in 0..4 { if acc[i].1 > 0.0 { y[i] = acc[i].0 / acc[i].1 * gain[i]; } }
         Row { phase, sess, pos: (r.order as f64 / n_total.max(runs.len()) as f64).min(1.0), t: r.t, kernel: kernel.into(), cfg: r.cfg.clone(), y, w: r.w, bv: calib::BENCH_VERSION }
     }).collect()
 }
@@ -1033,6 +1052,10 @@ fn main() {
         println!("{}", bench::probe_main(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(512)));
         return;
     }
+    if args.first().map(String::as_str) == Some("__job") {
+        bench::job_main(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000));
+        return;
+    }
     if args.first().map(String::as_str) == Some("__ballast") {
         let n = |i: usize, d: u64| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
         bench::ballast_main(n(1, 0) as usize, n(2, 1) as usize, n(3, 1024), n(4, 0) == 1);
@@ -1132,6 +1155,9 @@ fn main() {
         battery: src == "battery",
     };
     let rate = lpm_helpers::iorate::gather().bps;
+    // Fixed work of the game loop and the short jobs, sized once, before any knob is touched.
+    eprintln!("work unit: {} k iterations/ms at full clock (game loop: 4.8 ms main thread + 3 x 2.4 ms jobs per 8 ms frame)", bench::unit() / 1000);
+    if cal.migrated { eprintln!("note: the stored idle/load measurements came from an older benchmark set that could not see most CPU and scheduler knobs; those phases start over (storage rows and unsafe values are kept)"); }
     if src != "battery" { eprintln!("note: on AC — power is RAPL (CPU package) only; device-level power needs a run on battery"); }
     match &ctx.disk {
         Some(d) => eprintln!("storage suite: {} on {d} ({} MiB written per IO run, unlinked temp files)", ctx.dir, ctx.io_size * 3 / 2 >> 20),
@@ -1246,8 +1272,9 @@ mod tests {
         assert_eq!(runs_for(3, 1), 5);
         assert_eq!(runs_for(3, 2), 9);
         let cpu = Benches { cpu: true, idle: true, ..Default::default() };
-        // A CPU knob with 3 candidates: was 2 x 4 runs x 8.5 s = 68 s, now 5 x 5.4 s (frame probe included).
-        assert!(est_secs(Phase::Idle, cpu, 1.0) * runs_for(3, 1) as f64 <= 28.0);
+        // A CPU knob with 3 candidates: 5 runs x 6.7 s (frame loop, game loop, contended window and short jobs included).
+        assert!(est_secs(Phase::Idle, cpu, 1.0) * runs_for(3, 1) as f64 <= 34.0);
+        assert!(est_secs(Phase::Load, Benches { cpu: true, ..Default::default() }, 1.0) <= 4.3);
         assert!(est_secs(Phase::Io, Benches { io: true, ..Default::default() }, 1.0) < 6.0);
         assert!(selects("@io", "blk.read_ahead_kb", "Storage") && selects("@io", "vm.dirty", "Memory") && !selects("@io", "vm.swappiness", "Memory"));
         assert_eq!(union_benches(Phase::Io, &[]), Benches { io: true, ..Default::default() });
@@ -1274,6 +1301,25 @@ mod tests {
         let y = rows.last().unwrap().y[0];
         assert!(y > 0.07, "{y}");
     }
+    #[test]
+    fn an_effect_on_one_metric_is_not_diluted_by_the_others() {
+        // Eight latency metrics, a knob that makes the game's frame tail 10 % better and touches nothing else.
+        let lat = [Metric::WakeP99Us, Metric::FrameP99Us, Metric::FrameMedUs, Metric::PingPongP99Us, Metric::GameTailMs,
+                   Metric::BusyFrameP99Us, Metric::FaultP99Us, Metric::FaultHugeP99Us];
+        let base = |game: f64| -> Vec<(Metric, f64)> { lat.iter().map(|m| (*m, if *m == Metric::GameTailMs { game } else { 100.0 })).collect() };
+        let mut runs: Vec<Run> = (0..3).map(|_| run(vec![], &base(10.0))).collect();
+        runs.push(run(vec![("k".into(), "1".into())], &base(9.0)));
+        let y = compute_rows(&runs, Phase::Idle, 1, "", 10).last().unwrap().y[0];
+        // The plain mean gave ln(1/0.9) / 8 = 1.3 %: under every margin. Summed over the metrics and halved: 5.3 %.
+        assert!((y - (1.0f64 / 0.9).ln() / 2.0).abs() < 1e-9, "{y}");
+        // The same knob measured in a session without the memory probes (6 metrics) lands on the same scale.
+        let few = |game: f64| -> Vec<(Metric, f64)> { base(game).into_iter().filter(|(m, _)| !matches!(m, Metric::FaultP99Us | Metric::FaultHugeP99Us)).collect() };
+        let mut runs: Vec<Run> = (0..3).map(|_| run(vec![], &few(10.0))).collect();
+        runs.push(run(vec![("k".into(), "1".into())], &few(9.0)));
+        let y2 = compute_rows(&runs, Phase::Idle, 1, "", 10).last().unwrap().y[0];
+        assert!((y - y2).abs() < 1e-9, "{y} vs {y2}");
+    }
+
     #[test]
     fn depth_grows_with_budget_and_ladders_refine_doses() {
         let (l, d, m) = (Depth::pick(15.0, 30, None), Depth::pick(40.0, 30, None), Depth::pick(f64::INFINITY, 30, None));

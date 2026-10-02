@@ -42,7 +42,9 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 pub type Cfg = Vec<(String, String)>;
-const DRIFT_SD: f64 = 0.03;
+/// Prior sd of a session's offset and trend (objective units; an objective is the gain summed
+/// over its metrics since benchmark set 4, hence twice the earlier 0.03).
+const DRIFT_SD: f64 = 0.06;
 /// Correlation time of the within-session drift (seconds).
 const OU_TAU: f64 = 150.0;
 /// Risk aversion of decisions: gain must exceed the margin by this many posterior sds.
@@ -327,7 +329,7 @@ impl Hyper {
     fn clamp(mut self) -> Hyper {
         self.sigma = self.sigma.clamp(0.003, 0.6); self.main = self.main.clamp(0.003, 0.5);
         self.pin = self.pin.clamp(0.001, 0.2); self.px = self.px.clamp(0.0005, 0.1);
-        self.tri = self.tri.clamp(0.0003, 0.1); self.ou = self.ou.clamp(0.001, 0.08);
+        self.tri = self.tri.clamp(0.0003, 0.1); self.ou = self.ou.clamp(0.001, 0.2);
         self
     }
     fn scales(&self) -> [f64; NC] {

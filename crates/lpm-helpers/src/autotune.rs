@@ -33,7 +33,8 @@ use crate::defaults;
 use crate::iorate;
 use crate::tune;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const MIB: u64 = 1 << 20;
@@ -42,6 +43,13 @@ const GIB: u64 = 1 << 30;
 const MODESTY: f64 = 0.10;
 /// A candidate must beat the reference by this much to be written.
 pub const MARGIN: f64 = 0.03;
+/// The benchmarks "see" a knob when at least one of its values moves this goal's utility by
+/// this many posterior standard deviations. Below it a measured "no effect" is the benchmark's
+/// blindness, not knowledge: the rule's estimate stays.
+const SEEN_Z: f64 = 2.0;
+/// A value a rule chose leaves the joint decision only when the model puts it this many
+/// standard deviations below the reference.
+const KEEP_Z: f64 = 1.0;
 /// Largest integer the GUI's JSON layer (double) carries exactly.
 pub const JSON_SAFE_INT: i64 = 1 << 53;
 
@@ -645,6 +653,12 @@ struct Rules<'a> {
     scores: Map<String, Value>,
     /// Messages of the joint pass (shown with the constraint notes).
     notes: Vec<String>,
+    /// The signature's joint model for this goal's weights (None: no design rows yet).
+    joint: Option<model::Joint>,
+    jkeys: BTreeSet<String>,
+    seen: RefCell<BTreeMap<String, bool>>,
+    /// Keys no rule knows, decided from the measurements alone (signature pass).
+    measured_only: BTreeSet<&'static str>,
 }
 
 fn vstr(v: &Value) -> String { match v { Value::String(s) => s.clone(), x => x.to_string() } }
@@ -661,6 +675,19 @@ impl<'a> Rules<'a> {
         self.set(key, value, why);
     }
     fn is(&self, g: Goal) -> bool { self.g == g }
+    /// Decided by the goal itself, whatever a benchmark says: amd-pstate's per-core EPP boost
+    /// is on for gaming and throughput. It acts on cores that stay more than half busy while
+    /// the package is shared with a GPU - the 1 % lows of a real game, which no synthetic
+    /// load of a few hundred milliseconds reproduces.
+    fn pinned(&self, key: &str) -> bool { key == "cpu.epp_boost" && matches!(self.g, Goal::Gaming | Goal::Throughput) }
+    /// Whether the benchmarks can see `key` on this machine at all (see SEEN_Z). Keys the
+    /// joint model does not hold (one-at-a-time records only) count as seen, as before.
+    fn seen(&self, key: &str) -> bool {
+        if let Some(v) = self.seen.borrow().get(key) { return *v; }
+        let v = match &self.joint { Some(j) if self.jkeys.contains(key) => seen_in(j, key), _ => true };
+        self.seen.borrow_mut().insert(key.to_owned(), v);
+        v
+    }
     /// How this goal combines the calibration phases (load share, storage weight).
     fn blend(&self) -> calib::Blend { calib::Blend::new(self.g.key(), self.w.storage) }
     fn u(&self, c: &Cand) -> f64 { c.fx.u(&self.w) - MODESTY * c.dev }
@@ -691,7 +718,8 @@ impl<'a> Rules<'a> {
             self.p.cur(key).map(str::to_owned).or_else(|| self.p.calibration.as_ref().and_then(|c| c.values(key, "")).map(|(r, _)| r))
         };
         alts.retain(|c| !self.p.measured_unsafe(key, &vstr(&c.value)));
-        if let Some(r) = ref_str { let b = self.blend(); for c in alts.iter_mut() { self.p.apply_measured(b, key, &r, &vstr(&c.value), c); } }
+        // Measurements replace the estimates only where the benchmarks can see the knob.
+        if let (Some(r), true) = (ref_str, self.seen(key)) { let b = self.blend(); for c in alts.iter_mut() { self.p.apply_measured(b, key, &r, &vstr(&c.value), c); } }
         self.choose_raw(key, reference, alts)
     }
 
@@ -746,6 +774,8 @@ impl<'a> Rules<'a> {
         let Some((stored_ref, vals)) = cal.values(key, &reference) else { return false };
         let reference = if reference.is_empty() { stored_ref } else { reference };
         let share = self.blend();
+        // Only values that were found unsafe are on record (nothing measured): the rule stands.
+        if !vals.iter().any(|v| *v != reference && cal.get(key, &reference, v, share).is_some()) { return false; }
         let mut alts: Vec<Cand> = vals.iter().filter(|v| **v != reference).map(|v| {
             let val = v.parse::<i64>().map(Value::from).unwrap_or_else(|_| json!(v));
             cand(val, Fx::default(), 0.2, format!("{key} = {v}."))
@@ -776,6 +806,14 @@ impl<'a> Rules<'a> {
 }
 
 fn round2(x: f64) -> f64 { (x * 100.0).round() / 100.0 }
+
+/// At least one value of `key` moves the joint utility by SEEN_Z posterior standard deviations.
+fn seen_in(j: &model::Joint, key: &str) -> bool {
+    j.values(key).iter().any(|val| {
+        let (m, var) = j.eval_diff(&[(key.to_owned(), val.clone())], &[]);
+        var > 0.0 && m.abs() >= SEEN_Z * var.sqrt()
+    })
+}
 
 /// log2 distance of two numeric values; None for text and for 0 against a non-zero value:
 /// 0 switches the feature off (writeback throttling, boosted reclaim, background compaction,
@@ -808,7 +846,10 @@ pub fn decide(goal: Goal, p: &Profile) -> Vec<Decision> { decide_weighted(goal, 
 
 /// Decisions plus the score trace and the constraint notes.
 pub fn decide_weighted(goal: Goal, p: &Profile, w: Weights) -> (Vec<Decision>, Map<String, Value>, Vec<String>) {
-    let mut r = Rules { p, g: goal, w, out: Vec::new(), scores: Map::new(), notes: Vec::new() };
+    let mut r = Rules { p, g: goal, w, out: Vec::new(), scores: Map::new(), notes: Vec::new(), joint: None, jkeys: BTreeSet::new(), seen: RefCell::new(BTreeMap::new()),
+                          measured_only: BTreeSet::new() };
+    r.joint = p.calibration.as_ref().and_then(|c| c.joint([w.latency, w.throughput, w.power, w.footprint], r.blend()));
+    r.jkeys = r.joint.as_ref().map(|j| j.keys().into_iter().collect()).unwrap_or_default();
     cpu_rules(&mut r);
     memory_rules(&mut r);
     sched_rules(&mut r);
@@ -870,24 +911,39 @@ impl<'a> Rules<'a> {
 /// not single knobs, and per-CCD role variants stay as fixed context.
 fn joint_pass(r: &mut Rules) {
     let Some(cal) = r.p.calibration.as_ref() else { return };
-    let wts = [r.w.latency, r.w.throughput, r.w.power, r.w.footprint];
-    let Some(joint) = cal.joint(wts, r.blend()) else { return };
+    let Some(joint) = r.joint.take() else { return };
     let (mut keys, mut cands, mut fixed) = (Vec::new(), Vec::new(), Vec::new());
     for key in joint.keys() {
         let Some(reference) = cal.refs.get(&key).cloned() else { continue };
         let scoped = format!("{key}_");
-        if tune::find(&key).is_none() || r.out.iter().any(|d| d.key.starts_with(&scoped)) {
+        if tune::find(&key).is_none() || r.pinned(&key) || r.out.iter().any(|d| d.key.starts_with(&scoped)) {
             if let Some(v) = r.context_value(&key) { if v != reference { fixed.push((key.clone(), v)); } }
             continue;
         }
         if r.p.boot_default(&key).map_or(false, |d| d != reference) { continue; }
         let c = r.level_costs(&key, &reference, &model::with_mids(&reference, &joint.values(&key)));
+        // A rule chose a value that was never measured: nothing to weigh it against, it stays.
+        let ruled = r.out.iter().find(|d| d.key == key.as_str()).map(|d| vstr(&d.value));
+        if ruled.map_or(false, |v| !c.iter().any(|(x, _)| *x == v)) { continue; }
         if c.len() > 1 { keys.push(key); cands.push(c); }
     }
     if keys.is_empty() { return; }
     let start: Vec<usize> = keys.iter().zip(&cands).map(|(k, c)| {
         r.out.iter().find(|d| d.key == k.as_str()).and_then(|d| c.iter().position(|(v, _)| *v == vstr(&d.value))).unwrap_or(0)
     }).collect();
+    // A value a rule chose is prior knowledge (kernel documentation, this machine's evidence), not
+    // a candidate that has to prove itself again: it pays neither margin nor modesty, and it goes
+    // back to the reference only when the measurements put it below the reference with
+    // confidence (KEEP_Z) - not when the benchmarks merely fail to see what it does. Learned
+    // rollback risk still counts in full. A value picked from the measurements alone (no rule
+    // behind it) has no such standing: it must pay in context like any other change.
+    let ruled: Vec<bool> = keys.iter().zip(&start).map(|(k, s)| *s > 0 && !r.measured_only.contains(k.as_str())).collect();
+    for (i, c) in cands.iter_mut().enumerate() {
+        if !ruled[i] { continue; }
+        let learned = r.w.stability * r.p.learned_risk(&keys[i]).unwrap_or(0.0);
+        let sd = joint.eval_diff(&[(keys[i].clone(), c[start[i]].0.clone())], &[]).1.max(0.0).sqrt();
+        c[start[i]].1 = learned + MARGIN + (KEEP_Z + model::RISK_Z) * sd;
+    }
     let prob = model::Problem::new(&joint, keys.clone(), cands.clone(), fixed, model::RISK_Z, MARGIN, cal.unsafe_sets.clone());
     let mut rng = model::Rng::new(0x5EED);
     let mut sel = prob.optimize(&start, &mut rng, 8);
@@ -895,10 +951,15 @@ fn joint_pass(r: &mut Rules) {
     let dropped = prob.prune(&mut sel, model::RISK_Z, MARGIN);
     let cfg0 = prob.cfg(&start);
     let marg = prob.marginals(&sel);
+    let mut kept = 0usize;
     for (i, key) in keys.iter().enumerate() {
-        if sel[i] == start[i] { continue; }
+        if sel[i] == start[i] { if ruled[i] { kept += 1; } continue; }
         let value = cands[i][sel[i]].0.clone();
-        let why = if sel[i] == 0 {
+        let why = if sel[i] == 0 && ruled[i] {
+            let (m, v) = joint.eval_diff(&[(key.clone(), cands[i][start[i]].0.clone())], &[]);
+            format!("Joint model: {} = {} measured {:+.3} (±{:.3}) against the reference on this machine - worse with confidence, so the rule's choice goes back to the reference.",
+                    key, cands[i][start[i]].0, m, v.max(0.0).sqrt())
+        } else if sel[i] == 0 {
             let d = dropped.iter().find(|d| d.0 == i);
             format!("Joint model: {} = {} looked good alone but next to the other chosen settings it adds {:+.3} (±{:.3}); back to the reference.",
                     key, cands[i][start[i]].0, d.map_or(0.0, |d| d.1), d.map_or(0.0, |d| d.2))
@@ -916,6 +977,11 @@ fn joint_pass(r: &mut Rules) {
     let mu0 = joint.eval(&cfg0).0;
     r.notes.push(format!("Joint model: {} calibrated change(s) predicted {:+.3} ± {:.3} weighted gain for this goal (per-knob choices alone: {:+.3}).",
                          sel.iter().filter(|s| **s > 0).count(), mu, var.sqrt(), mu0));
+    let blind = keys.iter().enumerate().filter(|(i, k)| ruled[*i] && sel[*i] == start[*i] && !seen_in(&joint, k)).count();
+    if kept > 0 {
+        r.notes.push(format!("Joint model: {kept} rule-based choice(s) kept{}; a rule's choice is dropped only when the measurements put it below the reference with confidence.",
+                             if blind > 0 { format!(" ({blind} of them on knobs the benchmarks cannot see on this machine)") } else { String::new() }));
+    }
 }
 
 // ── memory ───────────────────────────────────────────────────────────────────
@@ -996,7 +1062,8 @@ fn thp_rules(r: &mut Rules) {
     let refc: Combo = anchor.unwrap_or((boot.as_deref() == Some("always"), false, 511, Pace::Default));
     let label = |c: Combo| json!(format!("{}{}/{}/{:?}", if c.0 { "always" } else { "madvise" }, if c.1 { "+mthp" } else { "" }, c.2, c.3));
     let (mut rf, rd0) = thp_fx(refc.0, refc.1, refc.2, refc.3);
-    thp_measured(p, r.blend(), refc, &mut rf);
+    let thp_seen = r.seen("thp");
+    if thp_seen { thp_measured(p, r.blend(), refc, &mut rf); }
     let reference = Cand { value: label(refc), fx: rf, dev: if anchor.is_some() { 0.0 } else { rd0 }, why: String::new() };
     let keys = ["thp.enabled", "thp.khp_max_ptes_none", "thp.khp_pages_to_scan", "thp.khp_scan_sleep_ms", "thp.mthp_16k", "thp.mthp_32k", "thp.mthp_64k"];
     let learned: Option<f64> = keys.iter().map(|k| p.learned_risk(k)).sum();
@@ -1015,7 +1082,7 @@ fn thp_rules(r: &mut Rules) {
                     let Some(risk) = learned else { continue };
                     let (mut f, d) = thp_fx(always, mthp, pt, pace);
                     if p.measured_unsafe("thp", &format!("{}{}", if always { "always" } else { "madvise" }, if mthp { "+mthp" } else { "" })) { continue; }
-                    thp_measured(p, r.blend(), c, &mut f);
+                    if thp_seen { thp_measured(p, r.blend(), c, &mut f); }
                     f.risk += risk;
                     let dev = if anchor.is_some() { combo_dist(c, refc) } else { d };
                     alts.push(Cand { value: label(c), fx: f, dev, why: String::new() });
@@ -1100,7 +1167,7 @@ fn dirty_rules(r: &mut Rules) {
     alts.retain(|c| { let b = dirty_pair(rate, ram, c.value.as_f64().unwrap_or(1.0)); if seen.contains(&b) { false } else { seen.push(b); true } });
     for c in alts.iter_mut() {
         let t = format!("{}", c.value.as_f64().unwrap_or(1.0));
-        p.apply_measured(r.blend(), "vm.dirty", "1", &t, c);
+        if r.seen("vm.dirty") { p.apply_measured(r.blend(), "vm.dirty", "1", &t, c); }
     }
     let win = r.pick("vm.dirty_bytes", &reference, &alts);
     let (t, c) = match win { Some(i) => (alts[i].value.as_f64().unwrap_or(1.0), &alts[i]), None => (1.0, &reference) };
@@ -1319,21 +1386,25 @@ fn device_rules(r: &mut Rules) {
     }
 }
 
-/// Every key the machine signature measured and no scored rule handled yet is
-/// re-decided from the measurements (replacing a structural rule's value). A
-/// global key is left alone when a rule already set a scoped variant of it
-/// (cpu.epp vs cpu.epp_ccd0: CCD roles stay structural).
+/// Every key the machine signature measured and no rule handled yet is decided
+/// from the measurements. A key a structural rule decided keeps the rule's value
+/// here: the joint pass weighs it against the model's posterior and takes it back
+/// only on credible evidence (one-at-a-time records, which carry no posterior,
+/// still replace it). A global key is left alone when a rule already set a scoped
+/// variant of it (cpu.epp vs cpu.epp_ccd0: CCD roles stay structural), and so is
+/// a key the goal pins (see `Rules::pinned`).
 fn signature_pass(r: &mut Rules) {
     let Some(cal) = r.p.calibration.as_ref() else { return };
     let keys: Vec<&'static str> = cal.key_names().iter().filter_map(|k| tune::find(k).map(|t| t.key)).collect();
     for key in keys {
         if r.scores.contains_key(key) { continue; }
-        if key == "cpu.epp_boost" && !r.is(Goal::PowerSave) { continue; }
+        if r.pinned(key) { continue; }
         let scoped = format!("{key}_");
         if r.out.iter().any(|d| d.key.starts_with(&scoped)) { continue; }
         let before: Vec<Decision> = r.out.iter().filter(|d| d.key == key).cloned().collect();
+        if !before.is_empty() && r.jkeys.contains(key) { continue; }
         r.out.retain(|d| d.key != key);
-        if !r.calibrated_choice(key) { r.out.extend(before); }
+        if r.calibrated_choice(key) { r.measured_only.insert(key); } else { r.out.extend(before); }
     }
 }
 
@@ -2360,6 +2431,57 @@ mod tests {
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
             assert!(v["ok"].as_bool().unwrap());
         }
+    }
+
+    /// Signature with two knobs a rule decides: split-lock mitigation (structural) and EPP boost.
+    /// `harm`: latency effect of the rule's value of each on the synthetic machine.
+    fn ruled_signature(harm_split: f64, harm_boost: f64) -> Profile {
+        let kv = [("kernel.split_lock_mitigate", "1"), ("cpu.epp_boost", "0")];
+        let mut p = with_defaults(legion(), &kv);
+        for (k, v) in kv { p.current.insert(k.into(), v.into()); }
+        let facs = vec![model::Factor { key: "kernel.split_lock_mitigate".into(), reference: "1".into(), values: vec!["0".into()] },
+                        model::Factor { key: "cpu.epp_boost".into(), reference: "0".into(), values: vec!["1".into()] }];
+        let mut rng = model::Rng::new(5);
+        let mut design = model::initial_design(&facs, 60, &mut rng);
+        for _ in 0..12 { design.push(Vec::new()); }
+        let n = design.len();
+        let rows: Vec<calib::Row> = design.iter().enumerate().map(|(i, c)| {
+            let has = |k: &str| c.iter().any(|(a, _)| a == k);
+            let y = if has("kernel.split_lock_mitigate") { harm_split } else { 0.0 } + if has("cpu.epp_boost") { harm_boost } else { 0.0 };
+            calib::Row { phase: calib::Phase::Load, sess: 1, pos: i as f64 / n as f64, t: 0, kernel: String::new(), cfg: c.clone(),
+                         y: [y + ((rng.unit() + rng.unit()) - 1.0) * 0.04, f64::NAN, f64::NAN, f64::NAN], w: 1.0, bv: calib::BENCH_VERSION }
+        }).collect();
+        let mut cal = calib::Calibration::default();
+        cal.put_session(calib::Phase::Load, 1, rows);
+        for f in &facs { cal.refs.insert(f.key.clone(), f.reference.clone()); }
+        p.calibration = Some(cal);
+        p
+    }
+
+    #[test]
+    fn blind_benchmarks_do_not_overturn_rules_but_credible_harm_does() {
+        // The benchmarks see nothing (noise around zero): the rules' choices stay. Before, "no measured
+        // effect" sent every calibrated knob back to its boot default.
+        let p = ruled_signature(0.0, 0.0);
+        let (d, _, notes) = decide_weighted(Goal::Gaming, &p, Weights::for_goal(Goal::Gaming));
+        assert_eq!(get(&d, "kernel.split_lock_mitigate"), Some(&json!(0)), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("rule-based choice(s) kept")), "{notes:?}");
+        let (d, _, _) = decide_weighted(Goal::Desktop, &p, Weights::for_goal(Goal::Desktop));
+        assert_eq!(get(&d, "cpu.epp_boost"), Some(&json!("1")), "desktop keeps the rule's EPP boost when nothing speaks against it");
+        // Measured clearly worse than the reference on this machine: the rule's choice goes.
+        let p = ruled_signature(-0.15, -0.15);
+        let (d, _, _) = decide_weighted(Goal::Gaming, &p, Weights::for_goal(Goal::Gaming));
+        assert_ne!(get(&d, "kernel.split_lock_mitigate"), Some(&json!(0)), "{d:?}");
+        let why = |d: &[Decision], k: &str| d.iter().find(|x| x.key == k).map(|x| x.why.clone()).unwrap_or_default();
+        // EPP boost is the goal's own decision for gaming and throughput - no benchmark takes it away ...
+        for g in [Goal::Gaming, Goal::Throughput] {
+            let (d, _, _) = decide_weighted(g, &p, Weights::for_goal(g));
+            assert_eq!(get(&d, "cpu.epp_boost"), Some(&json!("1")), "{g:?}");
+            assert!(why(&d, "cpu.epp_boost").starts_with("EPP boost"), "{g:?}: the rule's own reason, not a model's");
+        }
+        // ... while the desktop goal follows the measurement.
+        let (d, _, _) = decide_weighted(Goal::Desktop, &p, Weights::for_goal(Goal::Desktop));
+        assert_ne!(get(&d, "cpu.epp_boost"), Some(&json!("1")), "{d:?}");
     }
 
     #[test]

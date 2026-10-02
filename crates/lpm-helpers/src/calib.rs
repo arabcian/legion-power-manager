@@ -72,6 +72,11 @@ pub enum Metric {
     IopsK,          // 4 KiB direct random reads per second from several threads, thousands (throughput, higher better)
     IoCpuUs,        // busy CPU time (irq included) per random read (power, lower better)
     RaFootprintMib, // page cache brought in by sparse mmap touches: read-around waste (footprint, lower better)
+    FrameMedUs,     // 240 Hz frame loop: typical deadline -> work done (latency: the clock a mostly idle core gets, lower better)
+    GameFrameMs,    // game loop (60 % busy main thread + 3 job threads, 125 Hz): typical frame time (throughput = fps, lower better)
+    GameTailMs,     // game loop: frame-time tail, the 1 % lows (latency, lower better)
+    BusyFrameP99Us, // 240 Hz frame loop while every CPU is taken: preemption / wake-up placement tail (latency, lower better)
+    JobsPerSec,     // short processes per second: exec, fresh-heap faults, 2 ms of work, exit (throughput, higher better)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,17 +96,19 @@ impl Phase {
 pub fn io_key(key: &str) -> bool { key == "vm.dirty" || key.starts_with("blk.") }
 
 impl Metric {
-    pub const ALL: [Metric; 27] = [Metric::WakeP99Us, Metric::FaultP99Us, Metric::FsyncP99Ms, Metric::RandReadP99Us,
+    pub const ALL: [Metric; 32] = [Metric::WakeP99Us, Metric::FaultP99Us, Metric::FsyncP99Ms, Metric::RandReadP99Us,
         Metric::PingPongP99Us, Metric::StallsPerSec, Metric::MemBwGbs, Metric::AllocMs, Metric::WriteMbs, Metric::ReadMbs,
         Metric::ThpPct, Metric::CpuSingle, Metric::CpuMulti, Metric::IdleW, Metric::PkgW, Metric::CpuEff, Metric::ProbeRssMib,
         Metric::TlbRandNs, Metric::TlbHugeNs, Metric::ShmRandNs, Metric::FaultHugeP99Us, Metric::FrameP99Us, Metric::MixedReadP99Us,
-        Metric::MmapFaultP99Us, Metric::IopsK, Metric::IoCpuUs, Metric::RaFootprintMib];
+        Metric::MmapFaultP99Us, Metric::IopsK, Metric::IoCpuUs, Metric::RaFootprintMib, Metric::FrameMedUs, Metric::GameFrameMs,
+        Metric::GameTailMs, Metric::BusyFrameP99Us, Metric::JobsPerSec];
     pub fn objective(self) -> Objective {
         use Metric::*;
         match self {
             WakeP99Us | FaultP99Us | FsyncP99Ms | RandReadP99Us | PingPongP99Us | StallsPerSec | FaultHugeP99Us | FrameP99Us
-            | MixedReadP99Us | MmapFaultP99Us => Objective::Lat,
-            MemBwGbs | AllocMs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | TlbRandNs | TlbHugeNs | ShmRandNs | IopsK => Objective::Thr,
+            | MixedReadP99Us | MmapFaultP99Us | FrameMedUs | GameTailMs | BusyFrameP99Us => Objective::Lat,
+            MemBwGbs | AllocMs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | TlbRandNs | TlbHugeNs | ShmRandNs | IopsK
+            | GameFrameMs | JobsPerSec => Objective::Thr,
             IdleW | PkgW | CpuEff | IoCpuUs => Objective::Pwr,
             ProbeRssMib | RaFootprintMib => Objective::Mem,
         }
@@ -111,13 +118,13 @@ impl Metric {
     pub fn noise_floor(self) -> f64 {
         use Metric::*;
         match self { WakeP99Us | FaultP99Us | FsyncP99Ms | RandReadP99Us | PingPongP99Us | FaultHugeP99Us | FrameP99Us | MixedReadP99Us
-                     | MmapFaultP99Us => 0.05, _ => 0.02 }
+                     | MmapFaultP99Us | GameTailMs | BusyFrameP99Us => 0.05, _ => 0.02 }
     }
     /// Offset that keeps log-ratios finite for counters that can be zero.
     pub fn eps(self) -> f64 { match self { Metric::StallsPerSec | Metric::ThpPct => 1.0, _ => 0.0 } }
     pub fn higher_better(self) -> bool {
         use Metric::*;
-        matches!(self, MemBwGbs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | CpuEff | IopsK)
+        matches!(self, MemBwGbs | WriteMbs | ReadMbs | ThpPct | CpuSingle | CpuMulti | CpuEff | IopsK | JobsPerSec)
     }
     pub fn name(self) -> &'static str {
         use Metric::*;
@@ -129,6 +136,8 @@ impl Metric {
             TlbRandNs => "TLB random (plain)", TlbHugeNs => "TLB random (madvise)", ShmRandNs => "TLB random (shmem)",
             FaultHugeP99Us => "huge fault p99", FrameP99Us => "frame tail", MixedReadP99Us => "read tail under writes",
             MmapFaultP99Us => "mmap fault tail", IopsK => "random-read IOPS", IoCpuUs => "CPU per I/O", RaFootprintMib => "read-around cache",
+            FrameMedUs => "frame typical", GameFrameMs => "game frame time", GameTailMs => "game frame tail",
+            BusyFrameP99Us => "frame tail, CPUs taken", JobsPerSec => "short jobs",
         }
     }
 }
@@ -138,8 +147,25 @@ impl Metric {
 /// shmem) and a fragmented load phase. 3 = tails as expected shortfall (worst 1 %,
 /// at least 5 samples), the frame-loop probe, metrics weighted by their measured
 /// noise inside an objective, and the storage suite in its own IO phase (idle/load
-/// objectives without I/O metrics).
-pub const BENCH_VERSION: u8 = 3;
+/// objectives without I/O metrics). 4 = workloads the knobs act on: the game loop (busy,
+/// unsaturated cores), the frame loop with every CPU taken (scheduler knobs), short jobs
+/// (exec / fault / placement path), the frame loop's median; an objective is the gain summed
+/// over its metrics (see `objective_gain`) instead of their mean. Idle/load rows of older
+/// sets are not kept: they were blind to most CPU and scheduler knobs and would vote "no
+/// effect" against the new measurements.
+pub const BENCH_VERSION: u8 = 4;
+
+/// Scale of an objective that averages `k` metrics. A knob moves the one or two metrics it
+/// acts on and leaves the rest alone, so the plain mean shrank with every benchmark added: a
+/// 10 % better frame time among eight latency metrics came out as 1.3 %, below any margin
+/// autotune can use, and the more the suite measured the less every knob seemed to do. The
+/// objective is therefore the gain summed over its metrics, counted as if two of them carried
+/// it: mean x k/2 (never below the mean). One scale whatever else a session measured.
+pub fn objective_gain(k: usize) -> f64 { (k as f64 / 2.0).max(1.0) }
+
+/// Gains of the storage suite's objectives (4 latency, 3 throughput, 1 power, 1 footprint
+/// metric): IO rows logged before version 4 hold plain means of the same metrics.
+const IO_GAIN_V3: [f64; 4] = [2.0, 1.5, 1.0, 1.0];
 
 /// Which benchmark groups a knob can influence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -204,7 +230,7 @@ pub struct Measured { pub lat: Option<f64>, pub thr: Option<f64>, pub pwr: Optio
 pub fn fold(effects: &BTreeMap<Metric, f64>) -> Measured {
     let mean = |o: Objective| {
         let v: Vec<f64> = effects.iter().filter(|(m, _)| m.objective() == o).map(|(_, e)| *e).collect();
-        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64 * objective_gain(v.len()))
     };
     Measured { lat: mean(Objective::Lat), thr: mean(Objective::Thr), pwr: mean(Objective::Pwr), mem: mean(Objective::Mem), n: 1.0 }
 }
@@ -238,7 +264,6 @@ pub const EXCLUDED: &[(&str, &str)] = &[
     ("sched.ext", "needs a userspace scheduler"), ("kernel.watchdog", "never disabled"), ("kernel.sched_schedstats", "debug counters"),
     ("kernel.cfs_bandwidth_slice_us", "only with CPU quotas"), ("kernel.sched_util_clamp_min_rt_default", "RT tasks only"),
     ("wq.cpumask", "topology (structural)"), ("irq.affinity", "topology (structural)"),
-    ("kernel.sched_burst_cache_lifetime", "fork-time cache: no fork benchmark"),
     ("vm.dirty_writeback_centisecs", "periodic flush every 5-15 s: longer than a run, unmeasurable"),
     ("vm.dirty_expire_centisecs", "30-60 s data age: longer than a run, unmeasurable"),
 ];
@@ -389,6 +414,8 @@ pub struct Calibration {
     pub strategies: BTreeMap<String, Vec<String>>,
     cache: ModelCache,
     pub on_battery: bool,
+    /// The file held idle/load data of an older benchmark set, which was dropped on reading.
+    pub migrated: bool,
     /// Current kernel (major.minor) and time used to weight records.
     pub kernel: String,
     pub now: u64,
@@ -647,7 +674,7 @@ impl Calibration {
         let rows: Vec<Value> = self.rows.iter().map(|r| json!({
             "ph": r.phase.idx(), "s": r.sess, "p": r.pos, "t": r.t, "k": r.kernel, "w": r.w, "bv": r.bv,
             "c": r.cfg.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "y": r.y.iter().map(|v| num(*v)).collect::<Vec<_>>()})).collect();
-json!({"version": 5, "fingerprint": self.fingerprint.to_json(), "on_battery": self.on_battery, "keys": keys, "rows": rows,
+        json!({"version": 6, "fingerprint": self.fingerprint.to_json(), "on_battery": self.on_battery, "keys": keys, "rows": rows,
                "refs": self.refs, "hyp": self.hyp, "strategies": self.strategies, "unsafe_sets": self.unsafe_sets.iter().map(|u| u.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>()).collect::<Vec<_>>()})
     }
     pub fn from_json(v: &Value) -> Calibration {
@@ -685,13 +712,32 @@ json!({"version": 5, "fingerprint": self.fingerprint.to_json(), "on_battery": se
         }
         // Format 4 logged vm.dirty design rows against the live limits while labelling them window "1".
         if version < 5 { c.rows.retain(|r| !r.cfg.iter().any(|(k, _)| k == "vm.dirty")); }
+        // Format 6 = benchmark set 4. The storage suite is the same, so its rows are kept and
+        // brought to the new objective scale; idle/load rows and one-at-a-time records of the
+        // older sets go (what was found unsafe stays unsafe), with their fitted prior scales
+        // and the progress of the lean sessions - those phases start over.
+        let old = version < 6;
+        if old {
+            c.migrated = c.rows.iter().any(|r| r.phase != Phase::Io)
+                || c.keys.values().flatten().flat_map(|g| g.values.values()).any(|s| !s.idle.is_empty() || !s.load.is_empty());
+            c.rows.retain(|r| r.phase == Phase::Io);
+            for r in c.rows.iter_mut().filter(|r| r.bv < 4) {
+                for (y, g) in r.y.iter_mut().zip(IO_GAIN_V3) { *y *= g; }
+                r.bv = BENCH_VERSION;
+            }
+            for gs in c.keys.values_mut() {
+                for g in gs.iter_mut() { g.values.retain(|_, s| { s.idle.clear(); s.load.clear(); s.unsafe_ }); }
+                gs.retain(|g| !g.values.is_empty());
+            }
+            c.keys.retain(|_, gs| !gs.is_empty());
+        }
         for (k, x) in v["refs"].as_object().into_iter().flatten() { if let Some(x) = x.as_str() { c.refs.insert(k.clone(), x.to_owned()); } }
         for u in v["unsafe_sets"].as_array().into_iter().flatten() { c.unsafe_sets.push(u.as_array().into_iter().flatten().filter_map(pair).collect()); }
-        for (k, x) in v["hyp"].as_object().into_iter().flatten() {
+        for (k, x) in v["hyp"].as_object().into_iter().flatten().filter(|_| !old) {
             let h: Vec<f64> = x.as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
             if Hyper::from_slice(&h).is_some() { c.hyp.insert(k.clone(), h); }
         }
-        for (k, x) in v["strategies"].as_object().into_iter().flatten() {
+        for (k, x) in v["strategies"].as_object().into_iter().flatten().filter(|(k, _)| !old || k.as_str() == "io") {
             c.strategies.insert(k.clone(), x.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect());
         }
         c
@@ -790,10 +836,24 @@ mod tests {
         // Records beyond KEEP drop the oldest.
         for _ in 0..15 { c.add("k", "128", "256", Phase::Idle, Some(m(0.0, 0.0)), false, now, "7.2.8"); }
         assert_eq!(c.keys["k"][0].values["256"].idle.len(), KEEP);
-        // Version 2 files load.
-        let v2 = json!({"version": 2, "keys": {"k": {"reference": "a", "values": {"b": {"idle": {"lat": 0.1}, "load": null, "unsafe": false}}}}});
+        // Files of an older benchmark set load, but their idle/load records are not kept (the
+        // old benchmarks were blind to most CPU and scheduler knobs); unsafe values stay unsafe.
+        let v2 = json!({"version": 2, "keys": {"k": {"reference": "a", "values": {"b": {"idle": {"lat": 0.1}, "load": null, "unsafe": false},
+                                                                                     "c": {"idle": null, "load": null, "unsafe": true}}}}});
         let c3 = Calibration::from_json(&v2);
-        assert_eq!(c3.get_phase("k", "a", "b", Phase::Idle).unwrap().lat, Some(0.1));
+        assert!(c3.migrated && c3.get_phase("k", "a", "b", Phase::Idle).is_none() && c3.is_unsafe("k", "c") && !c3.is_unsafe("k", "b"));
+        // Version 5: idle/load rows go, IO rows are brought to the summed objective scale; the next write is format 6.
+        let row = |ph: u64| json!({"ph": ph, "s": 1, "p": 0.5, "t": 1, "k": "7.2", "w": 1.0, "bv": 3, "c": [["blk.scheduler", "none"]], "y": [0.1, 0.1, 0.1, null]});
+        let v5 = json!({"version": 5, "rows": [row(0), row(1), row(2)], "hyp": {"io0": [0.03, 0.03, 0.012, 0.004, 0.004, 0.01]},
+                        "strategies": {"idle": ["lean/base"], "io": ["lean/base"]}});
+        let c5 = Calibration::from_json(&v5);
+        assert_eq!(c5.rows.len(), 1);
+        assert!(c5.migrated && c5.rows[0].phase == Phase::Io && c5.rows[0].bv == BENCH_VERSION && c5.hyp.is_empty());
+        assert!((c5.rows[0].y[0] - 0.2).abs() < 1e-12 && (c5.rows[0].y[1] - 0.15).abs() < 1e-12 && (c5.rows[0].y[2] - 0.1).abs() < 1e-12);
+        assert!(c5.strategies_of(Phase::Idle).is_empty() && c5.strategies_of(Phase::Io).len() == 1);
+        let again = Calibration::from_json(&c5.to_json());
+        assert!(!again.migrated && again.rows.len() == 1 && again.rows[0].y[0] == c5.rows[0].y[0]);
+        assert_eq!((objective_gain(1), objective_gain(2), objective_gain(8)), (1.0, 1.0, 4.0));
     }
 
     #[test]

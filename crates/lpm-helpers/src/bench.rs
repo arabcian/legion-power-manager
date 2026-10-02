@@ -534,6 +534,8 @@ mod tests {
         assert!(s.get(&Metric::RaFootprintMib).map_or(false, |m| *m > 0.0) && s.contains_key(&Metric::MmapFaultP99Us));
         assert!(wake_p99_us(Duration::from_millis(200)).is_some());
         assert!(frame_tail_us(Duration::from_millis(120)).map_or(false, |v| v > 0.0));
+        let (t, m) = frame_us(Duration::from_millis(120)).unwrap();
+        assert!(m > 0.0 && t >= m, "the tail is never below the median");
         assert_eq!(p99(&mut vec![]), None);
         assert_eq!(tail(&mut vec![]), None);
         // Worst 1 %, at least 5: 1000 samples -> the 10 largest; 8 samples -> the 5 largest.
@@ -575,6 +577,18 @@ mod tests {
         assert_eq!(Rapl::from_dir(&root).zones.len(), 1);
         assert!(Rapl::from_dir(&root).zones[0].0.ends_with("intel-rapl-mmio:0"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn game_loop_contention_and_jobs_produce_metrics() {
+        assert!(unit() >= 50_000 && unit() == unit(), "measured once");
+        let (med, tl) = game_loop(Duration::from_millis(240)).expect("frames");
+        assert!(med > 0.0 && tl >= med);
+        let c = contended(Duration::from_millis(120));
+        assert!(c.rate > 0.0 && c.frame_tail.map_or(false, |v| v > 0.0));
+        // The test binary is not lpm-calibrate: a child that fails to run the job yields None, never a figure.
+        assert_eq!(jobs_per_sec(std::path::Path::new("/nonexistent/lpm-calibrate"), Duration::from_millis(50)), None);
+        job_main(10_000);
     }
 
     #[test]
@@ -747,36 +761,202 @@ fn mono_ns() -> i64 {
 const FRAME_WORK: u64 = 250_000;
 const FRAME_NS: i64 = 4_000_000;
 
-/// Burst response tail (µs): a thread wakes every 4 ms (240 Hz) on an absolute deadline, runs
-/// a fixed piece of work over a 256 KiB working set and records deadline -> work done. That is
-/// what a game's frame loop or a compositor meets: timer wake-up, C-state exit and how fast the
-/// clock comes up for a short burst after idling (EPP, boost, idle governor, wake-up latency
-/// QoS). A bare sleep (wake p99) or a sustained spin (1-thread work) each see only part of it.
-/// Three fresh threads one after another, so one placement does not decide the run; a missed
+fn sleep_until(ns: i64) {
+    let t = libc::timespec { tv_sec: (ns / 1_000_000_000) as libc::time_t, tv_nsec: (ns % 1_000_000_000) as libc::c_long };
+    unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &t, std::ptr::null_mut()); }
+}
+
+/// Fixed work over a working set: `iters` of integer work, then one pass over `buf`.
+fn work(iters: u64, seed: u64, buf: &[u8]) -> u64 {
+    let mut acc = spin(iters, seed);
+    for j in (0..buf.len()).step_by(64) { acc = acc.wrapping_add(unsafe { std::ptr::read_volatile(buf.as_ptr().add(j)) } as u64); }
+    acc
+}
+
+/// One thread's 240 Hz frame loop for `dur`: deadline -> work done, µs per frame. A missed
 /// deadline is recorded and the loop re-aligns to the next period.
-pub fn frame_tail_us(dur: Duration) -> Option<f64> {
+fn frame_part(dur: Duration, seed: u64) -> Vec<f64> {
+    let buf = vec![1u8; 256 * 1024];
+    let mut v = Vec::with_capacity(256);
+    let mut next = mono_ns() + FRAME_NS;
+    let end = next + dur.as_nanos() as i64;
+    let mut acc = seed;
+    while next < end {
+        sleep_until(next);
+        acc = work(FRAME_WORK, acc, &buf);
+        let done = mono_ns();
+        v.push((done - next).max(0) as f64 / 1000.0);
+        next += FRAME_NS;
+        if done >= next { next += ((done - next) / FRAME_NS + 1) * FRAME_NS; }
+    }
+    std::hint::black_box(acc);
+    v
+}
+
+/// Burst response (µs): a thread wakes every 4 ms (240 Hz) on an absolute deadline, runs a
+/// fixed piece of work over a 256 KiB working set and records deadline -> work done. That is
+/// what a compositor or a light game thread meets: timer wake-up, C-state exit and how fast
+/// the clock comes up for a short burst after idling (EPP, boost, idle governor, wake-up
+/// latency QoS). Returns (tail, median): the tail is the stutter, the median the typical
+/// response - it moves with the clock a mostly idle core is given, at a fraction of the
+/// tail's noise. Three fresh threads one after another, so one placement does not decide
+/// the run.
+pub fn frame_us(dur: Duration) -> Option<(f64, f64)> {
     let mut all = Vec::with_capacity(512);
     for i in 0..3u64 {
-        let part = std::thread::spawn(move || {
+        all.extend(std::thread::spawn(move || frame_part(dur / 3, i)).join().unwrap_or_default());
+    }
+    let med = crate::calib::median(&mut all.clone())?;
+    Some((tail(&mut all)?, med))
+}
+
+pub fn frame_tail_us(dur: Duration) -> Option<f64> { frame_us(dur).map(|x| x.0) }
+
+static UNIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// `spin` iterations one core does per millisecond at its full clock: the best of 12 short
+/// windows after a warm-up, measured once per process. lpm-calibrate calls it before it
+/// touches any knob, so the game loop's and the jobs' work is the same in every run of a
+/// session (work that scaled with the clock would hide exactly what EPP and boost change).
+pub fn unit() -> u64 {
+    *UNIT.get_or_init(|| {
+        std::hint::black_box(spin_for(Duration::from_millis(60), 1));
+        let mut best = 0.0f64;
+        for i in 0..12u64 {
+            let (n, secs) = spin_for(Duration::from_millis(8), i);
+            if secs > 0.0 { best = best.max(n as f64 / secs); }
+        }
+        ((best / 1000.0) as u64).max(50_000)
+    })
+}
+
+const GAME_NS: i64 = 8_000_000;
+const GAME_WORKERS: usize = 3;
+
+/// Frame gate of the game loop: (frame number, workers finished, stop).
+struct Gate { m: std::sync::Mutex<(u64, usize, bool)>, go: std::sync::Condvar, done: std::sync::Condvar }
+
+fn game_part(dur: Duration, seed: u64, unit: u64) -> Vec<f64> {
+    let gate = Arc::new(Gate { m: std::sync::Mutex::new((0, 0, false)), go: std::sync::Condvar::new(), done: std::sync::Condvar::new() });
+    let workers: Vec<_> = (0..GAME_WORKERS as u64).map(|w| {
+        let g = gate.clone();
+        std::thread::spawn(move || {
             let buf = vec![1u8; 256 * 1024];
-            let mut v = Vec::with_capacity(256);
-            let mut next = mono_ns() + FRAME_NS;
-            let end = next + (dur / 3).as_nanos() as i64;
-            let mut acc = i;
-            while next < end {
-                let t = libc::timespec { tv_sec: (next / 1_000_000_000) as libc::time_t, tv_nsec: (next % 1_000_000_000) as libc::c_long };
-                unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &t, std::ptr::null_mut()); }
-                acc = spin(FRAME_WORK, acc);
-                for j in (0..buf.len()).step_by(64) { acc = acc.wrapping_add(unsafe { std::ptr::read_volatile(buf.as_ptr().add(j)) } as u64); }
-                let done = mono_ns();
-                v.push((done - next).max(0) as f64 / 1000.0);
-                next += FRAME_NS;
-                if done >= next { next += ((done - next) / FRAME_NS + 1) * FRAME_NS; }
+            let (mut seen, mut acc) = (0u64, seed ^ (w + 1));
+            loop {
+                {
+                    let mut st = g.m.lock().unwrap();
+                    while st.0 == seen && !st.2 { st = g.go.wait(st).unwrap(); }
+                    if st.2 { break; }
+                    seen = st.0;
+                }
+                acc = work(unit * 24 / 10, acc, &buf);  // 2.4 ms at full clock: a 30 % busy job thread
+                let mut st = g.m.lock().unwrap();
+                st.1 += 1;
+                g.done.notify_one();
             }
             std::hint::black_box(acc);
-            v
-        });
-        all.extend(part.join().unwrap_or_default());
+        })
+    }).collect();
+    let buf = vec![1u8; 1024 * 1024];
+    let mut v = Vec::with_capacity(64);
+    let mut next = mono_ns() + GAME_NS;
+    let end = next + dur.as_nanos() as i64;
+    let (mut acc, mut frame) = (seed, 0u64);
+    while next < end {
+        sleep_until(next);
+        frame += 1;
+        { let mut st = gate.m.lock().unwrap(); st.0 = frame; st.1 = 0; gate.go.notify_all(); }
+        acc = work(unit * 48 / 10, acc, &buf);  // 4.8 ms at full clock: the 60 % busy main thread
+        { let mut st = gate.m.lock().unwrap(); while st.1 < GAME_WORKERS { st = gate.done.wait(st).unwrap(); } }
+        let done = mono_ns();
+        if frame > 2 { v.push((done - next).max(0) as f64 / 1e6); }  // the first frames start the threads up
+        next += GAME_NS;
+        if done >= next { next += ((done - next) / GAME_NS + 1) * GAME_NS; }
     }
-    tail(&mut all)
+    { let mut st = gate.m.lock().unwrap(); st.2 = true; gate.go.notify_all(); }
+    for h in workers { let _ = h.join(); }
+    std::hint::black_box(acc);
+    v
+}
+
+/// Game loop (ms): a 125 Hz frame whose main thread is about 60 % busy (4.8 ms of fixed work
+/// over a 1 MiB working set) and hands a 2.4 ms job to each of three worker threads at the
+/// start of every frame; the frame ends when the main thread and all jobs are done. That is
+/// the load a CPU-bound game puts on the machine and the one the light frame loop (7 % busy)
+/// and the sustained spins (100 % busy, one thread or all) both miss: cores that are busy but
+/// never saturated, where EPP, per-core EPP boost (it acts on cores more than half busy), core
+/// boost, CCD clock caps, idle states and wake-up placement of the job threads decide the
+/// frame time. Returns (median frame time, tail). Three fresh thread sets one after another.
+pub fn game_loop(dur: Duration) -> Option<(f64, f64)> {
+    let unit = unit();
+    let mut all = Vec::with_capacity(128);
+    for i in 0..3u64 {
+        all.extend(std::thread::spawn(move || game_part(dur / 3, 0x6A3E + i, unit)).join().unwrap_or_default());
+    }
+    let med = crate::calib::median(&mut all.clone())?;
+    Some((med, tail(&mut all)?))
+}
+
+/// What `contended` measured: all-thread work per second, work per joule (RAPL) and the
+/// frame loop's tail (µs) while every CPU was taken.
+pub struct Contended { pub rate: f64, pub eff: Option<f64>, pub frame_tail: Option<f64> }
+
+/// Every CPU taken: 1.5 runnable threads per logical CPU spin over a small working set
+/// while the 240 Hz frame loop runs next to them. The spinners' total is the all-thread work
+/// figure (and, with RAPL, work per joule); the frame loop's tail is what an interactive
+/// thread gets when it has to preempt its way onto a CPU - the only place where the
+/// scheduler knobs (slice, preemption, wake-up placement, migration cost, BORE) act at all:
+/// on a machine with free CPUs they have nothing to decide.
+pub fn contended(dur: Duration) -> Contended {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = cpus + cpus / 2;
+    let ((rate, lat), w) = with_pkg_power(|| {
+        let hogs: Vec<_> = (0..threads).map(|i| std::thread::spawn(move || {
+            let buf = vec![1u8; 128 * 1024];
+            let (t0, mut n, mut acc) = (Instant::now(), 0u64, i as u64);
+            while t0.elapsed() < dur { acc = work(100_000, acc ^ n, &buf); n += 100_000; }
+            std::hint::black_box(acc);
+            let secs = t0.elapsed().as_secs_f64();
+            if secs > 0.0 { n as f64 / secs } else { 0.0 }
+        })).collect();
+        let mut lat = Vec::with_capacity(256);
+        for i in 0..2u64 {
+            lat.extend(std::thread::spawn(move || frame_part(dur / 2, 0xB5 + i)).join().unwrap_or_default());
+        }
+        (hogs.into_iter().map(|h| h.join().unwrap_or(0.0)).sum::<f64>(), lat)
+    });
+    let mut lat = lat;
+    Contended { rate, eff: w.filter(|w| *w > 0.0).map(|w| rate / w), frame_tail: tail(&mut lat) }
+}
+
+/// The short job (`lpm-calibrate __job <iters>`): a fresh 8 MiB heap touched page by page,
+/// then `iters` of integer work - a compiler or a shader-compile child in miniature.
+pub fn job_main(iters: u64) {
+    if let Some(m) = anon(8 * MIB) {
+        for i in (0..m.len()).step_by(4096) { m[i] = 1; }
+        std::hint::black_box(work(iters, 7, &m[..256 * 1024]));
+    }
+}
+
+/// Short jobs per second: half the CPUs (2..12) each keep starting `exe __job` and waiting
+/// for it. A build, a game launcher or a shader cache is thousands of processes that live a
+/// few milliseconds: exec, page faults of a fresh heap, 2 ms of work on a core that was
+/// idle, exit. Sustained spins see none of it - where a new task is placed, how fast its
+/// core's clock comes up, what a fault costs (THP, reclaim under pressure).
+pub fn jobs_per_sec(exe: &std::path::Path, dur: Duration) -> Option<f64> {
+    let iters = (unit() * 2).to_string();
+    let spawn = |exe: &std::path::Path, iters: &str| std::process::Command::new(exe).arg("__job").arg(iters)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map_or(false, |s| s.success());
+    if !spawn(exe, &iters) { return None; }  // also brings the binary back into the page cache
+    let threads = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).clamp(2, 12);
+    let t0 = Instant::now();
+    let hs: Vec<_> = (0..threads).map(|_| {
+        let (exe, iters) = (exe.to_path_buf(), iters.clone());
+        std::thread::spawn(move || { let mut n = 0u64; while t0.elapsed() < dur { if !spawn(&exe, &iters) { break; } n += 1; } n })
+    }).collect();
+    let n: u64 = hs.into_iter().map(|h| h.join().unwrap_or(0)).sum();
+    let secs = t0.elapsed().as_secs_f64();
+    (n > 0 && secs > 0.0).then(|| n as f64 / secs)
 }
