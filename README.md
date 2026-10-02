@@ -199,6 +199,7 @@ Firmware-persistent changes always ask, at every level.
 | live memory timings, extra CPU sensors *(optional)* | `ryzen_smu`, `zenpower` / `zenergy` |
 | BIOS memory timings | efivarfs (`/sys/firmware/efi/efivars`) |
 | Lighting tab without a password | udev + systemd-logind or elogind (`uaccess`) |
+| Health → Network (connections, IP blacklist, Wine/.exe guard) | `nft` (nftables) and the `lpm-netguard` service; kernel: `NETFILTER_NETLINK_QUEUE`, `NF_TABLES`, `NF_TABLES_INET`, `NFT_QUEUE`, `NF_CONNTRACK`, `NFT_CT`, `INET_DIAG`, `INET_TCP_DIAG`, `INET_UDP_DIAG`, `INET_DIAG_DESTROY` |
 
 Missing pieces only disable the tab or row that needs them.
 

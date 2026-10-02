@@ -3,7 +3,7 @@
 
 EAPI=8
 
-inherit cmake systemd udev xdg
+inherit cmake linux-info systemd udev xdg
 
 DESCRIPTION="Power profile, firmware attribute and CPU/GPU curve tuning for Lenovo Legion laptops"
 HOMEPAGE="https://localhost/legion-power-manager"
@@ -24,7 +24,11 @@ DEPEND="
 RDEPEND="
 	${DEPEND}
 	sys-auth/polkit
+	net-firewall/nftables
 "
+# Health → Network (lpm-netguard); warnings only.
+CONFIG_CHECK="~NETFILTER_NETLINK_QUEUE ~NF_TABLES ~NF_TABLES_INET ~NFT_QUEUE ~NF_CONNTRACK ~NFT_CT
+	~INET_DIAG ~INET_TCP_DIAG ~INET_UDP_DIAG ~INET_DIAG_DESTROY"
 BDEPEND=">=virtual/rust-1.75"
 
 pkg_nofetch() {
@@ -54,10 +58,10 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,tune-profile-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lighting-helper,amdgpu-helper,nvcurve-sensors,legion-ec-sensors,lpm-boot-guard}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,tune-profile-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lighting-helper,amdgpu-helper,nvcurve-sensors,legion-ec-sensors,lpm-boot-guard,netguard-helper}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
-	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv,lpm-autotune,lpm-calibrate}
+	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv,lpm-autotune,lpm-calibrate,lpm-netguard}
 
 	cmake_src_install
 
@@ -69,7 +73,7 @@ src_install() {
 	insinto /etc/polkit-1/rules.d
 	doins packaging/polkit/49-legion-power-manager.rules
 	local s
-	for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard; do
+	for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard lpm-netguard; do
 		sed -e "s|@BINDIR@|${EPREFIX}/usr/bin|g" \
 			-e "s|@LIBEXEC@|${EPREFIX}/usr/libexec/legion-power-manager|g" \
 			packaging/openrc/${s} > "${T}"/${s}.initd || die
@@ -109,6 +113,8 @@ pkg_postinst() {
 	elog "  OpenRC:  rc-update add lpm-intel-uv-daemon default / systemd: lpm-intel-uv-daemon.service"
 	elog "Experimental GPU power (Optimizations \u2192 Experimental, NVIDIA laptops) needs sys-power/acpi_call"
 	elog "  and the Custom platform profile; values are written via Lenovo WMI (\\WS-free)."
+	elog "Network guard (Health \u2192 Network: IP blacklist, Wine/.exe guard):"
+	elog "  OpenRC:  rc-update add lpm-netguard default / systemd: lpm-netguard.service"
 	elog "Lutris hooks: /usr/bin/lpm-gamemode PRE / POST / RUN (see the Game launch sub-tab)."
 	elog "The Ryzen tab needs a root-owned ryzenadj in /usr/bin, /usr/sbin,"
 	elog "/usr/local/{bin,sbin} or /opt/ryzenadj."

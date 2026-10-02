@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+# Legion Power Manager — network guard daemon (Health → Network).
+#
+# Enforces the IP blacklist (nftables table inet lpm_netguard) and, when the
+# guard is switched on, cuts off Wine/.exe programs that are not whitelisted
+# (NFQUEUE). Rules: /etc/legion-power-manager/netguard.json (edited in the
+# app; the helper sends SIGHUP). Stopping the service removes the table.
+# `nft flush ruleset` (e.g. a restart of the nftables service) removes it too:
+# `rc-service lpm-netguard reload` puts it back.
+#
+#   rc-update add lpm-netguard default
+
+description="Legion Power Manager network guard (IP blacklist, Wine/.exe guard)"
+command="@BINDIR@/lpm-netguard"
+command_args="daemon"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/lpm-netguard.log"
+error_log="/var/log/lpm-netguard.log"
+extra_started_commands="reload"
+
+depend() {
+	need localmount
+	after modules nftables iptables ip6tables firewall
+}
+
+reload() {
+	ebegin "Reloading ${RC_SVCNAME}"
+	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	eend $?
+}

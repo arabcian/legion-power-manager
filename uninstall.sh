@@ -5,12 +5,15 @@ PREFIX=${PREFIX:-/usr}
 UNITDIR=${UNITDIR:-$PREFIX/lib/systemd/system}
 if [[ -d /run/systemd/system ]]; then
     systemctl disable nvcurve-autoload.service lpm-tune.service lpm-intel-uv.service lpm-intel-uv-daemon.service lpm-boot-guard.service 2>/dev/null || true
+    systemctl disable --now lpm-netguard.service 2>/dev/null || true
 else
     rc-update del nvcurve-autoload default 2>/dev/null || true
     rc-update del lpm-tune boot 2>/dev/null || true
     rc-update del lpm-intel-uv boot 2>/dev/null || true
     rc-update del lpm-intel-uv-daemon default 2>/dev/null || true
     rc-update del lpm-boot-guard 2>/dev/null || true
+    rc-service lpm-netguard stop 2>/dev/null || true
+    rc-update del lpm-netguard default 2>/dev/null || true
 fi
 # Put every tuned value back before the helper disappears.
 if [[ -x "$PREFIX/libexec/legion-power-manager/tune-helper" ]]; then
@@ -22,7 +25,7 @@ if [[ -x "$PREFIX/libexec/legion-power-manager/tune-helper" ]]; then
     fi
 fi
 rm -rf "$PREFIX/libexec/legion-power-manager"
-rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-gamemode" "$PREFIX/bin/lpm-intel-uv" "$PREFIX/bin/lpm-autotune" "$PREFIX/bin/lpm-calibrate" \
+rm -f "$PREFIX/bin/legion-power-manager" "$PREFIX/bin/nvcurve" "$PREFIX/bin/lpm-gamemode" "$PREFIX/bin/lpm-intel-uv" "$PREFIX/bin/lpm-autotune" "$PREFIX/bin/lpm-calibrate" "$PREFIX/bin/lpm-netguard" /etc/init.d/lpm-netguard "$UNITDIR/lpm-netguard.service" \
       /etc/init.d/lpm-tune /etc/init.d/lpm-intel-uv /etc/init.d/lpm-intel-uv-daemon /etc/init.d/lpm-boot-guard {/lib64,/usr/lib64,/lib,/usr/lib}/elogind/system-sleep/50-lpm-intel-uv \
       "$PREFIX/share/applications/legion-power-manager.desktop" \
       "$PREFIX/share/icons/hicolor/scalable/apps/legion-power-manager.svg" \
@@ -39,6 +42,6 @@ rm -f /var/lib/legion-power-manager/boot-guard.json /var/lib/legion-power-manage
 rmdir /var/lib/legion-power-manager 2>/dev/null || true
 [[ -d /run/systemd/system ]] && systemctl daemon-reload 2>/dev/null || true
 [[ -L /run/legion-power-manager ]] && rm -f /run/legion-power-manager || rm -rf /run/legion-power-manager
-echo "Removed. Kept: /etc/nvcurve, /etc/legion-power-manager (boot preset),"
+echo "Removed. Kept: /etc/nvcurve, /etc/legion-power-manager (boot preset, network guard rules),"
 [[ -d /var/lib/legion-power-manager ]] && echo "/var/lib/legion-power-manager (BIOS memory-timing backups),"
 echo "~/.config/ryzen-curve-optimizer and ~/.config/legion-power-manager (tuning presets)."

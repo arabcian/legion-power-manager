@@ -130,4 +130,14 @@
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/lighting-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
+  <action id="com.legion-power-manager.netguard">
+    <description>Change the network guard rules (IP blacklist, program whitelist) or abort a connection</description>
+    <description xml:lang="tr">Ağ koruması kurallarını (IP kara listesi, program beyaz listesi) değiştir veya bir bağlantıyı kes</description>
+    <message>Authentication is required to change the network guard rules</message>
+    <message xml:lang="tr">Ağ koruması kurallarını değiştirmek için kimlik doğrulama gerekiyor</message>
+    <!-- Never silent (see the rules file): a guarded program runs as the user and must not be able to whitelist itself. -->
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/netguard-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
 </policyconfig>

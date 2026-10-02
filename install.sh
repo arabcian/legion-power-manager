@@ -24,6 +24,7 @@
 #   /usr/bin/legion-power-manager                   GUI (Qt6)
 #   /usr/bin/nvcurve                                nvcurve CLI (Rust)
 #   /usr/bin/lpm-gamemode                           Lutris/Steam game-mode hook (runs as the user)
+#   /usr/bin/lpm-netguard                           network guard daemon (IP blacklist, Wine/.exe guard)
 #   /usr/libexec/legion-power-manager/*-helper      pkexec targets (root:root)
 #   $PREFIX/lib/udev/rules.d/70-legion-power-manager-lighting.rules   keyboard lighting (uaccess)
 #   /usr/share/polkit-1/actions/com.legion-power-manager.policy
@@ -152,10 +153,10 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/tune-profile-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/legion-ec-sensors" "$T/lpm-boot-guard" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/tune-profile-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/legion-ec-sensors" "$T/lpm-boot-guard" "$T/netguard-helper" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
-install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$T/lpm-autotune" "$T/lpm-calibrate" "$DESTDIR$PREFIX/bin/"
+install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$T/lpm-autotune" "$T/lpm-calibrate" "$T/lpm-netguard" "$DESTDIR$PREFIX/bin/"
 DESTDIR="$DESTDIR" cmake --install gui/build --strip
 
 install -d "${own[@]}" -m 0755 "$DESTDIR$PREFIX/share/polkit-1/actions" "$DESTDIR/etc/polkit-1/rules.d" \
@@ -174,16 +175,16 @@ if [[ -z "$DESTDIR" ]] && command -v udevadm >/dev/null; then
 fi
 # Service files carry @BINDIR@/@LIBEXEC@ so a non-/usr PREFIX points at the right binaries.
 subst() { sed -e "s|@BINDIR@|$PREFIX/bin|g" -e "s|@LIBEXEC@|$LIBEXEC|g" "$1"; }
-for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard; do
+for s in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard lpm-netguard; do
     subst "packaging/openrc/$s" > "$DESTDIR/etc/init.d/$s"
     chmod 0755 "$DESTDIR/etc/init.d/$s"
 done
 install -d "${own[@]}" -m 0755 "$DESTDIR$UNITDIR"
-for u in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard; do
+for u in nvcurve-autoload lpm-tune lpm-intel-uv lpm-intel-uv-daemon lpm-boot-guard lpm-netguard; do
     subst "packaging/systemd/$u.service" > "$DESTDIR$UNITDIR/$u.service"
     chmod 0644 "$DESTDIR$UNITDIR/$u.service"
 done
-[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR"/etc/init.d/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon,lpm-boot-guard} "$DESTDIR$UNITDIR"/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon,lpm-boot-guard}.service
+[[ $EUID -eq 0 ]] && chown root:root "$DESTDIR"/etc/init.d/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon,lpm-boot-guard,lpm-netguard} "$DESTDIR$UNITDIR"/{nvcurve-autoload,lpm-tune,lpm-intel-uv,lpm-intel-uv-daemon,lpm-boot-guard,lpm-netguard}.service
 # elogind resume hook (re-applies the Intel undervolt boot profile; systemd uses the unit's sleep targets).
 ELOGIND_SLEEP=${ELOGIND_SLEEP:-}
 if [[ -z $ELOGIND_SLEEP ]]; then
@@ -216,11 +217,13 @@ if [[ -z "$DESTDIR" ]]; then
         echo "  systemctl enable lpm-boot-guard.service     # records clean shutdowns (login-scene guard)"
         echo "  systemctl enable nvcurve-autoload.service   # GPU V/F profile"
         echo "  systemctl enable lpm-tune.service           # Optimizations boot preset"
+        echo "  systemctl enable --now lpm-netguard.service # network guard (Health → Network; needs nftables)"
         grep -q GenuineIntel /proc/cpuinfo && echo "  systemctl enable lpm-intel-uv.service       # Intel undervolt boot/resume profile (or lpm-intel-uv-daemon)"
     else
         echo "  rc-update add lpm-boot-guard default     # records clean shutdowns (login-scene guard)"
         echo "  rc-update add nvcurve-autoload default   # GPU V/F profile"
         echo "  rc-update add lpm-tune boot              # Optimizations boot preset"
+        echo "  rc-update add lpm-netguard default       # network guard (Health → Network; needs nftables)"
         grep -q GenuineIntel /proc/cpuinfo && echo "  rc-update add lpm-intel-uv boot          # Intel undervolt boot profile (or lpm-intel-uv-daemon default)"
     fi
     if [[ -x /usr/local/bin/lutris-game-tune-wrapper ]]; then

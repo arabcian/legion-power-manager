@@ -1,0 +1,26 @@
+# Legion Power Manager — network guard daemon (Health → Network).
+# Counterpart of packaging/openrc/lpm-netguard.
+#
+#   systemctl enable --now lpm-netguard.service
+
+[Unit]
+Description=Legion Power Manager network guard (IP blacklist, Wine/.exe guard)
+After=systemd-modules-load.service nftables.service network-pre.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/lpm-netguard daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

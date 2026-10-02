@@ -34,6 +34,11 @@
  * without the user noticing, so it always gets AUTH_ADMIN (password every
  * time, no keep), for wheel members at the machine too.
  *
+ * Exception: netguard-helper (com.legion-power-manager.netguard) changes the
+ * network guard's whitelist/blacklist. The programs it guards run as the same
+ * user, so a silent grant would let one of them whitelist itself: it always
+ * gets AUTH_ADMIN_KEEP (password, then polkit's cache window), at every level.
+ *
  * Security level (chosen at install time, install.sh --security-level=N):
  *   1  the behaviour described above: wheel + local + active session is silent.
  *   2  no silent grants: the same session gets auth_admin_keep (one password,
@@ -68,12 +73,19 @@ var PROFILE_ID = "com.legion-power-manager.tune.profile";
 var PROFILE_HELPER = "@LIBEXEC@/tune-profile-helper";
 var FIRMWARE_ACTION = "com.legion-power-manager.firmware.write";
 var FIRMWARE_HELPER = "@LIBEXEC@/legion-firmware-helper";
+var NETGUARD_ACTION = "com.legion-power-manager.netguard";
+var NETGUARD_HELPER = "@LIBEXEC@/netguard-helper";
 
 polkit.addRule(function (action, subject) {
     // Firmware-persistent writes: always the password, never cached.
     if (action.id === FIRMWARE_ACTION ||
         (action.id === "org.freedesktop.policykit.exec" && action.lookup("program") === FIRMWARE_HELPER)) {
         return polkit.Result.AUTH_ADMIN;
+    }
+    // Network guard rules: never silent, the password is kept for polkit's cache window.
+    if (action.id === NETGUARD_ACTION ||
+        (action.id === "org.freedesktop.policykit.exec" && action.lookup("program") === NETGUARD_HELPER)) {
+        return (subject.local && subject.active && subject.isInGroup("wheel")) ? polkit.Result.AUTH_ADMIN_KEEP : polkit.Result.AUTH_ADMIN;
     }
     var ours = action.id.indexOf("com.legion-power-manager.") === 0 ||
         (action.id === "org.freedesktop.policykit.exec" &&
