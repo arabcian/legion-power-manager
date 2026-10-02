@@ -99,7 +99,7 @@ static const Builtin BUILTINS[] = {
     {"amd", "Competitive",
      "Gaming X3D taken to the limit: frequency CCD parked (in game mode emptied, not taken offline), deep C-states off. Maximum determinism, most heat.",
      R"({"values":{
-        "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.boost":"1",
+        "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"performance","cpu.epp_boost":"1","cpu.boost":"1",
         "cpu.governor_ccd0":"powersave","cpu.governor_ccd1":"powersave","cpu.epp_ccd0":"performance","cpu.epp_ccd1":"balance_power",
         "cpu.min_freq":"lowest_nonlinear","cpu.x3d_mode":"cache","cpu.cstate_max":"1",
         "thp.enabled":"madvise","thp.defrag":"defer+madvise","thp.khugepaged_defrag":0,"mm.lru_gen_min_ttl":1000,
@@ -119,7 +119,7 @@ static const Builtin BUILTINS[] = {
     {"amd", "Compile throughput",
      "Long parallel builds (emerge, kernel): frequency CCD preferred, throughput preemption, bigger slices.",
      R"({"values":{
-        "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance","cpu.boost":"1",
+        "cpu.pstate_status":"active","cpu.governor":"powersave","cpu.epp":"balance_performance","cpu.epp_boost":"1","cpu.boost":"1",
         "cpu.x3d_mode":"frequency","cpu.smt":"on","cpu.ccd_park":"none","cpu.cstate_max":"all",
         "thp.enabled":"always","thp.defrag":"madvise","vm.swappiness":60,
         "sched.preempt":"voluntary","sched.base_slice_ns":3000000,"sched.min_base_slice_ns":3000000,"sched.migration_cost_ns":500000,
