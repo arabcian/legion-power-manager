@@ -119,13 +119,28 @@ ryzen::Layout ryzen::detect() {
         groups << parked;
     // Order by L3 id when every online group has one (a parked group has none: it sorts by
     // its first CPU, which is what it always did), else by lowest CPU number.
+    // A parked group has no sysfs id, so remember ids seen while its CPUs were online: otherwise
+    // parking flips the sort from L3-id order to CPU-number order and CCD0/CCD1 swap places
+    // whenever the two orders differ (SMU slots follow the L3-id / die order).
+    static QMap<int, int> knownId;
+    for (auto it = idOfCpu.cbegin(); it != idOfCpu.cend(); ++it) if (it.value() >= 0) knownId[it.key()] = it.value();
     auto keyOf = [&](const QList<int> &g) {
-        for (int c : g) if (idOfCpu.value(c, -1) >= 0) return idOfCpu.value(c);
+        for (int c : g) { const int v = idOfCpu.value(c, -1) >= 0 ? idOfCpu.value(c) : knownId.value(c, -1); if (v >= 0) return v; }
         return -1;
     };
     const bool haveIds = std::all_of(groups.begin(), groups.end(), [&](const QList<int> &g) { return keyOf(g) >= 0; });
+    // Remember the L3-id order (by each CCD's lowest CPU, which survives SMT/park) and reuse it
+    // whenever ids are unreadable (hot-plug transition), instead of flipping to CPU-number order.
+    static QList<int> stableOrder;
+    auto known = [&] {
+        if (stableOrder.size() != groups.size()) return false;
+        return std::all_of(groups.begin(), groups.end(), [&](const QList<int> &g) { return stableOrder.contains(g.first()); });
+    };
     std::sort(groups.begin(), groups.end(), [&](const QList<int> &a, const QList<int> &b) {
-        return haveIds ? keyOf(a) < keyOf(b) : a.first() < b.first(); });
+        if (haveIds) return keyOf(a) < keyOf(b);
+        if (known()) return stableOrder.indexOf(a.first()) < stableOrder.indexOf(b.first());
+        return a.first() < b.first(); });
+    if (haveIds) { stableOrder.clear(); for (const auto &g : groups) stableOrder << g.first(); }
     out.ccdCount = groups.size();
     for (int ccd = 0; ccd < groups.size(); ++ccd) {
         if (groups[ccd] != parked) continue;
@@ -727,10 +742,31 @@ void RyzenTab::updateParked() {
         };
         if (fresh.ccdCount == layout_.ccdCount && sig(fresh) != sig(layout_)) {
             layout_ = fresh;
-            for (const Slot &s : std::as_const(slots_)) {
-                const auto cores = layout_.cores.value(s.ccd);
-                if (s.slot >= cores.size()) continue;
-                s.cppc->setText(cores[s.slot].highestPerf ? QString::number(*cores[s.slot].highestPerf) : QStringLiteral("–"));
+            // Full redraw of the layout-derived cells (value, ★, colour, tooltips), not just the text:
+            // otherwise the ★ markers and CPU hints keep describing the old CCD mapping.
+            for (int ccd = 0; ccd < ccdCount_; ++ccd) {
+                const auto cores = layout_.cores.value(ccd);
+                QList<int> perf;
+                for (const auto &c : cores) if (c.highestPerf) perf << *c.highestPerf;
+                std::sort(perf.begin(), perf.end(), std::greater<>());
+                const int bestCut = perf.size() >= 2 ? perf[1] : (perf.isEmpty() ? INT_MAX : perf[0]);
+                for (const Slot &s : std::as_const(slots_)) {
+                    if (s.ccd != ccd) continue;
+                    const ryzen::PhysCore *pc = s.slot < cores.size() ? &cores[s.slot] : nullptr;
+                    QStringList cpus;
+                    if (pc) for (int c : pc->cpus) cpus << QString::number(c);
+                    const QString cpuHint = pc ? QStringLiteral("OS CPU%1 %2").arg(cpus.size() == 1 ? "" : "s", cpus.join(", "))
+                                               : QStringLiteral("OS CPU mapping unknown (topology mismatch)");
+                    const bool hasHp = pc && pc->highestPerf;
+                    const bool best = hasHp && *pc->highestPerf >= bestCut;
+                    s.cppc->setText(hasHp ? QString::number(*pc->highestPerf) + (best ? QStringLiteral(" ★") : QString()) : QStringLiteral("–"));
+                    s.cppc->setStyleSheet(QStringLiteral("color:%1;%2 background:transparent;")
+                                              .arg(hasHp ? (best ? theme::WARN : theme::FG_DIM) : theme::MUTED, best ? " font-weight:700;" : ""));
+                    s.cppc->setToolTip(QStringLiteral("CPPC highest_perf for this physical core") +
+                                       (hasHp ? ": " + QString::number(*pc->highestPerf) : QStringLiteral(" (not reported on this system)")) +
+                                       "\nHigher = a better core on this die; ★ marks the two best on this CCD.\n" + cpuHint);
+                    s.row->setToolTip(QStringLiteral("Fixed SMU slot %1 of CCD%2 (hardware addressing, not the OS core id)\n").arg(s.slot).arg(ccd) + cpuHint);
+                }
             }
         }
     }
