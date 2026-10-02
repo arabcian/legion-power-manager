@@ -21,6 +21,7 @@ class QLabel;
 class QLineEdit;
 class QPushButton;
 class QSpinBox;
+class SceneEngine;
 class Int64SpinBox;
 class QTabWidget;
 class QTimer;
@@ -37,6 +38,9 @@ public:
     /// Load + apply as a manual change (tray). false if busy or unknown.
     bool applyNamedPreset(const QString &name);
     void restoreAll(bool confirm = true);
+    /// Pauses Scenes, then writes every knob to the value lpm-boot-guard captured at boot (calibration baseline).
+    void returnToBootDefaults();
+    void setSceneEngine(SceneEngine *eng) { scenes_ = eng; }
     bool busy() const { return busy_; }
     bool tuningActive() const { return active_; }
     QString gamePreset() const;
@@ -116,6 +120,8 @@ private:
     bool active_ = false, busy_ = false, describing_ = false, helperMissing_ = false;
 
     QLabel *banner_ = nullptr, *bannerDetail_ = nullptr, *status_ = nullptr, *bootLabel_ = nullptr;
+    SceneEngine *scenes_ = nullptr;
+    QPushButton *defaultsBtn_ = nullptr;
     QPushButton *restoreBtn_ = nullptr, *applyBtn_ = nullptr, *gameBtn_ = nullptr, *bootBtn_ = nullptr, *bootClear_ = nullptr;
     QComboBox *presetCombo_ = nullptr, *affinity_ = nullptr, *autoGoal_ = nullptr;
     QPushButton *autoBtn_ = nullptr;

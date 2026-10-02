@@ -64,7 +64,7 @@ static QString helperPath() { return privileged::helperPath(QStringLiteral("tune
 // raw values, the boot preset, the preset store and driver options go to tune-helper (install.sh security level 3
 // asks for the password there only).
 static QString helperForOp(const QString &op) {
-    static const QStringList profileOps{"snapshot", "apply_preset", "release", "prune", "restore", "restore_keys", "boost", "isolate_join", "tool"};
+    static const QStringList profileOps{"snapshot", "apply_preset", "release", "prune", "restore", "restore_keys", "restore_defaults", "boost", "isolate_join", "tool"};
     return privileged::helperPath(profileOps.contains(op) ? QStringLiteral("tune-profile-helper") : QStringLiteral("tune-helper"));
 }
 
@@ -294,6 +294,11 @@ void OptimizeTab::buildUi() {
     btext->addWidget(banner_);
     btext->addWidget(bannerDetail_);
     bl->addLayout(btext, 1);
+    defaultsBtn_ = new QPushButton("↺ Return to boot-guard defaults");
+    defaultsBtn_->setToolTip("Pause Scenes and write every setting back to the value lpm-boot-guard captured at the start of this boot —\n"
+                             "a clean baseline for calibration, even if TLP or a scene changed things since.");
+    connect(defaultsBtn_, &QPushButton::clicked, this, &OptimizeTab::returnToBootDefaults);
+    bl->addWidget(defaultsBtn_);
     restoreBtn_ = new QPushButton("Restore originals");
     restoreBtn_->setObjectName("btnDanger");
     restoreBtn_->setToolTip("Write every saved original value back (hot-plugged CPUs first).");
@@ -1569,6 +1574,49 @@ void OptimizeTab::restoreAll(bool confirm) {
     });
 }
 
+void OptimizeTab::returnToBootDefaults() {
+    if (busy_) return;
+    const QString title = QStringLiteral("Return to boot-guard defaults");
+    QFile f(QStringLiteral("/var/lib/legion-power-manager/defaults.json"));
+    const QJsonObject snap = f.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(f.readAll()).object() : QJsonObject();
+    if (snap.value("values").toObject().isEmpty()) {
+        QMessageBox::warning(this, title, QStringLiteral("lpm-boot-guard has not captured boot defaults yet. Enable the lpm-boot-guard service and reboot once."));
+        return;
+    }
+    if (scenes_ && scenes_->busy()) {
+        QMessageBox::information(this, title, QStringLiteral("A scene is being applied right now. Try again when it has finished."));
+        return;
+    }
+    QString msg = QStringLiteral("Scenes will be paused (no automatic scene changes until you resume them in the Scenes tab), game mode ends, and "
+                                 "all %1 Optimizations settings are written back to the values lpm-boot-guard captured at the start of this boot.\n\n"
+                                 "Power profile, firmware limits, curves and lighting are not part of that snapshot and stay as they are.")
+                      .arg(snap.value("values").toObject().size());
+    if (!snap.value("clean").toBool())
+        msg += QStringLiteral("\n\nNote: that snapshot was taken after TLP or LPM had already run, so it may not be the pristine kernel default.");
+    if (QMessageBox::question(this, title, msg) != QMessageBox::Yes) return;
+    if (scenes_) {
+        QString err;
+        if (!scenes_->setPaused(true, &err)) {
+            QMessageBox::critical(this, title, QStringLiteral("Could not pause Scenes: ") + err);
+            return;
+        }
+    }
+    runOp({{"op", "restore_defaults"}}, title, [this](const QJsonObject &res) {
+        if (!res.contains("snapshot")) return;  // refused before anything was written; runOp shows the error
+        for (Row &x : rows_) x.touched = false;
+        const QJsonArray failed = res.value("failed").toArray();
+        if (failed.isEmpty()) {
+            showStatus(QStringLiteral("Back at boot defaults (%1 file(s) written). Scenes are paused.").arg(res.value("written").toInt()), theme::OK, 10000);
+            return;
+        }
+        QStringList keys;
+        for (const QJsonValue &v : failed) keys << v.toString();
+        showStatus(QStringLiteral("%1 setting(s) could not be returned to their boot default.").arg(failed.size()), theme::DANGER, 15000);
+        QMessageBox::warning(this, QStringLiteral("Return to boot-guard defaults"),
+                             QStringLiteral("These settings could not be written back:\n\n") + keys.join(QStringLiteral(", ")));
+    });
+}
+
 void OptimizeTab::approvePreset(const QString &name, const QJsonObject &values, std::function<void()> then) {
     runOp({{"op", "preset_save"}, {"name", name}, {"values", values}}, QStringLiteral("Approve preset"),
           [then](const QJsonObject &res) { if (res.value(QStringLiteral("ok")).toBool() && then) then(); });
@@ -1603,6 +1651,7 @@ void OptimizeTab::setBusy(bool b) {
     gameBtn_->setEnabled(!b);
     bootBtn_->setEnabled(!b);
     restoreBtn_->setEnabled(!b && active_);
+    defaultsBtn_->setEnabled(!b);
     bootClear_->setEnabled(!b && !boot_.isEmpty());
     if (autoBtn_) autoBtn_->setEnabled(!b && !autoRunning_);
 }
