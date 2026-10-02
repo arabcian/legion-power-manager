@@ -29,6 +29,7 @@ pub mod legion_wmi;
 pub mod lighting;
 pub mod machine;
 pub mod model;
+pub mod netguard;
 pub mod nvreg;
 pub mod tools;
 pub mod tune;
