@@ -1,6 +1,7 @@
 #include "healthtab.h"
 #include "klogpage.h"
 #include "dgpupage.h"
+#include "netpage.h"
 
 #include "privileged.h"
 #include "systools.h"
@@ -63,6 +64,11 @@ HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
     auto *monitor = new QWidget;
     sub->addTab(monitor, QStringLiteral("Monitor"));
     if (DgpuPage::present()) sub->addTab(new DgpuPage, QStringLiteral("dGPU power"));
+    // Network: connections, IP blacklist, Wine/.exe guard. Built now (not lazily):
+    // its inotify watch on the block log is what raises the tray alert.
+    auto *net = new NetPage;
+    connect(net, &NetPage::alert, this, &HealthTab::alert);
+    sub->addTab(net, QStringLiteral("Network"));
     systools::addPages(sub);
     sub->addTab(new KlogPage, QStringLiteral("Kernel log"));
     auto *root = new QVBoxLayout(monitor);

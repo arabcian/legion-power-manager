@@ -42,6 +42,7 @@ add_executable(legion-power-manager
     src/systools.cpp     src/systools.h
     src/klogpage.cpp     src/klogpage.h
     src/dgpupage.cpp     src/dgpupage.h
+    src/netpage.cpp      src/netpage.h
 )
 # Theme glyphs (checkbox tick, spin/combo chevrons), @2x for HiDPI. Compiled
 # with qt_add_resources, not AUTORCC: CMake's Makefile generator runs the
