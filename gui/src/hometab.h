@@ -25,6 +25,7 @@ class HomeTab : public QWidget {
     Q_OBJECT
 public:
     explicit HomeTab(QWidget *parent = nullptr);
+    ~HomeTab() override;
     void setSceneEngine(SceneEngine *eng);  // pause banner
 
     static QString profileLabel(const QString &profile);
@@ -95,7 +96,6 @@ private:
     void refreshDevice();                          // synchronous read + apply (after a user action)
     void applyDevice(const DeviceSnap &snap);
     void setDevice(const QString &key, const QString &value);
-    void runNvidiaSmi(const QStringList &args, std::function<void(const QByteArray &)> onOk);
 
     std::optional<pp::Handler> handler_;
     QHash<QString, QPushButton *> buttons_;
@@ -110,14 +110,20 @@ private:
     QList<LiveRow> liveRows_;
     QLabel *gpuLiveKey_ = nullptr, *gpuLiveValue_ = nullptr;
     QLabel *gpuHwKey_ = nullptr, *gpuHwValue_ = nullptr;
-    QProcess *smiLive_ = nullptr;
     bool liveBusy_ = false;            // a sensor sweep is running on the thread pool
-    // dGPU runtime PM: nvidia-smi wakes the GPU, so it is skipped while the
-    // GPU sleeps and throttled while it idles (see refreshGpuLive()).
+    // dGPU row: runtime-PM state from sysfs, temperature from the EC. The
+    // NVIDIA driver is never queried here (see hometab.cpp).
     QString dgpuRuntimeStatus_;        // <pci>/power/runtime_status of the NVIDIA dGPU
     bool dgpuProbed_ = false;
-    qint64 nextSmiAt_ = 0;             // monotonic ms; no nvidia-smi before this
     void refreshGpuLive();
+    // EC-side dGPU temperature (legion-ec-sensors root stream, only while the
+    // tab is visible): the GPU temperature without asking the driver.
+    QProcess *ecStream_ = nullptr;
+    bool ecFailed_ = false;            // unsupported firmware / not authorized: don't retry
+    int ecGpuTemp_ = 0;                // °C, 0 = no reading
+    qint64 ecAt_ = 0;                  // monotonic ms of the last EC reading
+    void startEcStream();
+    void stopEcStream();
 
     // Device box (battery charge mode, ideapad toggles, fan targets)
     QString chargeFile_, ideapadDir_, fanHwmon_;

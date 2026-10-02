@@ -22,6 +22,7 @@
 #include <QDir>
 #include <QGroupBox>
 #include <QIntValidator>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QLineEdit>
 #include <QSignalBlocker>
@@ -41,11 +42,12 @@
 #include <QShowEvent>
 #include <QVBoxLayout>
 
-static constexpr int LIVE_POLL_MS = 2000, SMI_TIMEOUT_MS = 3000;
-// nvidia-smi while the dGPU idles: every query resets the driver's idle timer,
-// so polling it every 2 s kept the GPU out of D3cold for as long as the Home
-// tab was open. Idle → one query every 15 s, long enough for it to suspend.
-static constexpr int SMI_IDLE_MS = 15000;
+static constexpr int LIVE_POLL_MS = 2000;
+// The Home tab never asks the NVIDIA driver anything (no nvidia-smi, no NVML):
+// every query powers the dGPU up or resets its idle timer, so a page that
+// polls keeps the GPU out of D3cold. The GPU row is built from the PCI
+// runtime-PM state (sysfs) and the EC's temperature sensor only; clock, power
+// and utilisation live in the NVIDIA tab, which the user opens on purpose.
 
 /// Monotonic milliseconds (QDeadlineTimer-free, works on Qt 6.4).
 static qint64 monoMs() {
@@ -67,7 +69,7 @@ static QString nvidiaPciDir() {
 }
 
 /// GPU model from the driver's procfs node — reading it does not touch the
-/// hardware, unlike nvidia-smi, which powers the dGPU up just to print a name.
+/// hardware (nvidia-smi would power the dGPU up just to print a name).
 static std::optional<QString> nvidiaProcModel() {
     const QDir d(QStringLiteral("/proc/driver/nvidia/gpus"));
     for (const QString &e : d.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
@@ -78,12 +80,6 @@ static std::optional<QString> nvidiaProcModel() {
                 if (const QString m = QString::fromUtf8(line.mid(6)).trimmed(); !m.isEmpty()) return m;
     }
     return std::nullopt;
-}
-
-/// nvidia-smi path, resolved once ($PATH does not change under us).
-static const QString &nvidiaSmiExe() {
-    static const QString exe = QStandardPaths::findExecutable(QStringLiteral("nvidia-smi"));
-    return exe;
 }
 
 static const QHash<QString, QString> LABELS{
@@ -290,30 +286,6 @@ HomeTab::HomeTab(QWidget *parent) : QWidget(parent), handler_(pp::primaryHandler
     connect(live_, &QTimer::timeout, this, &HomeTab::refreshLive);
 }
 
-// ── nvidia-smi (async, bounded) ─────────────────────────────────────────────
-
-void HomeTab::runNvidiaSmi(const QStringList &args, std::function<void(const QByteArray &)> onOk) {
-    const QString &exe = nvidiaSmiExe();
-    if (exe.isEmpty()) { onOk({}); return; }
-    auto *p = new QProcess(this);
-    auto *t = new QTimer(p);
-    t->setSingleShot(true);
-    connect(t, &QTimer::timeout, p, [p] { p->kill(); });
-    connect(p, &QProcess::finished, this, [p, onOk](int code, QProcess::ExitStatus st) {
-        onOk(code == 0 && st == QProcess::NormalExit ? p->readAllStandardOutput() : QByteArray());
-        p->deleteLater();
-    });
-    connect(p, &QProcess::errorOccurred, this, [p, onOk](QProcess::ProcessError e) {
-        if (e == QProcess::FailedToStart) { onOk({}); p->deleteLater(); }
-    });
-    // Mark before start(): a synchronous FailedToStart runs onOk (which
-    // clears smiLive_) inside start(), and must not be overwritten after.
-    if (args.contains("--query-gpu=temperature.gpu,power.draw,clocks.current.graphics,utilization.gpu"))
-        smiLive_ = p;
-    p->start(exe, args);
-    t->start(SMI_TIMEOUT_MS);
-}
-
 // ── Hardware box ────────────────────────────────────────────────────────────
 
 QGroupBox *HomeTab::buildHardwareBox() {
@@ -365,11 +337,9 @@ QGroupBox *HomeTab::buildHardwareBox() {
 
     if (auto m = nvidiaProcModel()) {
         gpuHwValue_->setText(*m);
-    } else {
-        runNvidiaSmi({"--query-gpu=name", "--format=csv,noheader"}, [this](const QByteArray &out) {
-            if (auto n = sysinfo::parseGpuName(out)) { gpuHwValue_->setText(*n); }
-            else { gpuHwKey_->hide(); gpuHwValue_->hide(); }
-        });
+    } else {  // no NVIDIA driver loaded: nothing to name without waking hardware
+        gpuHwKey_->hide();
+        gpuHwValue_->hide();
     }
     return box;
 }
@@ -391,7 +361,7 @@ QGroupBox *HomeTab::buildLiveBox() {
         {"Battery", sysinfo::battery}};
     int row = 0;
     for (const auto &[name, getter] : spec) {
-        if (!getter) {  // GPU: filled asynchronously; hidden until nvidia-smi answers
+        if (!getter) {  // dGPU: sysfs state + EC temperature, see refreshGpuLive()
             gpuLiveKey_ = muted(name);
             gpuLiveValue_ = new QLabel;
             gpuLiveValue_->setWordWrap(true);
@@ -410,14 +380,14 @@ QGroupBox *HomeTab::buildLiveBox() {
         g->addWidget(val, row++, 1);
         liveRows_.append({key, val, getter});
     }
-    if (liveRows_.isEmpty()) g->addWidget(muted("No live sensors found (hwmon, nvidia-smi, battery)."), row++, 0, 1, 2);
+    if (liveRows_.isEmpty()) g->addWidget(muted("No live sensors found (hwmon, battery)."), row++, 0, 1, 2);
     g->setColumnStretch(1, 1);
     g->setRowStretch(row, 1);
     return box;
 }
 
 void HomeTab::refreshLive() {
-    // Not visible (hidden to tray / other tab) → no reads. nvidia-smi in
+    // Not visible (hidden to tray / other tab) → no reads.
     // particular wakes the dGPU out of D3cold.
     if (!isVisible()) return;
     refreshGpuLive();
@@ -455,39 +425,74 @@ void HomeTab::refreshLive() {
 }
 
 void HomeTab::refreshGpuLive() {
-    if (smiLive_) return;  // previous query still running — never stack them
     if (!dgpuProbed_) {
         dgpuProbed_ = true;
         if (const QString pci = nvidiaPciDir(); !pci.isEmpty()) dgpuRuntimeStatus_ = pci + QStringLiteral("/power/runtime_status");
     }
-    // Asleep (runtime PM "suspended" = D3hot/D3cold): report it, don't wake it.
-    if (!dgpuRuntimeStatus_.isEmpty()
-        && pp::readText(dgpuRuntimeStatus_).value_or(QString()) == QLatin1String("suspended")) {
-        gpuLiveValue_->setText(QStringLiteral("asleep (runtime suspended, ~0 W)"));
-        gpuLiveKey_->show();
-        gpuLiveValue_->show();
-        nextSmiAt_ = 0;  // query immediately once something else wakes it
-        return;
+    if (dgpuRuntimeStatus_.isEmpty()) return;  // no NVIDIA dGPU: row stays hidden
+    // sysfs + EC only — the driver is never queried, so this cannot keep the GPU awake.
+    const QString st = pp::readText(dgpuRuntimeStatus_).value_or(QString());
+    QString t;
+    if (st == QLatin1String("suspended")) {
+        t = QStringLiteral("asleep (runtime suspended, ~0 W)");
+    } else if (st == QLatin1String("active") || st.isEmpty()) {
+        t = ecGpuTemp_ > 0 && monoMs() - ecAt_ < 5000 ? QStringLiteral("%1°C  ·  awake").arg(ecGpuTemp_) : QStringLiteral("awake");
+    } else {
+        t = st;  // suspending / resuming / error
     }
-    if (monoMs() < nextSmiAt_) return;
-    runNvidiaSmi({"--query-gpu=temperature.gpu,power.draw,clocks.current.graphics,utilization.gpu",
-                  "--format=csv,noheader,nounits"},
-                 [this](const QByteArray &out) {
-                     smiLive_ = nullptr;
-                     // Busy → normal cadence; idle (0 % util) → back off so the
-                     // driver's idle timer can expire and the GPU can suspend.
-                     const QStringList parts = QString::fromUtf8(out).trimmed().section('\n', 0, 0).split(',');
-                     bool ok = false;
-                     const int util = parts.size() >= 4 ? parts[3].trimmed().toInt(&ok) : 0;
-                     nextSmiAt_ = monoMs() + (ok && util > 0 ? 0 : SMI_IDLE_MS);
-                     if (auto v = sysinfo::parseGpuLive(out)) {
-                         gpuLiveValue_->setText(*v);
-                         gpuLiveKey_->show();
-                         gpuLiveValue_->show();
-                     } else if (gpuLiveValue_->isVisible()) {
-                         gpuLiveValue_->setText(QStringLiteral("—"));
-                     }
-                 });
+    if (gpuLiveValue_->text() != t) gpuLiveValue_->setText(t);
+    gpuLiveKey_->show();
+    gpuLiveValue_->show();
+}
+
+// ── EC sensor stream (root, read-only) ──────────────────────────────────────
+
+HomeTab::~HomeTab() { stopEcStream(); }
+
+void HomeTab::startEcStream() {
+    QString pkexec;
+    for (const char *c : {"/usr/bin/pkexec", "/bin/pkexec"})
+        if (QFileInfo(QString::fromLatin1(c)).isFile()) { pkexec = QString::fromLatin1(c); break; }
+    const QString helper = privileged::helperPath(QStringLiteral("legion-ec-sensors"));
+    if (pkexec.isEmpty() || !QFileInfo(helper).isExecutable()) { ecFailed_ = true; return; }
+    // Parented to the app, not the tab: once pkexec has exec'd the root helper
+    // we can't kill it (EPERM) — it exits on its own when stdin closes.
+    auto *p = new QProcess(QCoreApplication::instance());
+    ecStream_ = p;
+    p->setProgram(pkexec);
+    p->setArguments({helper});
+    connect(p, &QProcess::readyReadStandardOutput, this, [this, p] {
+        QByteArray last;
+        while (p->canReadLine()) last = p->readLine();
+        const QJsonObject o = QJsonDocument::fromJson(last).object();
+        if (o.isEmpty() || o.contains("error")) return;
+        ecGpuTemp_ = o.value("gpu_temp_c").toInt(0);
+        ecAt_ = monoMs();
+    });
+    QPointer<HomeTab> self(this);
+    connect(p, &QProcess::finished, p, [self, p](int code) {
+        if (self && self->ecStream_ == p) {
+            self->ecStream_ = nullptr;
+            if (code != 0) self->ecFailed_ = true;  // unsupported / denied: not again this session
+        }
+        p->deleteLater();
+    });
+    connect(p, &QProcess::errorOccurred, p, [self, p](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        if (self) { if (self->ecStream_ == p) self->ecStream_ = nullptr; self->ecFailed_ = true; }
+        p->deleteLater();
+    });
+    p->start();
+}
+
+void HomeTab::stopEcStream() {
+    if (!ecStream_) return;
+    QProcess *p = ecStream_;
+    ecStream_ = nullptr;
+    ecGpuTemp_ = 0;
+    disconnect(p, &QProcess::readyReadStandardOutput, this, nullptr);
+    p->closeWriteChannel();  // helper sees EOF and exits; finished() deletes it
+    if (p->state() == QProcess::Starting) p->kill();
 }
 
 // ── Device box ──────────────────────────────────────────────────────────────
@@ -1228,6 +1233,8 @@ void HomeTab::showEvent(QShowEvent *e) {
     refreshSelection();
     refreshLive();
     live_->start();
+    // refreshLive() probed the dGPU; the EC stream only makes sense next to one.
+    if (!dgpuRuntimeStatus_.isEmpty() && !ecStream_ && !ecFailed_) startEcStream();
     refreshGuard();
     if (gpuMode_ && !gpuModeRead_) { gpuModeRead_ = true; readGpuMode(); }
 }
@@ -1235,6 +1242,7 @@ void HomeTab::showEvent(QShowEvent *e) {
 void HomeTab::hideEvent(QHideEvent *e) {
     QWidget::hideEvent(e);
     live_->stop();
+    stopEcStream();
 }
 
 void HomeTab::setSceneEngine(SceneEngine *eng) {

@@ -1,5 +1,6 @@
 #include "healthtab.h"
 #include "klogpage.h"
+#include "dgpupage.h"
 
 #include "privileged.h"
 #include "systools.h"
@@ -61,6 +62,7 @@ HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
     outer->addWidget(sub);
     auto *monitor = new QWidget;
     sub->addTab(monitor, QStringLiteral("Monitor"));
+    if (DgpuPage::present()) sub->addTab(new DgpuPage, QStringLiteral("dGPU power"));
     systools::addPages(sub);
     sub->addTab(new KlogPage, QStringLiteral("Kernel log"));
     auto *root = new QVBoxLayout(monitor);
