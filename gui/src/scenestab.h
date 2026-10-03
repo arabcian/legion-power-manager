@@ -22,6 +22,7 @@ protected:
     void showEvent(QShowEvent *e) override;
 
 private:
+    void colorList();
     void reloadList(const QString &select = {});
     void select(const QString &name);
     void setEditor(const scenes::Scene &s);

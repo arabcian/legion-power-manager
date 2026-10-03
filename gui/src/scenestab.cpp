@@ -74,10 +74,10 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);  // long names elide instead
     list_->setTextElideMode(Qt::ElideRight);
     list_->setStyleSheet(QStringLiteral("QListWidget { background: transparent; border: none; padding: 0; outline: none; }"
-                                        "QListWidget::item { padding: 4px 6px; border-radius: 5px; color: %1; }"
-                                        "QListWidget::item:selected { background: %2; color: %3; }"
-                                        "QListWidget::item:hover:!selected { background: %4; }")
-                             .arg(theme::FG_DIM, theme::BG3, theme::FG, theme::BG2));
+                                        "QListWidget::item { padding: 4px 6px; border-radius: 5px; }"
+                                        "QListWidget::item:selected { background: %1; }"
+                                        "QListWidget::item:hover:!selected { background: %2; }")
+                             .arg(theme::BG3, theme::BG2));
     ll->addWidget(list_, 1);
     auto *add = new QPushButton("New scene…");
     ll->addWidget(add);
@@ -266,6 +266,7 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     // ── wiring ──
     connect(list_, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *it) {
         if (!filling_ && it) select(it->data(Qt::UserRole).toString());
+        colorList();
     });
     connect(add, &QPushButton::clicked, this, [this] { newScene(false); });
     connect(dup_, &QPushButton::clicked, this, [this] { newScene(true); });
@@ -378,6 +379,18 @@ Scene ScenesTab::fromEditor() const {
     return s;
 }
 
+// Active scene in the theme's accent (amber in Graphite, each palette's own equivalent elsewhere), the selected
+// row in the normal text colour, the rest dimmed. Set per item: a colour in the ::item stylesheet rule would win.
+void ScenesTab::colorList() {
+    const QString active = eng_->active();
+    for (int i = 0; i < list_->count(); ++i) {
+        QListWidgetItem *it = list_->item(i);
+        const char *c = it->data(Qt::UserRole).toString() == active && !active.isEmpty() ? theme::ACCENT
+                        : it == list_->currentItem() ? theme::FG : theme::FG_DIM;
+        it->setForeground(QColor(QLatin1String(c)));
+    }
+}
+
 void ScenesTab::reloadList(const QString &selectName) {
     filling_ = true;
     const QString want = selectName.isEmpty() ? loaded_.name : selectName;
@@ -402,6 +415,7 @@ void ScenesTab::reloadList(const QString &selectName) {
     if (!any) { loaded_ = {}; return; }
     const int i = names.indexOf(want);
     list_->setCurrentRow(i < 0 ? 0 : i);  // fires select(); a no-op for the scene already loaded
+    colorList();
 }
 
 void ScenesTab::select(const QString &name) {
