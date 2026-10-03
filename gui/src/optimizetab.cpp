@@ -306,6 +306,27 @@ void OptimizeTab::buildUi() {
     bl->addWidget(restoreBtn_);
     root->addWidget(bannerFrame);
 
+    // Master switch: outranks every scene, preset and autotune result.
+    wirelessLock_ = new QCheckBox(QStringLiteral("Forcefully disable Wi-Fi and Bluetooth power management"));
+    wirelessLock_->setToolTip(QStringLiteral(
+        "Master switch. While it is on, Wi-Fi power save, runtime power management of the Wi-Fi and Bluetooth devices and\n"
+        "Bluetooth USB autosuspend are kept off — scenes, presets, game mode and autotune cannot turn them back on.\n"
+        "With NetworkManager installed a drop-in is also written so it does not re-enable Wi-Fi power save on reconnect."));
+    root->addWidget(wirelessLock_);
+    connect(wirelessLock_, &QCheckBox::toggled, this, [this](bool on) {
+        if (busy_) {
+            const QSignalBlocker b(wirelessLock_);
+            wirelessLock_->setChecked(!on);
+            return;
+        }
+        runOp({{"op", "set_wireless_pm_lock"}, {"on", on}}, QStringLiteral("Wi-Fi / Bluetooth power management lock"), [this, on](const QJsonObject &r) {
+            if (!r.value("ok").toBool()) {
+                const QSignalBlocker b(wirelessLock_);
+                wirelessLock_->setChecked(!on);
+            }
+        });
+    });
+
     // Presets
     auto *pbox = box("Preset", "box_purple");
     auto *pl = new QGridLayout(pbox);
@@ -665,6 +686,10 @@ void OptimizeTab::onDescribe(const QJsonObject &d) {
     state_ = d.value("state").toObject();
     isolation_ = d.value("isolation").toObject();  // same describe poll: no extra cost
     boot_ = d.value("boot").toObject();
+    if (wirelessLock_ && !busy_) {  // the root-owned marker is the truth, not the checkbox
+        const QSignalBlocker b(wirelessLock_);
+        wirelessLock_->setChecked(d.value("wireless_pm_lock").toBool());
+    }
     const QJsonArray rows = d.value("tunables").toArray();
 
     QStringList keys;

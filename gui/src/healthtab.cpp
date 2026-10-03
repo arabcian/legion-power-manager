@@ -1,4 +1,5 @@
 #include "healthtab.h"
+#include "backuppage.h"
 #include "klogpage.h"
 #include "dgpupage.h"
 #include "netpage.h"
@@ -71,6 +72,10 @@ HealthTab::HealthTab(QWidget *parent) : QWidget(parent) {
     sub->addTab(net, QStringLiteral("Network"));
     systools::addPages(sub);
     sub->addTab(new KlogPage, QStringLiteral("Kernel log"));
+    // Backup: LPM configuration + system image (tar). Idle until a button is pressed.
+    auto *backup = new BackupPage;
+    connect(backup, &BackupPage::alert, this, &HealthTab::alert);
+    sub->addTab(backup, QStringLiteral("Backup"));
     auto *root = new QVBoxLayout(monitor);
     root->setContentsMargins(10, 8, 10, 8);
     root->setSpacing(6);
