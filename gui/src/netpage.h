@@ -52,6 +52,7 @@ private:
     void readConnLog();
     void filterConnLog();
     void ipInfo(const QString &ip);
+    void connDetails(const QString &ip, int pid, const QString &exe, qint64 uid, const QString &state);
     void whois(const QString &ip, std::function<void(const QJsonObject &)> cb);
     void addIpActions(QMenu &m, const QString &ip);
     void blacklistNetwork(const QString &ip);

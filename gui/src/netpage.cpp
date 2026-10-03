@@ -26,6 +26,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
+#include <QMap>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPointer>
@@ -41,7 +42,9 @@
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <memory>
+#include <unistd.h>
 #include <pwd.h>
 
 static constexpr int POLL_MS = 3000, MAX_BLOCK_ROWS = 1000, ALERT_GAP_MS = 10000;
@@ -50,7 +53,7 @@ static const char *const LOG_FILE = "/var/log/legion-power-manager/netguard.log"
 static const char *const CONN_LOG = "/var/log/legion-power-manager/connections.log";
 static constexpr int LOG_TAB = 2, MAX_LOG_ROWS = 3000;
 static constexpr qint64 LOG_TAIL = 512 * 1024;  // of an existing log, only the end is loaded
-enum { IdxRole = Qt::UserRole, KeyRole, ExeRole, IpRole, SortRole };
+enum { IdxRole = Qt::UserRole, KeyRole, ExeRole, IpRole, SortRole, PidRole, UidRole };
 
 static QString helper() { return privileged::helperPath(QStringLiteral("netguard-helper")); }
 static QString str(const QJsonObject &o, const char *k) { return o.value(QLatin1String(k)).toString(); }
@@ -182,6 +185,8 @@ NetPage::NetPage(QWidget *parent) : QWidget(parent) {
     bAll->setToolTip("One snapshot through pkexec: also names the processes of other users (system daemons).");
     auto *bInfoC = button("IP info", rc);
     bInfoC->setToolTip("Reverse DNS and whois record (owner, network, country) of the remote address.");
+    auto *bDetC = button("Details", rc);
+    bDetC->setToolTip("Process (parent chain, command line, service), the address's history in the connection log, and a link to IP info.");
     auto *bWlC = button("Whitelist program", rc);
     auto *bKill = button("Kill connection", rc);
     auto *bBlC = button("Blacklist IP", rc, true);
@@ -229,6 +234,8 @@ NetPage::NetPage(QWidget *parent) : QWidget(parent) {
     logInfo_ = new QLabel;
     logInfo_->setProperty("role", "muted");
     rlog->addWidget(logInfo_, 1);
+    auto *bDetL = button("Details", rlog);
+    bDetL->setToolTip(bDetC->toolTip());
     auto *bInfoL = button("IP info", rlog);
     bInfoL->setToolTip(bInfoC->toolTip());
     auto *bBlL = button("Blacklist IP", rlog, true);
@@ -286,9 +293,18 @@ NetPage::NetPage(QWidget *parent) : QWidget(parent) {
     connect(logConns_, &QCheckBox::toggled, this, [this](bool on) { runRoot({{"op", "set"}, {"log_conns", on}}); });
     connect(logFilter_, &QLineEdit::textChanged, this, &NetPage::filterConnLog);
     auto logIp = [this] { auto *it = connLog_->currentItem(); return it ? it->data(0, IpRole).toString() : QString(); };
+    auto detConn = [this](const QJsonObject &c) {
+        connDetails(str(c, "remote"), c.value(QLatin1String("pid")).toInt(), str(c, "exe"), c.value(QLatin1String("uid")).toInteger(-1), str(c, "state"));
+    };
+    auto detLog = [this](QTreeWidgetItem *it) {
+        if (it) connDetails(it->data(0, IpRole).toString(), it->data(0, PidRole).toInt(), it->data(0, ExeRole).toString(), it->data(0, UidRole).toLongLong(), QString());
+    };
+    connect(bDetC, &QPushButton::clicked, this, [this, detConn] { detConn(curConn()); });
+    connect(bDetL, &QPushButton::clicked, this, [this, detLog] { detLog(connLog_->currentItem()); });
+    connect(conns_, &QTreeWidget::itemDoubleClicked, this, [this, detConn] { detConn(curConn()); });
     connect(bInfoC, &QPushButton::clicked, this, [this] { ipInfo(str(curConn(), "remote")); });
     connect(bInfoL, &QPushButton::clicked, this, [this, logIp] { ipInfo(logIp()); });
-    connect(connLog_, &QTreeWidget::itemDoubleClicked, this, [this, logIp] { ipInfo(logIp()); });
+    connect(connLog_, &QTreeWidget::itemDoubleClicked, this, [detLog](QTreeWidgetItem *it) { detLog(it); });
     connect(bBlL, &QPushButton::clicked, this, [this, logIp] { changeList("blacklist", "add", logIp()); });
     connect(bClearL, &QPushButton::clicked, this, [this] {
         if (QMessageBox::question(this, "Clear log", "Delete the connection log?") == QMessageBox::Yes) runRoot({{"op", "clear_conn_log"}}, false);
@@ -327,10 +343,11 @@ NetPage::NetPage(QWidget *parent) : QWidget(parent) {
             if (!m.isEmpty()) m.exec(t->viewport()->mapToGlobal(pos));
         });
     };
-    menuFor(conns_, [this, wlConn, killConn](QMenu &m, QTreeWidgetItem *it) {
+    menuFor(conns_, [this, wlConn, killConn, detConn](QMenu &m, QTreeWidgetItem *it) {
         const QJsonObject c = connData_.at(it->data(0, IdxRole).toInt()).toObject();
         const bool wine = c.value(QLatin1String("wine")).toBool();
         if (!str(c, "remote").isEmpty()) {
+            m.addAction(QStringLiteral("Details…"), this, [detConn, c] { detConn(c); });
             addIpActions(m, str(c, "remote"));
             m.addSeparator();
             m.addAction(QStringLiteral("Kill connection"), this, [killConn, c] { killConn(c); });
@@ -345,7 +362,10 @@ NetPage::NetPage(QWidget *parent) : QWidget(parent) {
         if (exe.startsWith(QLatin1Char('/')))
             m.addAction(QStringLiteral("Whitelist folder"), this, [this, exe] { changeList("whitelist", "add", exe.left(exe.lastIndexOf(QLatin1Char('/')) + 1)); });
     });
-    menuFor(connLog_, [this](QMenu &m, QTreeWidgetItem *it) { addIpActions(m, it->data(0, IpRole).toString()); });
+    menuFor(connLog_, [this, detLog](QMenu &m, QTreeWidgetItem *it) {
+        m.addAction(QStringLiteral("Details…"), this, [detLog, it] { detLog(it); });
+        addIpActions(m, it->data(0, IpRole).toString());
+    });
     menuFor(bl_, [this](QMenu &m, QTreeWidgetItem *it) {
         const QString entry = it->data(0, IpRole).toString();
         m.addAction(it->childCount() ? QStringLiteral("Remove group") : bl_->selectedItems().size() > 1 ? QStringLiteral("Remove selected") : QStringLiteral("Remove"),
@@ -710,6 +730,9 @@ void NetPage::readConnLog() {
                                         in ? QStringLiteral("← in") : QStringLiteral("→ out"), name, str(o, "proto").toUpper(), remote,
                                         QString::number(o.value(QLatin1String(in ? "lport" : "rport")).toInt()), note});
         it->setData(0, IpRole, remote);
+        it->setData(0, PidRole, pid);
+        it->setData(0, ExeRole, exe);
+        it->setData(0, UidRole, o.value(QLatin1String("uid")).toInteger(-1));
         it->setData(0, SortRole, double(o.value(QLatin1String("ts")).toInteger()) * 1e6 + double(seq++ % 1000000));
         it->setToolTip(2, pid ? QStringLiteral("%1 (pid %2)").arg(exe).arg(pid) : exe);
         it->setToolTip(5, in ? QStringLiteral("local port; the peer used port %1").arg(o.value(QLatin1String("rport")).toInt())
@@ -755,6 +778,143 @@ void NetPage::filterConnLog() {
     logInfo_->setText(QStringLiteral("%1 shown · %2 inbound · logging %3").arg(shown).arg(inbound)
                           .arg(!on ? QStringLiteral("off") : !running ? QStringLiteral("on, but the daemon is not running")
                                : active ? QStringLiteral("on") : QStringLiteral("on, but not active in the running daemon — restart it")));
+}
+
+// ── Details: process (from /proc), the address's history in the connection log, link to IP info ──
+static QByteArray procFile(int pid, const char *name) {
+    QFile f(QStringLiteral("/proc/%1/%2").arg(pid).arg(QLatin1String(name)));
+    return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+}
+static QString procCmd(int pid) {
+    QByteArray b = procFile(pid, "cmdline");
+    b.replace('\0', ' ');
+    return QString::fromLocal8Bit(b).trimmed();
+}
+struct ProcStat { QString comm, state; int ppid = 0; qint64 start = 0; bool ok = false; };
+static ProcStat procStat(int pid) {
+    ProcStat s;
+    const QByteArray b = procFile(pid, "stat");
+    const int l = b.indexOf('('), r = b.lastIndexOf(')');
+    if (l < 0 || r < l) return s;
+    s.comm = QString::fromLocal8Bit(b.mid(l + 1, r - l - 1));
+    const QList<QByteArray> f = b.mid(r + 2).split(' ');
+    if (f.size() < 20) return s;
+    s.state = QString::fromLatin1(f[0]);
+    s.ppid = f[1].toInt();
+    qint64 btime = 0;
+    QFile st(QStringLiteral("/proc/stat"));
+    if (st.open(QIODevice::ReadOnly))
+        for (const QByteArray &ln : st.readAll().split('\n'))
+            if (ln.startsWith("btime ")) btime = ln.mid(6).toLongLong();
+    s.start = btime + f[19].toLongLong() / qMax(1L, sysconf(_SC_CLK_TCK));
+    s.ok = true;
+    return s;
+}
+static QString duration(qint64 s) {
+    if (s < 120) return QStringLiteral("%1 s").arg(s);
+    if (s < 7200) return QStringLiteral("%1 min").arg(qRound(s / 60.0));
+    if (s < 172800) return QStringLiteral("%1 h").arg(qRound(s / 360.0) / 10.0);
+    return QStringLiteral("%1 d").arg(qRound(s / 8640.0) / 10.0);
+}
+
+void NetPage::connDetails(const QString &ip, int pid, const QString &exe, qint64 uid, const QString &state) {
+    if (ip.isEmpty()) return;
+    QStringList out;
+    const auto when = [](qint64 t) { return QDateTime::fromSecsSinceEpoch(t).toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")); };
+
+    // Process: only trusted while it is the same program (a log pid may have been reused).
+    out << QStringLiteral("== Process ==");
+    const ProcStat ps = pid > 0 ? procStat(pid) : ProcStat();
+    const QString liveExe = pid > 0 ? QFileInfo(QStringLiteral("/proc/%1/exe").arg(pid)).symLinkTarget() : QString();
+    const bool alive = ps.ok && (exe.isEmpty() || liveExe.isEmpty() || liveExe == exe);
+    if (pid <= 0) out << QStringLiteral("No process known for this connection (short-lived, or owned by another user: use \"All users (root)\").");
+    else if (!alive) out << QStringLiteral("pid %1 has already exited (or was reused).").arg(pid);
+    if (!exe.isEmpty()) out << QStringLiteral("Program:   %1").arg(exe);
+    if (uid >= 0) out << QStringLiteral("User:      %1 (uid %2)").arg(userName(uint(uid))).arg(uid);
+    if (alive) {
+        out << QStringLiteral("PID:       %1   state %2   name %3").arg(pid).arg(ps.state, ps.comm);
+        out << QStringLiteral("Started:   %1 (%2 ago)").arg(when(ps.start), duration(QDateTime::currentSecsSinceEpoch() - ps.start));
+        out << QStringLiteral("Command:   %1").arg(procCmd(pid));
+        const QString cwd = QFileInfo(QStringLiteral("/proc/%1/cwd").arg(pid)).symLinkTarget();
+        if (!cwd.isEmpty()) out << QStringLiteral("Work dir:  %1").arg(cwd);
+        const QString cg = QString::fromLocal8Bit(procFile(pid, "cgroup")).trimmed().section(QLatin1Char('\n'), -1).section(QLatin1Char(':'), 2);
+        if (!cg.isEmpty() && cg != QLatin1String("/")) out << QStringLiteral("Cgroup:    %1").arg(cg);
+        out << QStringLiteral("Started by (parent chain):");
+        int cur = ps.ppid;
+        for (int depth = 0; cur > 0 && depth < 12; ++depth) {
+            const ProcStat pp = procStat(cur);
+            if (!pp.ok) break;
+            out << QStringLiteral("  %1 (pid %2)  %3").arg(pp.comm).arg(cur).arg(procCmd(cur));
+            cur = pp.ppid;
+        }
+    }
+    if (!state.isEmpty() && state.at(0).isUpper()) out << QStringLiteral("TCP state: %1").arg(state);
+
+    // History of this address in the connection log (needs "Log connections" on).
+    struct Hit { qint64 ts; QString prog, dir, host, port; };
+    QList<Hit> hits;
+    for (const char *suffix : {".1", ""}) {
+        QFile f(QLatin1String(CONN_LOG) + QLatin1String(suffix));
+        if (!f.open(QIODevice::ReadOnly)) continue;
+        while (!f.atEnd()) {
+            const QJsonObject o = QJsonDocument::fromJson(f.readLine()).object();
+            if (str(o, "remote") != ip) continue;
+            const bool in = str(o, "dir") == QLatin1String("in");
+            hits.append({o.value(QLatin1String("ts")).toInteger(), baseName(str(o, "exe")), str(o, "dir"), str(o, "host"),
+                         QString::number(o.value(QLatin1String(in ? "lport" : "rport")).toInt())});
+        }
+    }
+    std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) { return a.ts < b.ts; });
+    out << QString() << QStringLiteral("== History of %1 in the connection log ==").arg(ip);
+    if (hits.isEmpty()) {
+        out << QStringLiteral("No entries. Turn on \"Log connections\" (Log tab) to record new connections with their program.");
+    } else {
+        QMap<QString, int> progs, ports;
+        QSet<QString> names;
+        int outCount = 0;
+        for (const Hit &h : hits) {
+            ++progs[h.prog.isEmpty() ? QStringLiteral("(unknown)") : h.prog];
+            ++ports[h.port];
+            outCount += h.dir != QLatin1String("in");
+            if (!h.host.isEmpty()) names.insert(h.host);
+        }
+        out << QStringLiteral("%1 connections (%2 outbound, %3 inbound), first %4, last %5").arg(hits.size()).arg(outCount).arg(hits.size() - outCount).arg(when(hits.first().ts), when(hits.last().ts));
+        QList<qint64> gaps;
+        for (int i = 1; i < hits.size(); ++i)
+            if (hits[i].ts > hits[i - 1].ts) gaps << hits[i].ts - hits[i - 1].ts;
+        if (gaps.size() >= 2) {
+            std::sort(gaps.begin(), gaps.end());
+            out << QStringLiteral("Rhythm:    median gap %1 (shortest %2, longest %3)").arg(duration(gaps.at(gaps.size() / 2)), duration(gaps.first()), duration(gaps.last()));
+        }
+        QStringList pl, ql;
+        for (auto i = progs.constBegin(); i != progs.constEnd(); ++i) pl << QStringLiteral("%1 ×%2").arg(i.key()).arg(i.value());
+        for (auto i = ports.constBegin(); i != ports.constEnd(); ++i) ql << QStringLiteral("%1 ×%2").arg(i.key()).arg(i.value());
+        out << QStringLiteral("Programs:  %1").arg(pl.join(QStringLiteral(", ")));
+        out << QStringLiteral("Ports:     %1").arg(ql.join(QStringLiteral(", ")));
+        if (!names.isEmpty()) out << QStringLiteral("DNS names asked for before connecting: %1").arg(QStringList(names.values()).join(QStringLiteral(", ")));
+        out << QStringLiteral("Most recent:");
+        for (int i = hits.size() - 1; i >= qMax(0, hits.size() - 8); --i)
+            out << QStringLiteral("  %1  %2  %3  port %4").arg(when(hits[i].ts), hits[i].dir == QLatin1String("in") ? QStringLiteral("←") : QStringLiteral("→"), hits[i].prog, hits[i].port);
+    }
+
+    auto *d = new QDialog(this);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->setWindowTitle(QStringLiteral("Connection details — ") + ip);
+    d->resize(760, 560);
+    auto *v = new QVBoxLayout(d);
+    auto *txt = new QPlainTextEdit(out.join(QLatin1Char('\n')));
+    txt->setReadOnly(true);
+    txt->setLineWrapMode(QPlainTextEdit::NoWrap);
+    txt->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    auto *box = new QDialogButtonBox(QDialogButtonBox::Close);
+    auto *bInfo = box->addButton(QStringLiteral("IP info…"), QDialogButtonBox::ActionRole);
+    auto *bCopy = box->addButton(QStringLiteral("Copy"), QDialogButtonBox::ActionRole);
+    connect(bInfo, &QPushButton::clicked, this, [this, ip] { ipInfo(ip); });
+    connect(bCopy, &QPushButton::clicked, d, [txt] { QGuiApplication::clipboard()->setText(txt->toPlainText()); });
+    connect(box, &QDialogButtonBox::rejected, d, &QDialog::close);
+    v->addWidget(txt, 1);
+    v->addWidget(box);
+    d->show();
 }
 
 /// Reverse DNS (system resolver) and the registry record (whois, through the unprivileged helper) of one address.
