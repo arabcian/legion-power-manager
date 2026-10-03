@@ -55,6 +55,7 @@ private:
     QLineEdit *command_;
     QPushButton *save_, *apply_, *dup_, *del_;
     QCheckBox *auto_;
+    QCheckBox *resume_ = nullptr;
     class QPushButton *pause_ = nullptr;
     QComboBox *onAc_, *onBattery_;
     QLabel *power_, *status_, *empty_;

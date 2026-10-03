@@ -30,6 +30,7 @@
 #include <linux/netlink.h>
 #include <sys/socket.h>
 #include <sys/file.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace scenes {
@@ -153,13 +154,14 @@ Auto loadAuto() {
     a.onAc = o.value("on_ac").toString();
     a.onBattery = o.value("on_battery").toString();
     a.paused = o.value("paused").toBool();
+    a.onResume = o.value("on_resume").toBool();
     if (!validName(a.onAc)) a.onAc.clear();
     if (!validName(a.onBattery)) a.onBattery.clear();
     return a;
 }
 
 bool saveAuto(const Auto &a, QString *err) {
-    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}, {"paused", a.paused}}, err);
+    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}, {"paused", a.paused}, {"on_resume", a.onResume}}, err);
 }
 
 std::optional<bool> onAc() {
@@ -286,6 +288,10 @@ using namespace scenes;
 // a game scene); otherwise charger changes arrive as kernel uevents and the
 // slow tick is just a safety net (and notices a game scene appearing).
 static constexpr int POWER_POLL_MS = 3000, IDLE_POLL_MS = 20000, STABLE_READS = 2, STARTUP_DELAY_MS = 4000;
+// After a wake the firmware / EC may have reset limits and the drivers need a moment: first pass after
+// RESUME_DELAY_MS, then RESUME_PASSES-1 more RESUME_REPASS_MS apart (catches a late firmware override).
+static constexpr int RESUME_TICK_MS = 2000, RESUME_DELAY_MS = 5000, RESUME_REPASS_MS = 30000, RESUME_PASSES = 2;
+static constexpr long long RESUME_GAP_NS = 1000000000LL;  // sleeping longer than 1 s counts as a suspend
 static constexpr int GAME_ORPHAN_READS = 5;  // ~15 s without a game while the game scene is still set
 
 SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadAuto()) {
@@ -298,6 +304,7 @@ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadA
     if (qEnvironmentVariableIsSet("LPM_PGO_TRAIN")) return;
     watchUevents();
     retunePoll();
+    retuneResume();
     // Session start: bring the machine to the scene for the current source,
     // after the tabs have finished their own startup reads.
     // A theme change re-execs the app: the hardware is already in the scene's state.
@@ -354,6 +361,7 @@ bool SceneEngine::setAuto(const Auto &a, QString *err) {
     const bool wasOn = auto_.enabled;
     if (!saveAuto(a, err)) return false;
     auto_ = a;
+    retuneResume();
     if (a.enabled && !wasOn && ac_) applyForSource(*ac_);
     return true;
 }
@@ -370,6 +378,60 @@ bool SceneEngine::setPaused(bool on, QString *err) {
     // Resuming catches up with the current power source.
     if (!on && auto_.enabled && ac_) applyForSource(*ac_);
     return true;
+}
+
+static long long bootOffsetNs() {
+    timespec b{}, m{};
+    if (clock_gettime(CLOCK_BOOTTIME, &b) != 0 || clock_gettime(CLOCK_MONOTONIC, &m) != 0) return -1;
+    return (b.tv_sec - m.tv_sec) * 1000000000LL + (b.tv_nsec - m.tv_nsec);
+}
+
+/// Runs the suspend detector only while "reapply after resume" is on (and automatic scenes are enabled),
+/// so nothing wakes up for it otherwise.
+void SceneEngine::retuneResume() {
+    const bool want = auto_.enabled && auto_.onResume && !qEnvironmentVariableIsSet("LPM_PGO_TRAIN");
+    if (!want) {
+        if (resumeTick_) resumeTick_->stop();
+        if (resumePass_) resumePass_->stop();
+        resumePassesLeft_ = 0;
+        return;
+    }
+    if (!resumeTick_) {
+        resumeTick_ = new QTimer(this);
+        resumeTick_->setTimerType(Qt::CoarseTimer);
+        resumeTick_->setInterval(RESUME_TICK_MS);
+        connect(resumeTick_, &QTimer::timeout, this, &SceneEngine::resumeTick);
+        resumePass_ = new QTimer(this);
+        resumePass_->setSingleShot(true);
+        connect(resumePass_, &QTimer::timeout, this, &SceneEngine::resumePass);
+    }
+    if (!resumeTick_->isActive()) {
+        bootOffsetNs_ = bootOffsetNs();
+        resumeTick_->start();
+    }
+}
+
+// CLOCK_BOOTTIME keeps counting in suspend, CLOCK_MONOTONIC does not: their difference jumps by the sleep time.
+void SceneEngine::resumeTick() {
+    const long long off = bootOffsetNs();
+    if (off < 0) { resumeTick_->stop(); return; }  // no CLOCK_BOOTTIME: detection unavailable
+    const bool woke = bootOffsetNs_ >= 0 && off - bootOffsetNs_ > RESUME_GAP_NS;
+    bootOffsetNs_ = off;
+    if (!woke) return;
+    resumePassesLeft_ = RESUME_PASSES;  // a new suspend restarts the sequence
+    resumePass_->start(RESUME_DELAY_MS);
+}
+
+void SceneEngine::resumePass() {
+    if (!auto_.enabled || !auto_.onResume || resumePassesLeft_ <= 0) { resumePassesLeft_ = 0; return; }
+    --resumePassesLeft_;
+    // The charger may have been (un)plugged while asleep; take the fresh state, applyForSource honours
+    // pause, a running game (deferred) and a scene already being applied (queued).
+    if (const auto now = onAc()) {
+        if (!ac_ || *now != *ac_) { ac_ = now; candidate_.reset(); stableReads_ = 0; Q_EMIT powerSourceChanged(*ac_); }
+    }
+    if (ac_) applyForSource(*ac_);
+    if (resumePassesLeft_ > 0) resumePass_->start(RESUME_REPASS_MS);
 }
 
 void SceneEngine::retunePoll() {

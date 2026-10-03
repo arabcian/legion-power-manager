@@ -236,6 +236,10 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     ag->addWidget(onBattery_, 1, 3);
     power_ = muted(QString());
     ag->addWidget(power_, 2, 0, 1, 4);
+    resume_ = new QCheckBox("Reapply the scene after waking from suspend");
+    resume_->setToolTip("Firmware and the EC can reset limits during sleep. After a wake the scene for the current power source is "
+                        "applied again (5 s after waking, once more 30 s later). Needs automatic switching; honours Pause and running games.");
+    ag->addWidget(resume_, 3, 0, 1, 4);
     pause_ = new QPushButton;
     pause_->setCheckable(true);
     pause_->setToolTip("Pause every automatic scene change (power source, login, game scene). Apply still works.");
@@ -274,7 +278,8 @@ ScenesTab::ScenesTab(MainWindow *win) : win_(win), eng_(win->scenes()) {
     for (QComboBox *c : {profile_, cpu_, gpu_, tuning_, lightProfile_, lightBright_, fan_})
         if (c) connect(c, &QComboBox::currentIndexChanged, this, [this] { if (!filling_) updateDirty(); });
     connect(command_, &QLineEdit::textChanged, this, [this] { if (!filling_) updateDirty(); });
-    connect(auto_, &QCheckBox::toggled, this, [this] { if (!filling_) storeAuto(); });
+    connect(auto_, &QCheckBox::toggled, this, [this](bool on) { resume_->setEnabled(on); if (!filling_) storeAuto(); });
+    connect(resume_, &QCheckBox::toggled, this, [this] { if (!filling_) storeAuto(); });
     for (QComboBox *c : {onAc_, onBattery_})
         connect(c, &QComboBox::currentIndexChanged, this, [this] { if (!filling_) storeAuto(); });
 
@@ -566,6 +571,8 @@ void ScenesTab::reloadAuto() {
         c->setCurrentIndex(std::max(0, c->findData(sel)));
     }
     auto_->setChecked(a.enabled);
+    resume_->setChecked(a.onResume);
+    resume_->setEnabled(a.enabled);
     onAc_->setEnabled(!names.isEmpty());
     onBattery_->setEnabled(!names.isEmpty());
     filling_ = false;
@@ -574,6 +581,7 @@ void ScenesTab::reloadAuto() {
 void ScenesTab::storeAuto() {
     scenes::Auto a = eng_->autoConfig();  // keeps the pause state
     a.enabled = auto_->isChecked();
+    a.onResume = resume_->isChecked();
     a.onAc = onAc_->currentData().toString();
     a.onBattery = onBattery_->currentData().toString();
     QString err;

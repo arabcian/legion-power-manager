@@ -51,6 +51,7 @@ struct Auto {
     bool enabled = false;
     QString onAc, onBattery;       // scene names; empty = leave as is
     bool paused = false;           // no automatic scene changes (power source, login, game); manual Apply still works
+    bool onResume = false;         // after waking from suspend, reapply the scene for the current power source (needs `enabled`)
 };
 
 QString dir();
@@ -123,6 +124,9 @@ private:
     void retunePoll();
     void watchUevents();
     void checkGameEnd();
+    void retuneResume();
+    void resumeTick();
+    void resumePass();
     void applyForSource(bool onAc);
     void startupApply();
     void helper(const QString &name, const QJsonObject &req, Done done,
@@ -142,4 +146,7 @@ private:
     int gameGoneReads_ = 0;
     bool sawGameScene_ = false;
     int uevFd_ = -1;  // uevent socket; -1 → poll at the fast cadence as before
+    QTimer *resumeTick_ = nullptr, *resumePass_ = nullptr;  // suspend detector / reapply passes after a wake
+    long long bootOffsetNs_ = -1;  // CLOCK_BOOTTIME - CLOCK_MONOTONIC at the last tick; it grows by the time spent suspended
+    int resumePassesLeft_ = 0;
 };
