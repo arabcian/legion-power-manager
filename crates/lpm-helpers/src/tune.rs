@@ -1540,6 +1540,67 @@ fn wifi_set(f: &Path, data: &str) -> Result<(), String> {
     }
 }
 
+/// Master switch: while this root-owned marker exists, Wi-Fi and Bluetooth power
+/// management stays off, whatever a scene, preset or autotune asks for.
+pub const WIRELESS_PM_LOCK: &str = "/etc/legion-power-manager/wireless-pm-lock";
+
+pub fn wireless_pm_locked() -> bool { crate::read_root_file(WIRELESS_PM_LOCK, 64).is_some() }
+
+/// The PCI function or USB device behind every Wi-Fi interface and Bluetooth controller.
+fn wireless_devs() -> Vec<PathBuf> {
+    let mut links: Vec<PathBuf> = Vec::new();
+    for (dir, wifi) in [("/sys/class/net", true), ("/sys/class/bluetooth", false)] {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if !wifi || p.join("wireless").is_dir() || p.join("phy80211").exists() { links.push(p); }
+        }
+    }
+    let mut v: Vec<PathBuf> = Vec::new();
+    for l in links {
+        let Some(mut d) = canonical_in_sysfs(&l) else { continue };
+        while d.starts_with("/sys/devices") && d != Path::new("/sys/devices") {
+            if d.join("idVendor").is_file() || (d.join("vendor").is_file() && d.join("class").is_file()) { v.push(d); break; }
+            d.pop();
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Those devices while the master switch is on, None while it is off.
+pub fn wireless_lock() -> Option<Vec<PathBuf>> { wireless_pm_locked().then(wireless_devs) }
+
+/// Under the master switch the wireless devices are not the runtime-PM rows' business.
+fn without_wireless(v: Vec<PathBuf>) -> Vec<PathBuf> {
+    let Some(w) = wireless_lock() else { return v };
+    v.into_iter().filter(|f| !f.parent().and_then(|p| p.parent()).map_or(false, |d| w.iter().any(|x| x == d))).collect()
+}
+
+/// Forces Wi-Fi and Bluetooth power management off while the master switch is on:
+/// 802.11 power save, runtime PM of the radios' PCI/USB devices, and btusb autosuspend
+/// for adapters that appear later. Returns what could not be written.
+pub fn enforce_wireless_pm() -> Vec<String> {
+    let Some(devs) = wireless_lock() else { return vec![] };
+    let mut errs = Vec::new();
+    for f in wifi_ifaces() {
+        if wifi_get(&f).as_deref() == Some("1") {
+            if let Err(e) = wifi_set(&f, "0") { errs.push(e); }
+        }
+    }
+    for d in &devs {
+        let c = d.join("power/control");
+        if read(&c).as_deref() == Some("auto") {
+            if let Err(e) = write_checked(&c, "on") { errs.push(e); }
+        }
+    }
+    let p = Path::new("/sys/module/btusb/parameters/enable_autosuspend");
+    if read(p).as_deref() == Some("Y") {
+        if let Err(e) = write_checked(p, "N") { errs.push(e); }
+    }
+    errs
+}
+
 fn ethtool() -> Option<PathBuf> {
     ["/usr/sbin/ethtool", "/sbin/ethtool", "/usr/bin/ethtool", "/bin/ethtool"].iter().map(PathBuf::from)
         .find(|p| crate::trusted_path(p))
@@ -1880,7 +1941,7 @@ fn pci_runtime_files() -> Vec<PathBuf> {
         .collect();
     v.sort();
     v.dedup();
-    v
+    without_wireless(v)
 }
 
 /// USB devices (not interfaces) without a HID (03) or audio (01) interface.
@@ -1900,7 +1961,7 @@ fn usb_pm_files(rel: &str) -> Vec<PathBuf> {
         if !skip && f.is_file() { v.push(f); }
     }
     v.sort();
-    v
+    without_wireless(v)
 }
 
 /// Samsung OLED laptop panels ("ATNA...") have no backlight for ABM to modulate;

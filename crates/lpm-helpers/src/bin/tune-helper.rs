@@ -26,6 +26,8 @@
 //!   {"op":"snapshot"}                                  refresh the readable copy of debugfs values (also done after every root op)
 //!   {"op":"boost","nice":-5,"autogroup":true}          renice the process that ran pkexec
 //!   {"op":"set_boot","values":{..}|null,"preset":".."} store/clear the boot preset (root-owned file)
+//!   {"op":"set_wireless_pm_lock","on":bool}            tune-helper only: master switch — Wi-Fi/Bluetooth power management stays off
+//!       (root-owned /etc/legion-power-manager/wireless-pm-lock; scenes, presets and autotune cannot turn it back on)
 //!   {"op":"boot"}                                      apply the boot preset (OpenRC service)
 //!   {"op":"apply_preset","preset":"name","mode":"manual"|"game","replace":bool,"soft_park":bool,"owner_pid":N}
 //!       like apply, but the values are read from the root-owned store /etc/legion-power-manager/presets/<name>.json,
@@ -231,6 +233,10 @@ fn apply_values(st: &mut State, values: &Map<String, Value>) -> (Vec<Value>, boo
     let mut first = true;
     for t in TUNABLES {
         let Some(raw) = values.get(t.key) else { continue };
+        if t.key == "net.wifi_power_save" && tune::wireless_pm_locked() {
+            results.push(json!({"key": t.key, "ok": true, "skipped": "held off by the Wi-Fi/Bluetooth power-management master switch"}));
+            continue;
+        }
         if let Some(i) = rejects.iter().find(|i| i.key == t.key) {
             results.push(json!({"key": t.key, "ok": false, "error": format!("refused by the safety audit: {} (run lpm-autotune audit --fix)", i.msg)}));
             all_ok = false;
@@ -363,8 +369,13 @@ fn restore_entries(st: &mut State, only: Option<&[String]>) -> Value {
     // knob is still changed. A later restore (GUI, POST, service stop) retries.
     let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut hotplug_done = false;
+    let wireless = tune::wireless_lock();
     for &i in &order {
         let (key, f, orig) = &st.baseline[i];
+        // Master switch: the radios' originals are dropped, not written back.
+        if let Some(w) = &wireless {
+            if key == "net.wifi_power_save" || w.iter().any(|d| f.starts_with(d.join("power"))) { continue; }
+        }
         // CPUs come back first: give them time before their cpufreq files are written.
         if !hotplug_done && !tune::is_hotplug(key) {
             hotplug_done = true;
@@ -847,6 +858,34 @@ fn op_set_boot(req: &Value) -> Value {
     }
 }
 
+const NM_DROPIN_DIR: &str = "/etc/NetworkManager/conf.d";
+const NM_DROPIN: &str = "/etc/NetworkManager/conf.d/90-legion-power-manager-wifi-powersave.conf";
+const NM_DROPIN_BODY: &str = "# Written by Legion Power Manager: Wi-Fi/Bluetooth power-management master switch.\n[connection]\nwifi.powersave = 2\n";
+
+/// {"op":"set_wireless_pm_lock","on":bool}: root-owned marker read by every apply/restore path.
+/// NetworkManager re-applies its own Wi-Fi power-save setting on each (re)connect, so while
+/// the switch is on it also gets a drop-in that disables it (removed again when switched off).
+fn op_set_wireless_pm_lock(req: &Value) -> Value {
+    let Some(on) = req["on"].as_bool() else { return json!({"ok": false, "error": "on must be true or false"}) };
+    if let Err(e) = secure_dir(ETC_DIR) { return json!({"ok": false, "error": e}); }
+    let mut warnings: Vec<String> = Vec::new();
+    if on {
+        if let Err(e) = write_root_file(tune::WIRELESS_PM_LOCK, b"1\n") { return json!({"ok": false, "error": e}); }
+        if Path::new(NM_DROPIN_DIR).is_dir() {
+            if let Err(e) = write_root_file(NM_DROPIN, NM_DROPIN_BODY.as_bytes()) { warnings.push(e); }
+        }
+    } else {
+        match fs::remove_file(tune::WIRELESS_PM_LOCK) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return json!({"ok": false, "error": format!("{}: {e}", tune::WIRELESS_PM_LOCK)}),
+        }
+        if read_root_file(NM_DROPIN, 4096).as_deref() == Some(NM_DROPIN_BODY) { let _ = fs::remove_file(NM_DROPIN); }
+    }
+    warnings.extend(tune::enforce_wireless_pm());
+    json!({"ok": true, "wireless_pm_lock": on, "warnings": warnings})
+}
+
 fn boot_preset() -> Option<Value> {
     read_root_file(BOOT_FILE, 256 * 1024).and_then(|s| serde_json::from_str(&s).ok())
 }
@@ -874,6 +913,7 @@ fn run() -> Value {
         d["state"] = summary(&State::load());
         d["boot"] = boot_preset().unwrap_or(Value::Null);
         d["root"] = json!(is_root());
+        d["wireless_pm_lock"] = json!(tune::wireless_pm_locked());
         d["isolation"] = lpm_helpers::isolate::status();
         return d;
     }
@@ -897,7 +937,7 @@ fn run() -> Value {
         return json!({"ok": false, "error": format!("'{op}' is not available in tune-profile-helper (it needs tune-helper)")});
     }
     if !is_root() { return json!({"ok": false, "error": format!("'{op}' needs root (run through pkexec)")}); }
-    let out = match op {
+    let mut out = match op {
         "snapshot" => json!({"ok": true}),
         "apply" => op_apply(&req),
         "apply_preset" => op_apply_preset(&req),
@@ -917,6 +957,7 @@ fn run() -> Value {
             None => json!({"ok": false, "error": "values must be an object"}),
         },
         "set_boot" => op_set_boot(&req),
+        "set_wireless_pm_lock" => op_set_wireless_pm_lock(&req),
         "boot" => op_boot(),
         "guard_reset" => match lpm_helpers::bootguard::reset() {
             Ok(v) => json!({"ok": true, "guard": v}),
@@ -936,6 +977,11 @@ fn run() -> Value {
     };
     // Unprivileged describe reads the debugfs values from this copy (debugfs stays root-only).
     if matches!(op, "snapshot" | "apply" | "apply_preset" | "release" | "restore" | "restore_keys" | "restore_defaults" | "boot" | "prune") { tune::write_debugfs_snapshot(); }
+    // The master switch outranks whatever this op just changed.
+    if matches!(op, "apply" | "apply_preset" | "release" | "restore" | "restore_keys" | "restore_defaults" | "boot") {
+        let errs = tune::enforce_wireless_pm();
+        if !errs.is_empty() { out["wireless_pm_warnings"] = json!(errs); }
+    }
     out
 }
 
@@ -949,7 +995,7 @@ mod tests {
     use super::*;
     #[test]
     fn profile_role_cannot_take_values() {
-        for op in ["apply", "set_boot", "nvreg_set", "guard_reset", "preset_save", "preset_delete"] {
+        for op in ["apply", "set_boot", "set_wireless_pm_lock", "nvreg_set", "guard_reset", "preset_save", "preset_delete"] {
             assert!(!PROFILE_OPS.contains(&op), "{op} must stay tune-helper only");
         }
     }

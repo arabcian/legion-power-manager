@@ -1294,7 +1294,7 @@ fn io_rules(r: &mut Rules) {
         r.set_live("net.tcp_congestion", "bbr", "BBR models bandwidth/RTT instead of reacting to loss: steadier latency on Wi-Fi and long routes.");
         r.set_live("net.default_qdisc", "fq", "fq pacing, the qdisc BBR was designed for.");
     }
-    if p.wifi {
+    if p.wifi && !tune::wireless_pm_locked() {
         r.choose("net.wifi_power_save", leave(), vec![
             cand("0", fx(0.12, 0.0, -0.10, 0.0, 0.0), 0.2, "Radio never dozes between beacons: no 802.11 power-save ping spikes; ~0.5 W more."),
             cand("1", fx(-0.08, 0.0, 0.08, 0.0, 0.0), 0.2, "802.11 power save: radio dozes between beacons; ping jitter under light traffic."),

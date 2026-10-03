@@ -13,6 +13,7 @@ use std::path::Path;
 
 pub mod amdgpu;
 pub mod autotune;
+pub mod backup;
 pub mod bootguard;
 pub mod dgpu;
 pub mod fan_table;

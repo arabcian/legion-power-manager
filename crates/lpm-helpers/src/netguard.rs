@@ -1,6 +1,6 @@
 //! Network guard — Health → Network.
 //!
-//! Three parts, one module:
+//! Four parts, one module:
 //!   * connection list   sock_diag (the kernel interface behind `ss`) + /proc/<pid>/fd
 //!   * IP blacklist      nftables table `inet lpm_netguard` (drop in + out)
 //!   * Wine/.exe guard   the first packet of every new outbound flow is queued
@@ -8,16 +8,24 @@
 //!                       and process, and if that is a Wine program which is
 //!                       not whitelisted: verdict DROP, socket destroyed
 //!                       (SOCK_DESTROY), one line in the block log.
+//!   * connection log    switchable (`log_conns`): the first packet of every new
+//!                       flow, outbound and inbound, goes through the same queue,
+//!                       is accepted at once and written to the connection log
+//!                       with its program. Plus an on-demand whois client.
 //!
 //! Config   /etc/legion-power-manager/netguard.json   (root-owned, world-readable)
 //! Log      /var/log/legion-power-manager/netguard.log (JSON lines, rotated at 1 MiB)
+//!          /var/log/legion-power-manager/connections.log (JSON lines, rotated at 4 MiB)
 //! Daemon   lpm-netguard daemon; holds a lock on /run/legion-power-manager/netguard.pid,
 //!          reloads on SIGHUP (sent by the helper after every rule change).
 //!
-//! Cost model: nothing is polled. With the guard off there is no queue rule at
-//! all; with it on, only the first packet(s) of a new non-loopback flow reach
-//! the daemon (ct state new), and a flow that does not belong to a Wine
-//! process costs one exact socket lookup plus a readlink per known Wine pid.
+//! Cost model: nothing is polled. With the guard and the connection log off
+//! there is no queue rule at all; with one on, only the first packet(s) of a
+//! new non-loopback flow reach the daemon (ct state new), and a flow that does
+//! not belong to a Wine process costs one exact socket lookup plus a readlink
+//! per known Wine pid. The connection log names the owning process from /proc
+//! after the verdict went out, batched: at most one pass per FLUSH_GAP, the
+//! processes that opened the last connections first.
 //! The queue rule carries `bypass`: without a daemon traffic flows unguarded,
 //! it is never blackholed.
 //!
@@ -39,9 +47,14 @@ pub const CONF_DIR: &str = "/etc/legion-power-manager";
 pub const CONF_FILE: &str = "/etc/legion-power-manager/netguard.json";
 const RUN_DIR: &str = "/run/legion-power-manager";
 const LOCK_FILE: &str = "/run/legion-power-manager/netguard.pid";
+const STATE_FILE: &str = "/run/legion-power-manager/netguard.state";
 const LOG_DIR: &str = "/var/log/legion-power-manager";
 pub const LOG_FILE: &str = "/var/log/legion-power-manager/netguard.log";
 const LOG_MAX: u64 = 1 << 20;
+pub const CONN_LOG: &str = "/var/log/legion-power-manager/connections.log";
+const CONN_LOG_MAX: u64 = 4 << 20;
+const FLUSH_GAP: Duration = Duration::from_millis(200);
+const HOOK_LOCAL_IN: u8 = 1;  // NF_INET_LOCAL_IN
 const QUEUE_NUM: u16 = 19536;
 const TABLE: &str = "lpm_netguard";
 const MAX_BLACKLIST: usize = 4096;
@@ -88,6 +101,41 @@ impl Net {
     }
 }
 
+/// One blacklist entry as typed: an address, a CIDR block, or a range
+/// "first - last" (split into the CIDR blocks that cover exactly it).
+pub fn parse_nets(s: &str) -> Option<Vec<Net>> {
+    let Some((a, b)) = s.split_once('-') else { return Net::parse(s).map(|n| vec![n]) };
+    let (bits, lo, hi) = match (unmap(a.trim().parse().ok()?), unmap(b.trim().parse().ok()?)) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => (32u32, u128::from(u32::from(a)), u128::from(u32::from(b))),
+        (IpAddr::V6(a), IpAddr::V6(b)) => (128, u128::from(a), u128::from(b)),
+        _ => return None,
+    };
+    if lo > hi { return None; }
+    let last_of = |cur: u128, host: u32| if host >= 128 { u128::MAX } else { cur | ((1u128 << host) - 1) };
+    let (mut out, mut cur) = (Vec::new(), lo);
+    loop {
+        // The largest aligned block that starts here and does not pass the end.
+        let mut host = if cur == 0 { bits } else { cur.trailing_zeros().min(bits) };
+        while host > 0 && last_of(cur, host) > hi { host -= 1; }
+        if host == bits { return None; }  // the whole address space
+        let addr = if bits == 32 { IpAddr::V4(Ipv4Addr::from(cur as u32)) } else { IpAddr::V6(Ipv6Addr::from(cur)) };
+        out.push(Net { addr, prefix: (bits - host) as u8 });
+        if last_of(cur, host) >= hi { return Some(out); }
+        cur = last_of(cur, host) + 1;
+    }
+}
+
+/// Private, CGNAT, link-local, multicast, broadcast: the guard's "LAN exempt" set.
+pub fn is_lan(ip: IpAddr) -> bool {
+    match unmap(ip) {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_private() || v.is_link_local() || v.is_multicast() || v.is_broadcast() || (o[0] == 100 && o[1] & 0xc0 == 64)
+        }
+        IpAddr::V6(v) => { let s = v.segments()[0]; s & 0xfe00 == 0xfc00 || s & 0xffc0 == 0xfe80 || s & 0xff00 == 0xff00 }
+    }
+}
+
 impl std::fmt::Display for Net {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.prefix == if self.addr.is_ipv4() { 32 } else { 128 } { write!(f, "{}", self.addr) }
@@ -103,13 +151,17 @@ pub struct Config {
     pub guard: bool,
     /// Private / link-local / multicast destinations are not "internet".
     pub allow_lan: bool,
+    /// Log every new connection, outbound and inbound, to CONN_LOG.
+    pub log_conns: bool,
     /// Exact path, directory prefix (trailing '/') or bare file name (case-insensitive).
     pub whitelist: Vec<String>,
     pub blacklist: Vec<Net>,
+    /// Blacklist entry (as printed) → group name; entries banned together are removed together.
+    pub labels: HashMap<String, String>,
 }
 
 impl Default for Config {
-    fn default() -> Self { Config { guard: false, allow_lan: true, whitelist: Vec::new(), blacklist: Vec::new() } }
+    fn default() -> Self { Config { guard: false, allow_lan: true, log_conns: false, whitelist: Vec::new(), blacklist: Vec::new(), labels: HashMap::new() } }
 }
 
 fn basename(s: &str) -> &str { s.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(s) }
@@ -122,17 +174,23 @@ impl Config {
         let text = crate::read_root_file(CONF_FILE, 1 << 20).ok_or_else(|| format!("{CONF_FILE} is not a root-owned regular file"))?;
         let v: Value = serde_json::from_str(&text).map_err(|e| format!("{CONF_FILE}: {e}"))?;
         let strs = |k: &str| v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect::<Vec<_>>()).unwrap_or_default();
+        let blacklist: Vec<Net> = strs("blacklist").iter().filter_map(|s| Net::parse(s)).take(MAX_BLACKLIST).collect();
+        let have: HashSet<String> = blacklist.iter().map(Net::to_string).collect();
+        let labels = v["labels"].as_object().map(|m| m.iter().filter(|(k, _)| have.contains(*k))
+            .filter_map(|(k, l)| Some((k.clone(), l.as_str()?.to_owned()))).collect()).unwrap_or_default();
         Ok(Config {
             guard: v["guard"].as_bool().unwrap_or(false),
             allow_lan: v["allow_lan"].as_bool().unwrap_or(true),
+            log_conns: v["log_conns"].as_bool().unwrap_or(false),
             whitelist: strs("whitelist").into_iter().filter(|s| valid_entry(s)).take(MAX_WHITELIST).collect(),
-            blacklist: strs("blacklist").iter().filter_map(|s| Net::parse(s)).take(MAX_BLACKLIST).collect(),
+            blacklist,
+            labels,
         })
     }
 
     pub fn to_json(&self) -> Value {
-        json!({"guard": self.guard, "allow_lan": self.allow_lan, "whitelist": self.whitelist,
-               "blacklist": self.blacklist.iter().map(Net::to_string).collect::<Vec<_>>()})
+        json!({"guard": self.guard, "allow_lan": self.allow_lan, "log_conns": self.log_conns, "whitelist": self.whitelist,
+               "blacklist": self.blacklist.iter().map(Net::to_string).collect::<Vec<_>>(), "labels": self.labels})
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -342,6 +400,17 @@ impl Diag {
         None
     }
 
+    /// The local socket an incoming packet is for: the listener (TCP) or the bound socket (UDP).
+    pub fn find_local(&self, f: &Flow) -> Option<Sock> {
+        let fams: &[u8] = if f.dst.is_ipv4() { &[AF_INET, AF_INET6] } else { &[AF_INET6] };
+        let states = if f.proto == TCP { 1u32 << TCP_LISTEN } else { !0 };
+        for &fam in fams {
+            let hit = self.dump(fam, f.proto, states, f.dport).ok()?.into_iter().next();
+            if hit.is_some() { return hit; }
+        }
+        None
+    }
+
     /// Aborts the socket (TCP: ECONNABORTED to the owner). Needs CAP_NET_ADMIN
     /// and CONFIG_INET_DIAG_DESTROY (EOPNOTSUPP without it).
     pub fn destroy(&self, s: &Sock) -> io::Result<()> {
@@ -433,15 +502,21 @@ fn nft_script(cfg: &Config) -> String {
     let mut s = format!("table inet {TABLE}\ndelete table inet {TABLE}\ntable inet {TABLE} {{\n");
     s += &set("bl4", "ipv4_addr", true);
     s += &set("bl6", "ipv6_addr", false);
-    s += "\tchain in {\n\t\ttype filter hook input priority 0; policy accept;\n\t\tip saddr @bl4 drop\n\t\tip6 saddr @bl6 drop\n\t}\n";
-    s += "\tchain out {\n\t\ttype filter hook output priority 0; policy accept;\n\t\tip daddr @bl4 drop\n\t\tip6 daddr @bl6 drop\n";
-    if cfg.guard {
+    let queue = format!("\t\tmeta l4proto {{ tcp, udp }} queue num {QUEUE_NUM} bypass\n");
+    s += "\tchain in {\n\t\ttype filter hook input priority 0; policy accept;\n\t\tip saddr @bl4 drop\n\t\tip6 saddr @bl6 drop\n";
+    if cfg.log_conns {
+        s += "\t\tiifname \"lo\" accept\n\t\tct state != new accept\n\t\tmeta pkttype { broadcast, multicast } accept\n";
+        s += &queue;
+    }
+    s += "\t}\n\tchain out {\n\t\ttype filter hook output priority 0; policy accept;\n\t\tip daddr @bl4 drop\n\t\tip6 daddr @bl6 drop\n";
+    if cfg.guard || cfg.log_conns {
         s += "\t\toifname \"lo\" accept\n\t\tct state != new accept\n";
-        if cfg.allow_lan {
+        // With the connection log on, LAN flows must reach the daemon too; it applies the exemption itself.
+        if cfg.allow_lan && !cfg.log_conns {
             s += "\t\tip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } accept\n";
             s += "\t\tip6 daddr { fc00::/7, fe80::/10, ff00::/8 } accept\n";
         }
-        s += &format!("\t\tmeta l4proto {{ tcp, udp }} queue num {QUEUE_NUM} bypass\n");
+        s += &queue;
     }
     s + "\t}\n}\n"
 }
@@ -554,20 +629,23 @@ impl Queue {
     }
 }
 
-/// (packet id, payload) of an NFQNL_MSG_PACKET message body.
-fn queued_packet(p: &[u8]) -> Option<(u32, &[u8])> {
-    let (mut a, mut id, mut payload) = (p.get(4..)?, None, &[][..]);
+/// (packet id, netfilter hook, payload) of an NFQNL_MSG_PACKET message body.
+fn queued_packet(p: &[u8]) -> Option<(u32, u8, &[u8])> {
+    let (mut a, mut id, mut hook, mut payload) = (p.get(4..)?, None, 0u8, &[][..]);
     while a.len() >= 4 {
         let len = usize::from(u16::from_ne_bytes([a[0], a[1]]));
         if len < 4 || len > a.len() { break; }
         match u16::from_ne_bytes([a[2], a[3]]) & 0x3fff {
-            NFQA_PACKET_HDR if len >= 8 => id = Some(u32::from_be_bytes([a[4], a[5], a[6], a[7]])),
+            NFQA_PACKET_HDR if len >= 8 => {  // nfqnl_msg_packet_hdr: be32 id, be16 hw_protocol, u8 hook
+                id = Some(u32::from_be_bytes([a[4], a[5], a[6], a[7]]));
+                if len >= 11 { hook = a[10]; }
+            }
             NFQA_PAYLOAD => payload = &a[4..len],
             _ => {}
         }
         a = &a[((len + 3) & !3).min(a.len())..];
     }
-    Some((id?, payload))
+    Some((id?, hook, payload))
 }
 
 // ── daemon ─────────────────────────────────────────────────────────────────
@@ -594,6 +672,25 @@ struct Guard {
     scanned: Instant,
     last_pid: String,
     logged: HashMap<String, Instant>,      // same program → same destination: one line a minute
+    // connection log
+    pending: Vec<Seen>,                    // new flows not written yet
+    flushed: Instant,
+    seen: HashMap<String, Instant>,        // same program ↔ same peer and port: one line a minute
+    owners: HashMap<u32, i32>,             // socket inode → pid
+    owners_at: Instant,
+    hot: Vec<i32>,                         // pids that owned the last logged sockets, searched first
+}
+
+/// One new flow waiting for its connection-log line.
+struct Seen { ts: u64, inbound: bool, f: Flow, host: String, blocked: bool, open: bool, inode: u32, uid: Option<u32>, pid: i32, exe: String }
+
+fn append_log(file: &str, max: u64, text: &str) {
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o755).create(LOG_DIR);
+    if std::fs::metadata(file).map_or(false, |m| m.len() > max) { let _ = std::fs::rename(file, format!("{file}.1")); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(file) {
+        let _ = f.write_all(text.as_bytes());
+    }
 }
 
 /// Newest pid the kernel handed out (5th field of /proc/loadavg).
@@ -628,17 +725,108 @@ impl Guard {
     }
 
     /// true = let the packet through.
-    fn decide(&mut self, pkt: &[u8]) -> bool {
-        if !self.cfg.guard { return true; }
+    fn decide(&mut self, pkt: &[u8], hook: u8) -> bool {
         let Some(f) = parse_packet(pkt) else { return true };
-        let Some(s) = self.diag.find_socket(&f) else { return true };
-        if s.inode == 0 { return true; }
-        let Some(pid) = self.owner(s.inode) else { return true };
+        let inbound = hook == HOOK_LOCAL_IN;
+        let guarded = self.cfg.guard && !inbound && !(self.cfg.allow_lan && is_lan(f.dst));
+        let peer = if inbound { f.src } else { f.dst };
+        let log = self.cfg.log_conns && !peer.is_multicast() && peer != IpAddr::V4(Ipv4Addr::BROADCAST) && self.pending.len() < 1024;
+        if !guarded && !log { return true; }
+        let sock = if inbound { self.diag.find_local(&f) } else { self.diag.find_socket(&f) };
+        let block = if guarded { sock.as_ref().and_then(|s| self.block(&f, pkt, s)) } else { None };
+        let accept = block.is_none();
+        if log {
+            let host = if f.proto == UDP && f.dport == 53 && !inbound { pkt.get(f.l4 + 8..).and_then(dns_qname) } else { None };
+            let (pid, exe) = block.unwrap_or_default();
+            self.pending.push(Seen { ts: now_secs(), inbound, host: host.unwrap_or_default(), blocked: !accept, open: sock.is_some(),
+                                     inode: sock.as_ref().map_or(0, |s| s.inode), uid: sock.as_ref().map(|s| s.uid), pid, exe, f });
+        }
+        accept
+    }
+
+    /// Some((pid, program)) when the socket belongs to a non-whitelisted Wine program: cut off and logged.
+    fn block(&mut self, f: &Flow, pkt: &[u8], s: &Sock) -> Option<(i32, String)> {
+        if s.inode == 0 { return None; }
+        let pid = self.owner(s.inode)?;
         let ident = self.ident(pid);
-        if self.cfg.whitelisted(&ident) { return true; }
-        let killed = self.diag.destroy(&s).is_ok();
-        self.log(&f, pkt, pid, &ident, killed);
-        false
+        if self.cfg.whitelisted(&ident) { return None; }
+        let killed = self.diag.destroy(s).is_ok();
+        self.log(f, pkt, pid, &ident, killed);
+        Some((pid, ident))
+    }
+
+    /// Fills `owners` for the wanted socket inodes: recent owners first, then one /proc pass.
+    fn find_owners(&mut self, mut want: HashSet<u32>) {
+        if self.owners.len() > 4096 || self.owners_at.elapsed() > Duration::from_secs(60) { self.owners.clear(); self.owners_at = Instant::now(); }
+        want.retain(|i| !self.owners.contains_key(i));
+        for &pid in &self.hot {
+            if want.is_empty() { return; }
+            for ino in socket_inodes(pid) { if want.remove(&ino) { self.owners.insert(ino, pid); } }
+        }
+        if want.is_empty() { return; }
+        for (ino, pid) in owners_of(&want) {
+            self.owners.insert(ino, pid);
+            if !self.hot.contains(&pid) {
+                if self.hot.len() >= 16 { self.hot.remove(0); }
+                self.hot.push(pid);
+            }
+        }
+    }
+
+    fn program(&mut self, pid: i32, names: &mut HashMap<i32, String>) -> String {
+        if let Some(x) = names.get(&pid) { return x.clone(); }
+        let x = exe_of(pid).unwrap_or_default();
+        let x = if is_wine_loader(&x) { self.ident(pid) } else if x.is_empty() { comm(pid) } else { x };
+        names.insert(pid, x.clone());
+        x
+    }
+
+    /// The connections that are already open when logging is switched on: one
+    /// sock_diag dump, written as `existing` lines. A TCP socket on a port this
+    /// machine listens on counts as inbound.
+    fn snapshot(&mut self) {
+        let Ok(socks) = dump_all(&self.diag) else { return };
+        let listen: HashSet<u16> = socks.iter().filter(|s| s.proto == TCP && s.state == TCP_LISTEN).map(|s| s.sport).collect();
+        let live: Vec<&Sock> = socks.iter().filter(|s| s.dport != 0 && s.state != 6 && !s.dst.is_loopback() && !s.src.is_loopback()
+                                                       && !s.dst.is_multicast() && s.dst != IpAddr::V4(Ipv4Addr::BROADCAST)).collect();
+        self.find_owners(live.iter().map(|s| s.inode).filter(|&i| i != 0).collect());
+        let (ts, mut names, mut out) = (now_secs(), HashMap::new(), String::new());
+        for s in live {
+            let pid = self.owners.get(&s.inode).copied().unwrap_or(0);
+            let exe = if pid == 0 { String::new() } else { self.program(pid, &mut names) };
+            let proto = if s.proto == TCP { "tcp" } else { "udp" };
+            let inbound = s.proto == TCP && listen.contains(&s.sport);
+            let dir = if inbound { "in" } else { "out" };
+            let key = format!("{dir}|{proto}|{}|{}|{exe}|{:?}|", s.dst, if inbound { s.sport } else { s.dport }, Some(s.uid));
+            if self.seen.insert(key, Instant::now()).is_some() { continue; }
+            out += &json!({"ts": ts, "dir": dir, "proto": proto, "remote": s.dst.to_string(), "rport": s.dport, "lport": s.sport,
+                           "pid": pid, "uid": s.uid, "exe": exe, "host": "", "blocked": false, "open": true, "existing": true}).to_string();
+            out.push('\n');
+        }
+        if !out.is_empty() { append_log(CONN_LOG, CONN_LOG_MAX, &out); }
+    }
+
+    /// Writes the pending connection-log lines (runs after the verdicts went out).
+    fn flush(&mut self) {
+        self.flushed = Instant::now();
+        let batch = std::mem::take(&mut self.pending);
+        self.find_owners(batch.iter().filter(|e| e.pid == 0 && e.inode != 0).map(|e| e.inode).collect());
+        if self.seen.len() > 8192 { self.seen.clear(); }
+        let mut names: HashMap<i32, String> = HashMap::new();
+        let mut out = String::new();
+        for e in batch {
+            let pid = if e.pid != 0 { e.pid } else { self.owners.get(&e.inode).copied().unwrap_or(0) };
+            let exe = if !e.exe.is_empty() || pid == 0 { e.exe } else { self.program(pid, &mut names) };
+            let proto = if e.f.proto == TCP { "tcp" } else { "udp" };
+            let (dir, remote, rport, lport) = if e.inbound { ("in", e.f.src, e.f.sport, e.f.dport) } else { ("out", e.f.dst, e.f.dport, e.f.sport) };
+            let key = format!("{dir}|{proto}|{remote}|{}|{exe}|{:?}|{}", if e.inbound { lport } else { rport }, e.uid, e.host);
+            if self.seen.get(&key).map_or(false, |t| t.elapsed() < Duration::from_secs(60)) { continue; }
+            self.seen.insert(key, Instant::now());
+            out += &json!({"ts": e.ts, "dir": dir, "proto": proto, "remote": remote.to_string(), "rport": rport, "lport": lport,
+                           "pid": pid, "uid": e.uid, "exe": exe, "host": e.host, "blocked": e.blocked, "open": e.open}).to_string();
+            out.push('\n');
+        }
+        if !out.is_empty() { append_log(CONN_LOG, CONN_LOG_MAX, &out); }
     }
 
     fn log(&mut self, f: &Flow, pkt: &[u8], pid: i32, ident: &str, killed: bool) {
@@ -650,12 +838,7 @@ impl Guard {
         let host = if f.proto == UDP && f.dport == 53 { pkt.get(f.l4 + 8..).and_then(dns_qname) } else { None };
         let line = json!({"ts": now_secs(), "proto": proto, "dst": f.dst.to_string(), "dport": f.dport, "pid": pid,
                           "exe": ident, "host": host.unwrap_or_default(), "killed": killed});
-        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o755).create(LOG_DIR);
-        if std::fs::metadata(LOG_FILE).map_or(false, |m| m.len() > LOG_MAX) { let _ = std::fs::rename(LOG_FILE, format!("{LOG_FILE}.1")); }
-        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).mode(0o644)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(LOG_FILE) {
-            let _ = file.write_all(format!("{line}\n").as_bytes());
-        }
+        append_log(LOG_FILE, LOG_MAX, &format!("{line}\n"));
     }
 }
 
@@ -679,8 +862,18 @@ pub fn daemon_pid() -> Option<i32> {
     s.trim().parse().ok().filter(|&p| p > 1)
 }
 
-fn apply_rules(cfg: &Config) {
-    if let Err(e) = nft_run(&nft_script(cfg)) { eprintln!("lpm-netguard: {e}"); }
+/// What the running daemon really enforces, for `status`: the helper and the GUI
+/// compare it with the saved configuration (an older daemon writes nothing here).
+fn write_state(cfg: &Config, error: Option<&str>) {
+    let _ = crate::write_root_file(STATE_FILE, json!({"guard": cfg.guard, "allow_lan": cfg.allow_lan, "log_conns": cfg.log_conns, "error": error}).to_string().as_bytes());
+}
+
+fn applied() -> Value {
+    crate::read_root_file(STATE_FILE, 65536).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
+}
+
+fn in_force(cfg: &Config, a: &Value) -> bool {
+    a["error"].is_string() || (a["guard"] == cfg.guard && a["allow_lan"] == cfg.allow_lan && a["log_conns"] == cfg.log_conns)
 }
 
 pub fn run_daemon() -> i32 {
@@ -705,37 +898,57 @@ pub fn run_daemon() -> i32 {
         Ok(q) => q,
         Err(e) => { eprintln!("lpm-netguard: cannot bind NFQUEUE {QUEUE_NUM}: {e} (kernel: NETFILTER_NETLINK_QUEUE)"); return 1; }
     };
+    let _ = std::fs::remove_file(STATE_FILE);
     if let Err(e) = nft_run(&nft_script(&cfg)) {
         eprintln!("lpm-netguard: {e} (kernel: NF_TABLES, NF_TABLES_INET, NFT_QUEUE, NFT_CT, NF_CONNTRACK)");
         return 1;
     }
-    eprintln!("lpm-netguard: started (guard {}, {} blacklisted, {} whitelisted)",
-              if cfg.guard { "on" } else { "off" }, cfg.blacklist.len(), cfg.whitelist.len());
+    write_state(&cfg, None);
+    eprintln!("lpm-netguard: started (guard {}, connection log {}, {} blacklisted, {} whitelisted)",
+              if cfg.guard { "on" } else { "off" }, if cfg.log_conns { "on" } else { "off" }, cfg.blacklist.len(), cfg.whitelist.len());
     let mut g = Guard { cfg, diag, wine: HashSet::new(), idents: HashMap::new(), scanned: Instant::now(),
-                        last_pid: String::new(), logged: HashMap::new() };
+                        last_pid: String::new(), logged: HashMap::new(), pending: Vec::new(), flushed: Instant::now(),
+                        seen: HashMap::new(), owners: HashMap::new(), owners_at: Instant::now(), hot: Vec::new() };
+    if g.cfg.log_conns { g.snapshot(); }
     let mut buf = [0u8; 8192];
     while !STOP.load(Ordering::SeqCst) {
         if RELOAD.swap(false, Ordering::SeqCst) {
             match Config::load() {
-                Ok(c) => { g.cfg = c; apply_rules(&g.cfg); eprintln!("lpm-netguard: configuration reloaded"); }
+                Ok(c) => {
+                    let was_logging = std::mem::replace(&mut g.cfg, c).log_conns;
+                    let res = nft_run(&nft_script(&g.cfg));
+                    write_state(&g.cfg, res.as_ref().err().map(String::as_str));
+                    match res {
+                        Ok(()) => {
+                            eprintln!("lpm-netguard: configuration reloaded");
+                            if g.cfg.log_conns && !was_logging { g.snapshot(); }
+                        }
+                        Err(e) => eprintln!("lpm-netguard: {e}"),
+                    }
+                }
                 Err(e) => eprintln!("lpm-netguard: reload failed, keeping the old rules: {e}"),
             }
         }
+        // Pending log lines wake the loop when their batch window ends; otherwise it sleeps until a packet or signal.
+        let wait = if g.pending.is_empty() { -1 } else { FLUSH_GAP.saturating_sub(g.flushed.elapsed()).as_millis() as libc::c_int };
         let mut fds = [libc::pollfd { fd: queue.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 },
                        libc::pollfd { fd: pipe[0], events: libc::POLLIN, revents: 0 }];
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 { continue; }  // EINTR: flags are checked above
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) } < 0 { continue; }  // EINTR: flags are checked above
         if fds[1].revents != 0 { let mut b = [0u8; 64]; unsafe { libc::read(pipe[0], b.as_mut_ptr().cast(), b.len()); } }
-        if fds[0].revents == 0 { continue; }
-        for _ in 0..64 {  // then back to poll, so a flood cannot starve SIGTERM/SIGHUP
-            let Ok(n) = nl_recv(&queue.fd, &mut buf, libc::MSG_DONTWAIT) else { break };
-            let mut pkts: Vec<(u32, bool)> = Vec::new();
-            nl_each(&buf[..n], |ty, p| if ty == NFQ_PACKET {
-                if let Some((id, payload)) = queued_packet(p) { pkts.push((id, g.decide(payload))); }
-            });
-            for (id, accept) in pkts { queue.verdict(id, accept); }
+        if fds[0].revents != 0 {
+            for _ in 0..64 {  // then back to poll, so a flood cannot starve SIGTERM/SIGHUP
+                let Ok(n) = nl_recv(&queue.fd, &mut buf, libc::MSG_DONTWAIT) else { break };
+                let mut pkts: Vec<(u32, bool)> = Vec::new();
+                nl_each(&buf[..n], |ty, p| if ty == NFQ_PACKET {
+                    if let Some((id, hook, payload)) = queued_packet(p) { pkts.push((id, g.decide(payload, hook))); }
+                });
+                for (id, accept) in pkts { queue.verdict(id, accept); }
+            }
         }
+        if !g.pending.is_empty() && g.flushed.elapsed() >= FLUSH_GAP { g.flush(); }
     }
     nft_remove();
+    let _ = std::fs::remove_file(STATE_FILE);
     eprintln!("lpm-netguard: stopped");
     0
 }
@@ -805,6 +1018,7 @@ pub fn status(full: bool) -> Value {
     v["ok"] = json!(true);
     v["running"] = json!(pid.is_some());
     v["pid"] = json!(pid);
+    if pid.is_some() { v["applied"] = applied(); }
     if let Some(e) = err { v["config_error"] = json!(e); }
     if full {
         v["nft"] = json!(sys_bin("nft").is_some());
@@ -838,7 +1052,12 @@ fn kill_where(pred: impl Fn(&Sock) -> bool) -> (usize, Option<String>) {
 /// One request of netguard-helper. `list` and `status` work for any user; the rest is root-only.
 pub fn handle(req: &Value) -> Value {
     let op = req["op"].as_str().unwrap_or("");
-    match op { "list" => return list(), "status" => return status(true), _ => {} }
+    match op {
+        "list" => return list(),
+        "status" => return status(true),
+        "whois" => return whois(req["ip"].as_str().unwrap_or("")),
+        _ => {}
+    }
     if unsafe { libc::geteuid() } != 0 { return json!({"ok": false, "needs_root": true, "error": "this operation needs root (pkexec)"}); }
     let mut cfg = match Config::load() { Ok(c) => c, Err(e) => return json!({"ok": false, "error": e}) };
     let mut killed = 0;
@@ -846,15 +1065,28 @@ pub fn handle(req: &Value) -> Value {
         "set" => {
             if let Some(b) = req["guard"].as_bool() { cfg.guard = b; }
             if let Some(b) = req["allow_lan"].as_bool() { cfg.allow_lan = b; }
+            if let Some(b) = req["log_conns"].as_bool() { cfg.log_conns = b; }
         }
         "blacklist" => {
+            let label = req["label"].as_str().map(|l| l.chars().filter(|c| !c.is_control()).take(64).collect::<String>().trim().to_owned())
+                .filter(|l| !l.is_empty());
+            let mut have: HashSet<String> = cfg.blacklist.iter().map(Net::to_string).collect();
             let mut added = Vec::new();
             for s in strings(&req["add"]) {
-                let Some(n) = Net::parse(&s) else { return json!({"ok": false, "error": format!("not an IP address or CIDR block: {s}")}) };
-                if !cfg.blacklist.contains(&n) { cfg.blacklist.push(n); added.push(n); }
+                let Some(nets) = parse_nets(&s) else { return json!({"ok": false, "error": format!("not an IP address, CIDR block or range: {s}")}) };
+                for n in nets {
+                    if n.contains(IpAddr::V4(Ipv4Addr::LOCALHOST)) || n.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)) {
+                        return json!({"ok": false, "error": format!("{s} covers the loopback address; local programs would stop working")});
+                    }
+                    if have.insert(n.to_string()) { cfg.blacklist.push(n); added.push(n); }
+                    if let Some(l) = &label { cfg.labels.insert(n.to_string(), l.clone()); }
+                }
             }
-            let del: Vec<Net> = strings(&req["remove"]).iter().filter_map(|s| Net::parse(s)).collect();
-            cfg.blacklist.retain(|n| !del.contains(n));
+            if req["remove_all"] == true { cfg.blacklist.clear(); }
+            let del: HashSet<String> = strings(&req["remove"]).iter().filter_map(|s| Net::parse(s)).map(|n| n.to_string()).collect();
+            cfg.blacklist.retain(|n| !del.contains(&n.to_string()));
+            let have: HashSet<String> = cfg.blacklist.iter().map(Net::to_string).collect();
+            cfg.labels.retain(|k, _| have.contains(k));
             if cfg.blacklist.len() > MAX_BLACKLIST { return json!({"ok": false, "error": "blacklist is full"}); }
             if !added.is_empty() { killed = kill_where(|s| added.iter().any(|n| n.contains(s.dst))).0; }
         }
@@ -882,13 +1114,98 @@ pub fn handle(req: &Value) -> Value {
             let _ = std::fs::remove_file(format!("{LOG_FILE}.1"));
             return json!({"ok": true});
         }
+        "clear_conn_log" => {
+            let _ = std::fs::remove_file(CONN_LOG);
+            let _ = std::fs::remove_file(format!("{CONN_LOG}.1"));
+            return json!({"ok": true});
+        }
         _ => return json!({"ok": false, "error": "unknown op"}),
     }
     if let Err(e) = cfg.save() { return json!({"ok": false, "error": e}); }
     reload_daemon();
+    // Give the daemon a moment to load the rules, so the answer says what is really in force.
+    for _ in 0..15 {
+        if daemon_pid().is_none() || in_force(&cfg, &applied()) { break; }
+        std::thread::sleep(Duration::from_millis(40));
+    }
     let mut v = status(false);
     v["killed"] = json!(killed);
     v
+}
+
+// ── whois ──────────────────────────────────────────────────────────────────
+
+/// One query to a whois server (TCP 43): bounded in time and size.
+fn whois_query(server: &str, q: &str) -> Result<String, String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addr = (server, 43).to_socket_addrs().map_err(|e| format!("{server}: {e}"))?.next().ok_or_else(|| format!("{server}: no address"))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(2500)).map_err(|e| format!("{server}: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(2500)));
+    let _ = s.set_write_timeout(Some(Duration::from_millis(2500)));
+    s.write_all(format!("{q}\r\n").as_bytes()).map_err(|e| format!("{server}: {e}"))?;
+    let (mut out, mut buf, end) = (Vec::new(), [0u8; 8192], Instant::now() + Duration::from_secs(4));
+    while out.len() < 256 * 1024 && Instant::now() < end {
+        match s.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => out.extend_from_slice(&buf[..n]) }
+    }
+    if out.is_empty() { return Err(format!("{server}: no answer")); }
+    Ok(String::from_utf8_lossy(&out).chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect())
+}
+
+fn whois_fields(text: &str) -> Vec<(String, &str)> {
+    text.lines().filter(|l| !l.starts_with('%') && !l.starts_with('#'))
+        .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_lowercase(), v.trim()))).filter(|(_, v)| !v.is_empty()).collect()
+}
+
+/// The server a reply points to (IANA `refer:`, ARIN `ReferralServer: whois://host`).
+fn whois_referral(text: &str) -> Option<String> {
+    let v = whois_fields(text).into_iter().find(|(k, _)| k == "refer" || k == "referralserver")?.1.to_lowercase();
+    let host = v.strip_prefix("whois://").unwrap_or(&v).trim_end_matches('/').trim_end_matches(":43");
+    (!v.starts_with("rwhois") && host.contains('.') && host.len() < 128 && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        .then(|| host.to_owned())
+}
+
+/// The handful of fields worth a glance. ARIN lists the covering networks first, the other registries the closest one first.
+fn whois_summary(text: &str, last: bool) -> Vec<[String; 2]> {
+    let f = whois_fields(text);
+    let pick = |keys: &[&str]| keys.iter().find_map(|k| {
+        let mut hits = f.iter().filter(|(key, _)| key == k).map(|(_, v)| *v);
+        if last { hits.last() } else { hits.next() }
+    });
+    let mut out: Vec<[String; 2]> = Vec::new();
+    for (label, keys) in [("Range", &["inetnum", "inet6num", "netrange"][..]), ("CIDR", &["cidr", "route", "route6"]),
+                          ("Network", &["netname"]), ("Organisation", &["orgname", "org-name", "organization", "owner", "descr"]),
+                          ("Country", &["country"]), ("AS", &["originas", "origin", "aut-num"]),
+                          ("Abuse contact", &["orgabuseemail", "abuse-mailbox"])] {
+        if let Some(v) = pick(keys) { out.push([label.to_owned(), v.to_owned()]); }
+    }
+    // RIPE / APNIC: "% Abuse contact for '…' is 'abuse@example.net'"
+    if !out.iter().any(|r| r[0] == "Abuse contact") {
+        if let Some(a) = text.lines().find(|l| l.starts_with("% Abuse contact")).and_then(|l| l.rsplit('\'').nth(1)) {
+            out.push(["Abuse contact".to_owned(), a.to_owned()]);
+        }
+    }
+    out
+}
+
+/// Who an address belongs to: IANA names the registry, the registry answers (at
+/// most three hops). Runs as the calling user; nothing is sent for local addresses.
+pub fn whois(ip: &str) -> Value {
+    let Ok(ip) = ip.trim().parse::<IpAddr>().map(unmap) else { return json!({"ok": false, "error": "not an IP address"}) };
+    if ip.is_loopback() || ip.is_unspecified() || is_lan(ip) {
+        return json!({"ok": true, "ip": ip.to_string(), "server": "", "raw": "",
+                      "summary": [["Network", "private / local address — not registered anywhere"]]});
+    }
+    let (mut next, mut server, mut raw) = ("whois.iana.org".to_owned(), String::new(), String::new());
+    for _ in 0..3 {
+        let q = if next == "whois.arin.net" { format!("n + {ip}") } else { ip.to_string() };
+        match whois_query(&next, &q) {
+            Ok(t) => { raw = t; server = std::mem::take(&mut next); }
+            Err(e) if raw.is_empty() => return json!({"ok": false, "error": e}),
+            Err(_) => break,
+        }
+        match whois_referral(&raw) { Some(n) if n != server => next = n, _ => break }
+    }
+    json!({"ok": true, "ip": ip.to_string(), "server": server, "summary": whois_summary(&raw, server.ends_with("arin.net")), "raw": raw})
 }
 
 #[cfg(test)]
@@ -939,6 +1256,46 @@ mod tests {
         c.blacklist = vec![Net::parse("1.2.3.4").unwrap(), Net::parse("2001:db8::/32").unwrap()];
         let s = nft_script(&c);
         assert!(s.contains("elements = { 1.2.3.4 }") && s.contains("elements = { 2001:db8::/32 }") && s.contains("queue num 19536 bypass"));
+        assert!(s.matches("queue num").count() == 1 && s.contains("192.168.0.0/16"));
+        c.log_conns = true;  // both hooks queued, LAN exemption left to the daemon
+        let s = nft_script(&c);
+        assert!(s.matches("queue num").count() == 2 && !s.contains("192.168.0.0/16") && s.contains("iifname \"lo\" accept"));
+        c.guard = false;
+        assert!(nft_script(&c).matches("queue num").count() == 2);
+    }
+
+    #[test]
+    fn ranges() {
+        let p = |s: &str| parse_nets(s).map(|v| v.iter().map(Net::to_string).collect::<Vec<_>>().join(" "));
+        assert_eq!(p("1.2.3.0 - 1.2.3.255").as_deref(), Some("1.2.3.0/24"));
+        assert_eq!(p("192.0.2.10-192.0.2.20").as_deref(), Some("192.0.2.10/31 192.0.2.12/30 192.0.2.16/30 192.0.2.20"));
+        assert_eq!(p("10.0.0.0 - 10.255.255.255").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(p("0.0.0.0 - 0.0.0.3").as_deref(), Some("0.0.0.0/30"));
+        assert_eq!(p("2001:db8:: - 2001:db8:ffff:ffff:ffff:ffff:ffff:ffff").as_deref(), Some("2001:db8::/32"));
+        assert_eq!(p("255.255.255.254 - 255.255.255.255").as_deref(), Some("255.255.255.254/31"));
+        assert_eq!(p("5.6.7.8/16").as_deref(), Some("5.6.0.0/16"));
+        assert!(p("0.0.0.0 - 255.255.255.255").is_none() && p(":: - ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff").is_none());
+        assert!(p("1.2.3.9 - 1.2.3.1").is_none() && p("1.2.3.4 - ::1").is_none() && p("a - b").is_none());
+    }
+
+    #[test]
+    fn lan() {
+        for a in ["192.168.1.9", "10.0.0.1", "100.64.3.1", "169.254.1.1", "224.0.0.251", "fe80::1", "fd00::5", "::ffff:172.16.0.1"] { assert!(is_lan(a.parse().unwrap()), "{a}"); }
+        for a in ["8.8.8.8", "100.128.0.1", "172.32.0.1", "2001:db8::1"] { assert!(!is_lan(a.parse().unwrap()), "{a}"); }
+    }
+
+    #[test]
+    fn whois_parse() {
+        assert_eq!(whois_referral("% IANA WHOIS server\nrefer:        whois.ripe.net\n\ninetnum: 1.0.0.0\n").as_deref(), Some("whois.ripe.net"));
+        assert_eq!(whois_referral("ReferralServer:  whois://whois.apnic.net:43\n").as_deref(), Some("whois.apnic.net"));
+        assert!(whois_referral("ReferralServer: rwhois://rwhois.example.net:4321\n").is_none() && whois_referral("refer: bad host;x\n").is_none());
+        let ripe = "% Abuse contact for '1.2.3.0 - 1.2.3.255' is 'abuse@example.net'\n\ninetnum:  1.2.3.0 - 1.2.3.255\nnetname:  EX-NET\ndescr:    Example\ncountry:  TR\n\nroute:    1.2.0.0/16\ndescr:    other\norigin:   AS64500\n";
+        let s = whois_summary(ripe, false);
+        assert_eq!(s, [["Range", "1.2.3.0 - 1.2.3.255"], ["CIDR", "1.2.0.0/16"], ["Network", "EX-NET"], ["Organisation", "Example"],
+                       ["Country", "TR"], ["AS", "AS64500"], ["Abuse contact", "abuse@example.net"]].map(|r| r.map(str::to_owned)));
+        let arin = "NetRange: 8.0.0.0 - 8.127.255.255\nNetName: BIG\nOrgName: Parent\n\nNetRange: 8.8.8.0 - 8.8.8.255\nCIDR: 8.8.8.0/24\nNetName: SMALL\nOrgName: Child\n";
+        let s = whois_summary(arin, true);
+        assert_eq!((s[0][1].as_str(), s[2][1].as_str(), s[3][1].as_str()), ("8.8.8.0 - 8.8.8.255", "SMALL", "Child"));
     }
 
     #[test]
@@ -946,6 +1303,6 @@ mod tests {
         let mut body = vec![2, 0, 0x4c, 0x50];
         nl_attr(&mut body, NFQA_PACKET_HDR, &[0, 0, 0, 7, 8, 0, 3]);
         nl_attr(&mut body, NFQA_PAYLOAD, &[0x45, 1, 2]);
-        assert_eq!(queued_packet(&body), Some((7, &[0x45u8, 1, 2][..])));
+        assert_eq!(queued_packet(&body), Some((7, 3, &[0x45u8, 1, 2][..])));
     }
 }
