@@ -425,6 +425,10 @@ void FwattrTab::rebuild() {
 
 void FwattrTab::showEvent(QShowEvent *e) {
     QWidget::showEvent(e);
+    // Scenes, profile changes and other tools rewrite these values while the tab is not looking, so every
+    // (re)open starts with a full rescan: sysfs attributes are re-read by rebuild(), which also queues the
+    // WMI read. rebuild() is a no-op while an apply is running; the stale flag still catches the WMI read then.
+    rebuild();
     if (wmiStale_) readWmi();
 }
 
