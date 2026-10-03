@@ -73,6 +73,7 @@ preset from the GUI — enabling the service early is harmless.
         legion-profile-helper  fwattr-helper  ryzen-co-helper
         tune-helper  intel-uv-helper  legion-gpu-helper
         legion-firmware-helper  lighting-helper  amdgpu-helper  legion-ec-sensors
+        netguard-helper  backup-helper
         lpm-boot-guard                                          (root:root 0755)
         nvcurve-root-helper                                     (root:root 0700)
     /usr/share/polkit-1/actions/com.legion-power-manager.policy
@@ -323,6 +324,60 @@ Import shows what is inside, warns when the file comes from another model or
 BIOS (curve offsets are chip-specific), and asks whether to overwrite or keep
 existing items. NVIDIA profiles are written through `nvcurve-root-helper`,
 which validates them.
+
+## Backup (Health → Backup)
+
+`backup-helper` (engine: `crates/lpm-helpers/src/backup.rs`) streams: one JSON
+request line on stdin, `{"event":"start"|"progress"}` lines while it works, one
+final `{"ok":…}` line. Stdin stays open; EOF cancels (tar and the compressor
+run in their own process groups and are terminated, the `.partial` archive is
+removed). polkit action `com.legion-power-manager.backup`: AUTH_ADMIN, never
+cached, at every security level.
+
+**System image** (`system_backup`, root):
+`tar --acls --xattrs --xattrs-include='*' --ignore-failed-read --exclude=… -cvpf - / | pigz -pN -6`
+→ `<folder>/backup-YYYY-MM-DD.tar.gz` (`_HHMMSS` added when the name exists;
+`.tar.zst` / `.tar.xz` with the other compressors), 0600 root, written as
+`.partial` and renamed, plus `<archive>.info.json` (entry count, kernel,
+excludes, tar status). Default excludes use the `/proc/*` form, not `/proc`:
+the empty mount points stay in the archive, so a restore onto a fresh file
+system boots. The archive itself and older `backup-*.tar.*` files in the
+folder are always excluded; `/home/*` unless "Include /home". tar status 1
+(files changed while read) is normal on a live system; status 2 keeps the
+archive and flags it. Optional: verify (read back through
+`<decompressor> | tar -t`, entry count compared), retention (newest N
+`backup-YYYY-MM-DD*` images kept), nice 19 + lowest best-effort I/O priority.
+
+**Restore** (`system_restore`, root): compression from the magic bytes, then
+`<decompressor> | tar --acls --xattrs --xattrs-include='*' --numeric-owner -xvpf - -C <target>`.
+The request must repeat the resolved target (`confirm`); the GUI asks to type
+RESTORE for `/`. Missing mount points (`/proc /sys /dev /run /tmp /var/tmp
+/mnt /media /home`) are created afterwards, so images made with a plain
+`--exclude=/proc` restore to a bootable tree too. `--numeric-owner`: correct
+when restoring from live media whose passwd differs.
+
+**LPM configuration** (`config_backup`, as the user): readable files are staged
+and packed as `lpm-config-YYYY-MM-DD_HHMMSS.tar.gz` (0600):
+
+    LPM-BACKUP.json                 manifest: created, host, model, BIOS, kernel, counts, unreadable files
+    user/config/…                   ~/.config/{legion-power-manager,ryzen-curve-optimizer}
+    user/state/…                    logs (optional)
+    system/etc/legion-power-manager, system/etc/nvcurve, system/var/lib/legion-power-manager,
+    system/etc/modprobe.d/zz-legion-power-manager-nvidia.conf
+    system-profile/                 reference only, never restored: root/etc/portage, world, kernel .config,
+                                    fstab, grub/dracut/kernel, modprobe.d, modules-load.d, sysctl, conf.d,
+                                    runlevels, udev rules; cmdline, DMI, modules, packages.txt
+                                    (/etc/portage/gnupg is left out: Portage's regenerable keyring, root 0700)
+
+Restore: the GUI first saves the current state (`…-pre-restore.tar.gz`), then
+`config_restore_root` (pkexec) and `config_restore_user`. The root part goes
+through a whitelist — `/etc/legion-power-manager/*`, `presets/*`,
+`/etc/nvcurve/{config.json,profiles/*}`, the calibration files of
+`/var/lib/legion-power-manager` (signature, calibration, outcomes, io-probe,
+wmae-verified; not the boot-guard / boot-default state) and LPM's NVIDIA
+modprobe file — and every file is re-created root:root 0644 with an atomic
+write; owner, mode and symlinks in the archive are ignored. Files that are not
+in the backup stay.
 
 ## Components
 

@@ -39,6 +39,11 @@
  * user, so a silent grant would let one of them whitelist itself: it always
  * gets AUTH_ADMIN_KEEP (password, then polkit's cache window), at every level.
  *
+ * Exception: backup-helper (com.legion-power-manager.backup) writes a system
+ * image (a copy of every file, /etc/shadow included) and restores one over a
+ * chosen directory, / included. Like the firmware helper it always gets
+ * AUTH_ADMIN: the password every time, no keep, at every level.
+ *
  * Security level (chosen at install time, install.sh --security-level=N):
  *   1  the behaviour described above: wheel + local + active session is silent.
  *   2  no silent grants: the same session gets auth_admin_keep (one password,
@@ -73,6 +78,8 @@ var PROFILE_ID = "com.legion-power-manager.tune.profile";
 var PROFILE_HELPER = "@LIBEXEC@/tune-profile-helper";
 var FIRMWARE_ACTION = "com.legion-power-manager.firmware.write";
 var FIRMWARE_HELPER = "@LIBEXEC@/legion-firmware-helper";
+var BACKUP_ACTION = "com.legion-power-manager.backup";
+var BACKUP_HELPER = "@LIBEXEC@/backup-helper";
 var NETGUARD_ACTION = "com.legion-power-manager.netguard";
 var NETGUARD_HELPER = "@LIBEXEC@/netguard-helper";
 
@@ -80,6 +87,11 @@ polkit.addRule(function (action, subject) {
     // Firmware-persistent writes: always the password, never cached.
     if (action.id === FIRMWARE_ACTION ||
         (action.id === "org.freedesktop.policykit.exec" && action.lookup("program") === FIRMWARE_HELPER)) {
+        return polkit.Result.AUTH_ADMIN;
+    }
+    // System backup / restore: always the password, never cached.
+    if (action.id === BACKUP_ACTION ||
+        (action.id === "org.freedesktop.policykit.exec" && action.lookup("program") === BACKUP_HELPER)) {
         return polkit.Result.AUTH_ADMIN;
     }
     // Network guard rules: never silent, the password is kept for polkit's cache window.

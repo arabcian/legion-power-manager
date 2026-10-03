@@ -140,4 +140,14 @@
     <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/netguard-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
+  <action id="com.legion-power-manager.backup">
+    <description>Create, verify or restore a system backup, or restore saved Legion Power Manager system settings</description>
+    <description xml:lang="tr">Sistem yedeği oluştur, doğrula veya geri yükle ya da kayıtlı Legion Power Manager sistem ayarlarını geri yükle</description>
+    <message>Authentication is required to back up or restore the system</message>
+    <message xml:lang="tr">Sistemi yedeklemek veya geri yüklemek için kimlik doğrulama gerekiyor</message>
+    <!-- Never silent, never cached (see the rules file): the image holds /etc/shadow and a restore replaces any file. -->
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@LIBEXEC@/backup-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
 </policyconfig>

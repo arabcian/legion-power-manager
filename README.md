@@ -181,6 +181,14 @@ Firmware-persistent changes always ask, at every level.
   absent — see Requirements.
 - **Health tab** keeps the kernel-log history (Xid, MCE, AER, lockups, guard
   rollbacks) across boots.
+- **Health → Backup** makes two kinds of dated archive. *LPM configuration*:
+  scenes, presets, curves, lighting, boot profiles, network-guard rules and
+  calibration, plus an optional system profile (Portage config, world set,
+  kernel config, fstab, boot/module/sysctl settings, package list) — no
+  password to save, one to restore the root-owned part. *System image*:
+  `tar --acls --xattrs -cpf - / | pigz` (or zstd / xz) into a folder of your
+  choice, with verify, retention and a restore into any target directory —
+  the administrator password every time.
 
 ## Requirements
 
@@ -199,7 +207,8 @@ Firmware-persistent changes always ask, at every level.
 | live memory timings, extra CPU sensors *(optional)* | `ryzen_smu`, `zenpower` / `zenergy` |
 | BIOS memory timings | efivarfs (`/sys/firmware/efi/efivars`) |
 | Lighting tab without a password | udev + systemd-logind or elogind (`uaccess`) |
-| Health → Network (connections, IP blacklist, Wine/.exe guard) | `nft` (nftables) and the `lpm-netguard` service; kernel: `NETFILTER_NETLINK_QUEUE`, `NF_TABLES`, `NF_TABLES_INET`, `NFT_QUEUE`, `NF_CONNTRACK`, `NFT_CT`, `INET_DIAG`, `INET_TCP_DIAG`, `INET_UDP_DIAG`, `INET_DIAG_DESTROY` |
+| Health → Backup (system image) | GNU `tar` with ACL/xattr support; `pigz` (falls back to `gzip`), optionally `zstd`, `xz` |
+| Health → Network (connections, IP blacklist, Wine/.exe guard, connection log + whois) | `nft` (nftables) and the `lpm-netguard` service; kernel: `NETFILTER_NETLINK_QUEUE`, `NF_TABLES`, `NF_TABLES_INET`, `NFT_QUEUE`, `NF_CONNTRACK`, `NFT_CT`, `INET_DIAG`, `INET_TCP_DIAG`, `INET_UDP_DIAG`, `INET_DIAG_DESTROY` |
 
 Missing pieces only disable the tab or row that needs them.
 

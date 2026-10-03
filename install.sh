@@ -24,7 +24,7 @@
 #   /usr/bin/legion-power-manager                   GUI (Qt6)
 #   /usr/bin/nvcurve                                nvcurve CLI (Rust)
 #   /usr/bin/lpm-gamemode                           Lutris/Steam game-mode hook (runs as the user)
-#   /usr/bin/lpm-netguard                           network guard daemon (IP blacklist, Wine/.exe guard)
+#   /usr/bin/lpm-netguard                           network guard daemon (IP blacklist, Wine/.exe guard, connection log)
 #   /usr/libexec/legion-power-manager/*-helper      pkexec targets (root:root)
 #   $PREFIX/lib/udev/rules.d/70-legion-power-manager-lighting.rules   keyboard lighting (uaccess)
 #   /usr/share/polkit-1/actions/com.legion-power-manager.policy
@@ -153,7 +153,7 @@ fi
 own=(-o root -g root); [[ $EUID -eq 0 ]] || own=()
 T=target/release
 install -d "${own[@]}" -m 0755 "$DESTDIR$LIBEXEC" "$DESTDIR$PREFIX/bin"
-install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/tune-profile-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/legion-ec-sensors" "$T/lpm-boot-guard" "$T/netguard-helper" \
+install "${own[@]}" -m 0755 "$T/legion-profile-helper" "$T/fwattr-helper" "$T/ryzen-co-helper" "$T/tune-helper" "$T/tune-profile-helper" "$T/intel-uv-helper" "$T/legion-gpu-helper" "$T/legion-firmware-helper" "$T/lighting-helper" "$T/amdgpu-helper" "$T/nvcurve-sensors" "$T/legion-ec-sensors" "$T/lpm-boot-guard" "$T/netguard-helper" "$T/backup-helper" \
     "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0700 "$T/nvcurve-root-helper" "$DESTDIR$LIBEXEC/"
 install "${own[@]}" -m 0755 "$T/nvcurve" "$T/lpm-gamemode" "$T/lpm-intel-uv" "$T/lpm-autotune" "$T/lpm-calibrate" "$T/lpm-netguard" "$DESTDIR$PREFIX/bin/"

@@ -58,7 +58,7 @@ src_test() {
 src_install() {
 	local r="${S}/target/release"
 	exeinto /usr/libexec/${PN}
-	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,tune-profile-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lighting-helper,amdgpu-helper,nvcurve-sensors,legion-ec-sensors,lpm-boot-guard,netguard-helper}
+	doexe "${r}"/{legion-profile-helper,fwattr-helper,ryzen-co-helper,tune-helper,tune-profile-helper,intel-uv-helper,legion-gpu-helper,legion-firmware-helper,lighting-helper,amdgpu-helper,nvcurve-sensors,legion-ec-sensors,lpm-boot-guard,netguard-helper,backup-helper}
 	exeopts -m0700
 	doexe "${r}"/nvcurve-root-helper
 	dobin "${r}"/{nvcurve,lpm-gamemode,lpm-intel-uv,lpm-autotune,lpm-calibrate,lpm-netguard}
