@@ -2,35 +2,107 @@
 
 **Legion Space / Vantage for Linux — and then some.**
 One tray app for Lenovo Legion laptops: power profiles, firmware power limits,
-fan curves, CPU and GPU undervolting, per-key RGB, system tuning for games,
-and *Scenes* that switch all of it with one click or when you plug in the charger.
+fan curves, CPU and GPU undervolting, per-key RGB, game-aware system tuning with
+a measured **Autotune**, **Scenes** that switch all of it at once, and a
+**Health** suite (kernel-error history, dGPU power diagnostics, network guard,
+backups).
 
-Native Qt6 GUI, privileged work in small Rust helpers, no background daemon
-required, no telemetry, works on OpenRC and systemd.
+Native Qt6 GUI · privileged work in small validating Rust helpers · no
+telemetry · OpenRC and systemd. Nothing runs in the background unless you
+enable one of the optional boot services.
 
 > ⚠️ This tool writes low-level hardware and firmware settings.
 > Read [DISCLAIMER.md](DISCLAIMER.md) before using it.
 
-## Features
+**Using it?** Start with the [Handbook](docs/HANDBOOK.md) (task-by-task).
+Reference: [TECHNICAL.md](docs/TECHNICAL.md) · [AUTOTUNE.md](docs/AUTOTUNE.md).
+
+## What is inside
+
+Tabs appear only when the hardware, driver or tool behind them exists.
 
 | Tab | What you get |
 |---|---|
-| **Home** | Power profile (Quiet → Performance → Custom), live sensors (CPU per-CCD, dGPU, iGPU, fans, NVMe, power, battery), fan control and custom fan curve, battery charge mode, GPU mode (Hybrid / dGPU only), Fn-lock, camera, USB charging, memory timings viewer |
-| **Scenes** | One name for the whole machine — power profile, firmware limits, CPU/GPU curves, tuning preset, keyboard lighting, a custom command. Automatic AC / battery switching, game-start scene, export / import |
-| **Firmware Attributes** | CPU PL1/PL2/PL3, temperature targets, GPU cTGP and Dynamic Boost — including the values the kernel refuses to write |
-| **NVIDIA Curve Optimizer** | Drag-and-edit V/F curve, core/memory offsets, named profiles, apply at boot |
-| **Ryzen Curve Optimizer** *(AMD)* | Per-core and all-core Curve Optimizer, CPPC-ranked cores, profiles |
-| **Intel Undervolt** *(Intel)* | Voltage offsets, IccMax, TCC offset, PL1/PL2, AC/battery profiles, ThrottleStop.ini import, live throttle monitor |
-| **Optimizations** | ~80 documented CPU/memory/scheduler/power/storage knobs, weighted, hardware-aware **Autotune** (power saving · gaming · throughput · desktop; see [Autotune](#autotune) below), built-in presets, game launch hooks for Lutris and Steam, boot-parameter advisor, one-click *Restore originals* and *Return to boot-guard defaults* (pauses Scenes, rewrites every knob to the value `lpm-boot-guard` captured at boot — the clean baseline before calibrating) |
-| **Lighting** *(Gen10 Spectrum keyboards)* | Per-key RGB editor on a drawing of your own keyboard, firmware effects, 6 hardware profiles, brightness, lid logo, accent lights |
+| **Home** | Power profile cards (Quiet / Balanced / Performance / Custom). *Hardware* box (system, kernel, CPU, GPU, RAM, BIOS, EC firmware) and *Live* box (CPU per CCD, dGPU state, iGPU, fans, NVMe, power rails, battery). *Device* box: battery charge mode, GPU mode (MUX), iGPU-only mode, Panel Overdrive, Fn lock, camera, USB charging when off, Instant Boot, Custom in Fn+Q. Fans: per-fan Auto / Max / set, **Turbo fan** (EC full speed), custom **Fan curve** editor. **Memory timings** viewer and BIOS editor. Boot-guard status with *Resume boot presets* / *Resume login scene*. |
+| **Scenes** | One name for the whole machine: power profile, firmware limits, CPU curve (Ryzen / Intel), NVIDIA curve, Optimizations preset, keyboard lighting, fan boost, Custom-mode fan curve, a run command. AC / battery auto-switching, pause switch, game-start scene, export / import. |
+| **Firmware** | CPU PL1 / PL2 / PL3 and temperature target, GPU cTGP, Dynamic Boost ceiling / floor (written over WMI where the kernel refuses), BIOS CPU overclocking (applied next boot). |
+| **NVIDIA Curve** | Drag-and-edit V/F curve with zoom and pan, core / memory offsets, VRAM clock lock, GPU core clock cap, named profiles, ★ default applied at boot, driver module options, full reset. Status: temps (incl. VRAM / hotspot), throttle reasons, PowerMizer. |
+| **Ryzen Curve** *(AMD)* | Per-core and all-core Curve Optimizer (CPPC-ranked, CCD-aware layout), profiles; *Reset* clears both. |
+| **Intel Undervolt** *(Intel)* | Voltage offsets, IccMax, TCC offset, PL1 / PL2, AC / battery profiles, ThrottleStop.ini import, limit-reason counter, live monitor, boot / resume apply. |
+| **AMD GPU** *(amdgpu)* | Overdrive clocks / voltage per GPU generation, power limit, fan curve (RDNA3+), power profile. Every Apply is a **trial** — reverts in 20 s unless you press *Keep*; one-click undervolt steps. |
+| **Optimizations** | 100+ documented CPU / memory / scheduler / storage / network / device / power knobs in 8 groups, built-in presets, **Autotune**, game launch hooks (Lutris, Steam), boot-parameter advisor, *Restore originals* and *↺ Return to boot-guard defaults*. |
+| **Lighting** *(Gen10 Spectrum)* | Per-key RGB on a drawing of your own keyboard, firmware effects, 6 hardware profiles, brightness, lid logo, accent lights. |
+| **Health** | *Monitor* (Xid / GSP / MCE / AER / lockup events, kept across boots) · *dGPU power* (D3cold / runtime-PM report) · *Network* (connections, IP blacklist, Wine/.exe guard, connection log, whois) · system tool pages (Sensors, CPU, Memory, DMI, PCI, PCIe detail, USB, Storage, SMART, NVIDIA, Graphics, Kernel, Battery) · *Kernel log* (history across boots) · *Backup* (LPM configuration + full system image, with restore). |
 
-Everything important is also in the **tray menu**. Every setting has a tooltip
-that explains what it does and what value to use.
+The **tray menu** carries the everyday actions: Scene (with auto-switch and
+pause), Power Profile, CPU Curve, CPU Undervolt (Intel), GPU Curve,
+Optimizations, Keyboard Lighting, Fans, Show / Hide, Quit. Every setting has a
+tooltip that explains what it does and which value to use.
 
-Built to be safe to experiment with: root helpers validate every value,
-a **boot guard** pauses boot-time presets after a crash, the login scene has
-the same protection, and firmware-persistent changes (BIOS memory timings,
-BIOS CPU OC, GPU MUX) always ask for the administrator password.
+**dGPU-friendly by design.** Home never calls `nvidia-smi`: the GPU row reads
+the sysfs runtime-PM state plus the EC temperature, so an open window does not
+wake a sleeping RTX. Live clock / power / utilisation exist only in the NVIDIA
+tab (which does wake it).
+
+## Command-line tools
+
+| Command | Purpose |
+|---|---|
+| `legion-power-manager [--window] [--version]` | GUI + tray (`--window` opens the window; a second launch just shows the first) |
+| `nvcurve read\|write\|profile\|memlock\|sensors\|powermizer\|reset-all` | NVIDIA V/F curve CLI (generic; not Legion-gated) |
+| `lpm-gamemode PRE\|POST\|RUN\|WRAP\|APPLY\|UNDERVOLT\|SCENE\|RESTORE\|STATUS\|APPROVE` | Game hook for Lutris / Steam, scripted scene switching |
+| `lpm-autotune <powersave\|gaming\|throughput\|desktop>`, `probe`, `audit [--fix]`, `report [SEC]` | Autotune presets, disk probe, safety audit, memory report |
+| `lpm-calibrate [--budget MIN] [--all] [--depth lean\|deep\|max] [--list] [--show] [--restore]` | Measure this machine's knobs (the "machine signature") |
+| `lpm-boot-guard status\|reset\|…` | Boot-crash protection state |
+| `lpm-netguard daemon\|status\|list\|whois IP` | Network guard daemon and queries |
+| `lpm-intel-uv read\|apply\|reset\|monitor\|measure\|throttlestop FILE\|turbo\|daemon` | Standalone Intel undervolt (root) |
+
+## Boot services
+
+Enable only what you use. Nothing does anything until you set the matching
+default / preset in the GUI.
+
+| Service | Role | OpenRC runlevel |
+|---|---|---|
+| `lpm-boot-guard` | crash protection for the rest, records clean shutdowns (recommended) | default |
+| `nvcurve-autoload` | ★ default GPU curve | default |
+| `lpm-tune` | ⏻ Optimizations boot preset | boot |
+| `lpm-netguard` | network guard / connection log (Health → Network; needs nftables) | default |
+| `lpm-intel-uv` / `lpm-intel-uv-daemon` | Intel undervolt at boot / resume, or with AC switching (Intel only) | boot / default |
+
+```sh
+rc-update add lpm-boot-guard default       # OpenRC
+systemctl enable lpm-boot-guard            # systemd
+```
+
+## Safety model
+
+- **Validated helpers.** The GUI never touches hardware. Each change goes
+  through a small Rust helper in `/usr/libexec/legion-power-manager/` that
+  reads one JSON request, checks it against fixed paths and live kernel
+  ranges, and exits.
+- **Boot guard.** A boot that ends within 3 minutes without a clean shutdown
+  pauses every boot preset (and the login scene) until you press *Resume*.
+- **Firmware-persistent changes always ask** for the administrator password
+  (BIOS memory timings, BIOS CPU OC, GPU MUX, iGPU-only override). Backups and
+  restores ask every time too.
+- **Reversible.** *Restore originals* (tuning), *Reset* (curves), *Factory
+  reset profile* (lighting), *Return to boot-guard defaults* (all tuning knobs
+  to the values captured at boot), AMD GPU trial apply.
+- **Write log.** Hardware writes (acpi_call, sysfs, BIOS variable) are logged
+  with their caller to `/var/log/legion-power-manager/writes.log`.
+- **Machine gate.** Runs only on Lenovo Legion / LOQ / IdeaPad Gaming (see
+  below).
+
+### Security levels
+
+Chosen at install time (`--security-level=N` or asked interactively):
+
+| Level | Behaviour |
+|---|---|
+| 1 (default) | local, active `wheel` user runs helpers without a password |
+| 2 | every helper asks for the admin password (polkit caches it briefly) |
+| 3 | as 2, except applying an already-approved Optimizations preset by name |
 
 ## Supported hardware
 
@@ -64,11 +136,11 @@ sudo ./install.sh
 
 `install.sh` builds everything tuned for this machine (native CPU, LTO, PGO,
 hardening) and installs to `/usr`. Options: `--no-native` for portable
-binaries, `--no-lto`, `--no-pgo`, `--no-harden`, `--remove-legacy` to remove
-the old Python version, `--security-level=N` (see [Security levels](#security-levels)). Remove with `sudo ./uninstall.sh`.
-
-To build with clang/LLVM instead of GCC: `sudo ./install-clang.sh` (same options;
-uses lld when installed and `llvm-profdata` for PGO).
+binaries, `--no-lto`, `--no-pgo`, `--no-harden`, `--no-build`,
+`--remove-legacy` to remove the old Python version, `--clang`,
+`--security-level=N`. Remove with `sudo ./uninstall.sh`.
+To build with clang/LLVM: `sudo ./install-clang.sh` (same options; uses lld
+when installed and `llvm-profdata` for PGO).
 
 ### Gentoo
 
@@ -81,119 +153,101 @@ Copy the tarball into your `DISTDIR` and emerge the ebuild from
 
 ### After installing
 
-1. Log out and back in once (the keyboard lighting udev rule and polkit rules take effect).
-2. Start **Legion Power Manager** from the menu — it lives in the tray
-   (`legion-power-manager --window` opens the window directly). It also starts
-   automatically at login.
-3. Optional boot-time services — enable only the ones you use:
-
-   | Service | Applies at boot |
-   |---|---|
-   | `lpm-boot-guard` | crash protection for everything below (recommended) |
-   | `nvcurve-autoload` | the ★ default GPU curve |
-   | `lpm-tune` | the ⏻ Optimizations boot preset (OpenRC runlevel `boot`) |
-   | `lpm-intel-uv` / `lpm-intel-uv-daemon` | Intel undervolt (Intel only) |
-
-   ```sh
-   rc-update add nvcurve-autoload default     # OpenRC
-   systemctl enable nvcurve-autoload          # systemd
-   ```
-
-   Services do nothing until you set a default / boot preset in the GUI.
+1. Log out and back in once (keyboard-lighting udev rule and polkit rules take effect).
+2. Start **Legion Power Manager** from the menu — it lives in the tray and
+   starts at login. Missing tray → the window opens instead.
+3. Enable the [boot services](#boot-services) you want.
 
 ## Quick start
 
-- **Change the power profile:** Home → pick a card, or tray → *Power Profile*.
-- **Undervolt the GPU:** NVIDIA tab → *Read Current Curve* → set an offset or drag
-  points → *Apply Offsets* → *Save As…* → ★ *Default* to apply it at boot.
-- **Undervolt the CPU:** Ryzen tab → all-core or per-core offset → *Apply* → save a profile.
-- **Tune for games:** Optimizations → choose a preset → *Load* → *Apply checked*;
-  ★ *Use for games* and paste the shown hook into Lutris / Steam.
-- **One-click setups:** Scenes → *New…* → pick a profile for each component →
-  *Save*. Turn on *Switch scenes with the power source* for AC / battery.
-- **Keyboard colours:** Lighting → select keys (click, drag, Ctrl-click) →
-  *Paint selection* → *Apply to profile*.
+- **Power profile:** Home → pick a card, or tray → *Power Profile*.
+- **Undervolt the GPU:** NVIDIA → *Read Curve* → set an offset or drag points →
+  *Apply Offsets* → *Save As…* → ★ *Default* to apply it at boot.
+- **Undervolt the CPU:** Ryzen → all-core or per-core offset → *Apply* → save a profile.
+- **Tune for games:** Optimizations → ⚙ *Autotune* (or pick a preset) → *Apply
+  checked*; ★ *Use for games* and paste the hook from *Game launch* into
+  Lutris / Steam.
+- **One-click setups:** Scenes → *New…* → *Capture current* → adjust → *Save*;
+  tick *Switch scenes with the power source* for AC / battery.
+- **Keyboard colours:** Lighting → select keys → *Paint selection* → *Apply to profile*.
+- **Back everything up:** Health → Backup → *LPM configuration*.
 
-Nothing is applied permanently by accident: tuning can always be undone with
-*Restore originals*, curves with *Reset*, lighting with *Factory reset profile*.
+## Optimizations, Autotune, calibration
 
-## Autotune
+**Optimizations** has one sub-tab per group — CPU, Memory, Scheduler, Storage,
+Network, Devices, Power, Stability — plus *Game launch* (Lutris / Steam hooks,
+game-start scene) and *Boot options* (kernel-parameter advisor; nothing edits
+your bootloader). Rows the machine lacks are greyed out. On 2+ CCD chips,
+governor / EPP / boost / max-frequency are per CCD (the V-Cache die is
+labelled).
 
-Optimizations → **⚙ Autotune** profiles the machine (CPU topology and V-Cache,
-cpufreq driver, RAM, swap, storage, kernel, boot parameters, memory and I/O
-pressure history) and fills the tab with a preset for the chosen goal. Nothing
-is written until you press *Apply checked*.
+**⚙ Autotune** profiles the machine and fills the tab with a preset for a goal
+(power saving · gaming · throughput · desktop). Nothing is written until you
+press *Apply checked*.
 
-- **Anchored at boot defaults.** The boot-time values (kernel + distro + your
+- **Anchored at boot defaults.** The values at boot (kernel + distro + your
   sysctl, before TLP) are the reference; settings move at most 2× from them
-  unless evidence justifies more, and settings the pressure guard had to roll
-  back are penalised, then retired. Enable `lpm-boot-guard` for the snapshot.
-- **Weighted, not "bigger is better".** Every setting with a trade-off is
-  scored over latency, throughput, power, memory footprint and stability; a
-  value is written only if it clearly beats leaving the setting alone. Each goal
-  has default weights; **Weights…** changes them per goal (also
-  `lpm-autotune <goal> --weights latency=1.2,footprint=0.8`).
-- **Measured, bounded memory settings.** `vm.dirty_bytes` /
-  `dirty_background_bytes` come from the disk's sustained write rate (about
-  1 s / 0.25 s of writes, at most 2 % of RAM / 1 GiB). Watermark, reserve and
-  THP/khugepaged values stay inside RAM-derived limits, never use a
-  combination the kernel rejects, and rise only when reclaim evidence exists.
-- **Boot parameters win** (`usbcore.autosuspend=`, `pcie_aspm=`,
-  `transparent_hugepage=`); `kernel.watchdog` is never disabled.
-- **Safety net.** tune-helper refuses values that fail the audit (e.g.
-  `dirty_bytes` of a few KiB), and after applying memory/writeback settings a
-  120 s pressure guard restores them if I/O or memory stalls persist.
-- **64-bit values** are edited and stored without truncation.
+  unless evidence justifies more; settings the pressure guard had to roll back
+  are penalised, then retired.
+- **Weighted, not "bigger is better".** Each trade-off is scored over latency,
+  throughput, power, memory footprint and stability; a value is written only if
+  it clearly beats leaving the setting alone. **Weights…** edits the weights per goal.
+- **Measured and bounded.** Dirty limits come from the disk's measured write
+  rate; watermark / THP values stay inside RAM-derived limits; boot parameters
+  win; `kernel.watchdog` is never disabled.
+- **Safety net.** The helper refuses values that fail the audit, and a 120 s
+  pressure guard restores memory / writeback settings if I/O or memory stalls.
+- **Calibration** (`sudo lpm-calibrate`, ~12–15 min by default) measures what
+  each knob actually does on this machine — idle, under load and on the disk —
+  and accumulates a *machine signature* that Autotune uses to dose each knob.
+  Stop Scenes and use *↺ Return to boot-guard defaults* first, so the
+  baseline is clean.
 
 ```sh
 lpm-autotune desktop                 # show a preset (powersave|gaming|throughput|desktop)
 lpm-autotune gaming --save           # save it as "Auto Gaming"
-sudo lpm-autotune probe              # measure disk write speed (<= 512 MiB, <= 4 s)
-lpm-autotune audit [--fix]           # find/repair unsafe values in scenes and presets
-lpm-autotune report [SECONDS]        # memory, THP, writeback, PSI, vmstat deltas
-sudo lpm-calibrate [--budget MIN]    # measure the machine: knobs, their pair/triple interactions and THP (sequential design; depth grows with the budget), idle, under load and on the disk (storage suite)
+lpm-autotune audit [--fix]           # find / repair unsafe values in scenes and presets
+sudo lpm-calibrate --budget 15       # measure the machine
 ```
 
 After updating from an older version run `lpm-autotune audit --fix`, then
-re-save your scenes so the root preset store is rewritten. Details:
-[docs/AUTOTUNE.md](docs/AUTOTUNE.md).
+re-save your scenes. Details: [docs/AUTOTUNE.md](docs/AUTOTUNE.md).
 
-## Security levels
+## Health suite
 
-Chosen at install time (`--security-level=N` or asked interactively):
-
-| Level | Behaviour |
-|---|---|
-| 1 (default) | local, active `wheel` user runs helpers without a password |
-| 2 | every helper asks for the admin password (polkit caches it briefly) |
-| 3 | as 2, except applying an already-approved Optimizations preset by name |
-
-Firmware-persistent changes always ask, at every level.
+- **Monitor** — scans the kernel log for NVIDIA Xid / GSP, MCE, AER, soft
+  lockups and guard rollbacks; events are saved across boots (open / clear the saved log).
+- **dGPU power** — runtime-PM state, sibling PCI functions, upstream port,
+  driver power report and NVreg parameters, open handles that keep the GPU
+  awake, *Copy report*.
+- **Network** — *Connections* (live sockets with their process), *Blocked*,
+  *Log*, *Rules*. Optional guard cuts off any non-whitelisted Wine / .exe
+  program at its first packet; IP / CIDR / range blacklist (bulk bans are
+  removable as one named group); right-click menus (details, kill connection,
+  whitelist, IP info, blacklist IP / subnet / owner's network); connection
+  log with reverse-DNS and whois. Needs the `lpm-netguard` service and nftables.
+- **Backup** — *LPM configuration* (scenes, presets, curves, lighting, boot
+  profiles, network rules, calibration; optional system profile of Portage
+  config, kernel config, fstab, package list) and *System image*
+  (`tar --acls --xattrs` of `/` through pigz / zstd / xz, with verify,
+  retention and restore to any target).
 
 ## Troubleshooting
 
-- **Freezes or instability after applying a preset:** *Restore originals* in
-  Optimizations; then `lpm-autotune audit` to look for unsafe values. Boot
-  presets are paused automatically after a crash (`lpm-boot-guard`).
-- **High idle memory use:** `lpm-autotune report` (look at `AnonHugePages`,
-  watermarks, `MemAvailable`).
-- **Tab or row missing:** the hardware, kernel driver or tool behind it is
-  absent — see Requirements.
-- **Health tab** keeps the kernel-log history (Xid, MCE, AER, lockups, guard
-  rollbacks) across boots.
-- **Health → Backup** makes two kinds of dated archive. *LPM configuration*:
-  scenes, presets, curves, lighting, boot profiles, network-guard rules and
-  calibration, plus an optional system profile (Portage config, world set,
-  kernel config, fstab, boot/module/sysctl settings, package list) — no
-  password to save, one to restore the root-owned part. *System image*:
-  `tar --acls --xattrs -cpf - / | pigz` (or zstd / xz) into a folder of your
-  choice, with verify, retention and a restore into any target directory —
-  the administrator password every time.
+- **Freeze or instability after a preset:** *Restore originals*, then
+  `lpm-autotune audit`. Boot presets pause automatically after a crash.
+- **Tab or row missing:** the hardware, driver or tool behind it is absent — see Requirements.
+- **dGPU never sleeps:** Health → dGPU power → look at *open handles* and runtime PM.
+- **Games fail after parking a CCD, or Xid errors:** Health → Monitor; check
+  *Optimizations → CPU* CCD settings and the NVIDIA driver options.
+- **BIOS setting reverts at boot:** check `/var/log/legion-power-manager/writes.log`
+  for what LPM wrote and when.
+- **Lighting asks for admin rights:** re-login or replug the keyboard once so
+  the udev `uaccess` rule applies.
 
 ## Requirements
 
-**Build:** Rust ≥ 1.75 (cargo), a C++20 compiler, CMake ≥ 3.19, Qt ≥ 6.4
-(Widgets, Network).
+**Build:** Rust ≥ 1.75 (cargo), a C++20 compiler, CMake ≥ 3.19, Qt ≥ 6.4 (Widgets, Network).
 
 **Runtime:**
 
@@ -201,28 +255,38 @@ Firmware-persistent changes always ask, at every level.
 |---|---|
 | everything | polkit (`pkexec`), Linux with `platform_profile` |
 | firmware limits, fans, battery, device toggles | kernel drivers `lenovo-wmi-gamezone`, `lenovo-wmi-other`, `ideapad_laptop` |
-| GPU power limits, fan curve, GPU mode, instant boot | `acpi_call` kernel module |
+| GPU power limits, fan curve, GPU mode, instant boot, EC temps | `acpi_call` kernel module |
 | NVIDIA tab | proprietary NVIDIA driver (NvAPI / NVML are loaded at runtime) |
+| AMD GPU tab | `amdgpu` with `ppfeaturemask` bit `0x4000` for Overdrive |
 | Ryzen tab | root-owned `ryzenadj` in `/usr/bin`, `/usr/sbin`, `/usr/local/{bin,sbin}` or `/opt/ryzenadj` |
 | live memory timings, extra CPU sensors *(optional)* | `ryzen_smu`, `zenpower` / `zenergy` |
 | BIOS memory timings | efivarfs (`/sys/firmware/efi/efivars`) |
 | Lighting tab without a password | udev + systemd-logind or elogind (`uaccess`) |
-| Health → Backup (system image) | GNU `tar` with ACL/xattr support; `pigz` (falls back to `gzip`), optionally `zstd`, `xz` |
-| Health → Network (connections, IP blacklist, Wine/.exe guard, connection log + whois) | `nft` (nftables) and the `lpm-netguard` service; kernel: `NETFILTER_NETLINK_QUEUE`, `NF_TABLES`, `NF_TABLES_INET`, `NFT_QUEUE`, `NF_CONNTRACK`, `NFT_CT`, `INET_DIAG`, `INET_TCP_DIAG`, `INET_UDP_DIAG`, `INET_DIAG_DESTROY` |
+| Health → Backup (system image) | GNU `tar` with ACL / xattr support; `pigz` (falls back to `gzip`), optionally `zstd`, `xz` |
+| Health → Network | `nft` and the `lpm-netguard` service; kernel: `NETFILTER_NETLINK_QUEUE`, `NF_TABLES`, `NF_TABLES_INET`, `NFT_QUEUE`, `NF_CONNTRACK`, `NFT_CT`, `INET_DIAG`, `INET_TCP_DIAG`, `INET_UDP_DIAG`, `INET_DIAG_DESTROY` |
 
 Missing pieces only disable the tab or row that needs them.
 
 ## How it works
 
-The GUI runs as your user and never touches hardware directly. Each kind of
-change goes through a small Rust helper in `/usr/libexec/legion-power-manager/`
-that reads one JSON request, validates it against fixed paths and live
-kernel ranges, and exits. polkit lets a `wheel` user at the machine run them
-without a password; firmware-persistent changes always ask. The keyboard
-lighting helper normally runs as you, through a udev `uaccess` rule.
+```
+gui/                    Qt6 GUI + tray (C++20)
+crates/lpm-helpers/     root helpers, lpm-gamemode / autotune / calibrate / boot-guard / netguard
+crates/lpm-spectrum/    Spectrum keyboard protocol (hidraw)
+crates/nvcurve/         NVIDIA V/F curve core, CLI and root helper (NvAPI + NVML via dlopen)
+packaging/              OpenRC / systemd units, polkit, udev, Gentoo ebuild
+docs/                   HANDBOOK, TECHNICAL, AUTOTUNE
+```
 
-More: [docs/TECHNICAL.md](docs/TECHNICAL.md) — every tab in detail, the
-tuning guide, file locations, services and design notes.
+The GUI runs as your user. polkit lets a `wheel` user at the machine run the
+everyday helpers without a password; firmware-persistent changes always ask.
+The lighting helper normally runs as you through a udev `uaccess` rule.
+
+Data lives in `~/.config/legion-power-manager/` (scenes, presets, AMD GPU
+profiles), `~/.config/ryzen-curve-optimizer/` (CPU profiles), `/etc/nvcurve/`
+(GPU profiles), `/etc/legion-power-manager/` (boot preset, approved presets,
+network rules), `/var/lib/legion-power-manager/` (boot guard, calibration) and
+`/var/log/legion-power-manager/` (write log, connection log).
 
 ## Credits and inspiration
 
@@ -240,6 +304,7 @@ tuning guide, file locations, services and design notes.
   and ideas the CPU tabs build on.
 - **[LenovoLegionLinux](https://github.com/johnfanv2/LenovoLegionLinux)** — for
   paving the way for Legion support on Linux.
+- **LACT** and **TLP** — reference for the AMD GPU tab and the device power settings; both implemented independently.
 
 Third-party license texts: [NOTICE](NOTICE).
 
