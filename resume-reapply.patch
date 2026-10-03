@@ -1,0 +1,196 @@
+diff -ru legion-power-manager-main/gui/src/scenes.cpp legion-power-manager-main/gui/src/scenes.cpp
+--- legion-power-manager-main/gui/src/scenes.cpp	2026-10-01 15:50:36.000000000 +0000
++++ legion-power-manager-main/gui/src/scenes.cpp	2026-10-03 15:47:41.845495982 +0000
+@@ -30,6 +30,7 @@
+ #include <linux/netlink.h>
+ #include <sys/socket.h>
+ #include <sys/file.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ namespace scenes {
+@@ -153,13 +154,14 @@
+     a.onAc = o.value("on_ac").toString();
+     a.onBattery = o.value("on_battery").toString();
+     a.paused = o.value("paused").toBool();
++    a.onResume = o.value("on_resume").toBool();
+     if (!validName(a.onAc)) a.onAc.clear();
+     if (!validName(a.onBattery)) a.onBattery.clear();
+     return a;
+ }
+ 
+ bool saveAuto(const Auto &a, QString *err) {
+-    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}, {"paused", a.paused}}, err);
++    return writeObject(autoFile(), {{"auto", a.enabled}, {"on_ac", a.onAc}, {"on_battery", a.onBattery}, {"paused", a.paused}, {"on_resume", a.onResume}}, err);
+ }
+ 
+ std::optional<bool> onAc() {
+@@ -286,6 +288,10 @@
+ // a game scene); otherwise charger changes arrive as kernel uevents and the
+ // slow tick is just a safety net (and notices a game scene appearing).
+ static constexpr int POWER_POLL_MS = 3000, IDLE_POLL_MS = 20000, STABLE_READS = 2, STARTUP_DELAY_MS = 4000;
++// After a wake the firmware / EC may have reset limits and the drivers need a moment: first pass after
++// RESUME_DELAY_MS, then RESUME_PASSES-1 more RESUME_REPASS_MS apart (catches a late firmware override).
++static constexpr int RESUME_TICK_MS = 2000, RESUME_DELAY_MS = 5000, RESUME_REPASS_MS = 30000, RESUME_PASSES = 2;
++static constexpr long long RESUME_GAP_NS = 1000000000LL;  // sleeping longer than 1 s counts as a suspend
+ static constexpr int GAME_ORPHAN_READS = 5;  // ~15 s without a game while the game scene is still set
+ 
+ SceneEngine::SceneEngine(MainWindow *win) : QObject(win), win_(win), auto_(loadAuto()) {
+@@ -298,6 +304,7 @@
+     if (qEnvironmentVariableIsSet("LPM_PGO_TRAIN")) return;
+     watchUevents();
+     retunePoll();
++    retuneResume();
+     // Session start: bring the machine to the scene for the current source,
+     // after the tabs have finished their own startup reads.
+     // A theme change re-execs the app: the hardware is already in the scene's state.
+@@ -354,6 +361,7 @@
+     const bool wasOn = auto_.enabled;
+     if (!saveAuto(a, err)) return false;
+     auto_ = a;
++    retuneResume();
+     if (a.enabled && !wasOn && ac_) applyForSource(*ac_);
+     return true;
+ }
+@@ -372,6 +380,60 @@
+     return true;
+ }
+ 
++static long long bootOffsetNs() {
++    timespec b{}, m{};
++    if (clock_gettime(CLOCK_BOOTTIME, &b) != 0 || clock_gettime(CLOCK_MONOTONIC, &m) != 0) return -1;
++    return (b.tv_sec - m.tv_sec) * 1000000000LL + (b.tv_nsec - m.tv_nsec);
++}
++
++/// Runs the suspend detector only while "reapply after resume" is on (and automatic scenes are enabled),
++/// so nothing wakes up for it otherwise.
++void SceneEngine::retuneResume() {
++    const bool want = auto_.enabled && auto_.onResume && !qEnvironmentVariableIsSet("LPM_PGO_TRAIN");
++    if (!want) {
++        if (resumeTick_) resumeTick_->stop();
++        if (resumePass_) resumePass_->stop();
++        resumePassesLeft_ = 0;
++        return;
++    }
++    if (!resumeTick_) {
++        resumeTick_ = new QTimer(this);
++        resumeTick_->setTimerType(Qt::CoarseTimer);
++        resumeTick_->setInterval(RESUME_TICK_MS);
++        connect(resumeTick_, &QTimer::timeout, this, &SceneEngine::resumeTick);
++        resumePass_ = new QTimer(this);
++        resumePass_->setSingleShot(true);
++        connect(resumePass_, &QTimer::timeout, this, &SceneEngine::resumePass);
++    }
++    if (!resumeTick_->isActive()) {
++        bootOffsetNs_ = bootOffsetNs();
++        resumeTick_->start();
++    }
++}
++
++// CLOCK_BOOTTIME keeps counting in suspend, CLOCK_MONOTONIC does not: their difference jumps by the sleep time.
++void SceneEngine::resumeTick() {
++    const long long off = bootOffsetNs();
++    if (off < 0) { resumeTick_->stop(); return; }  // no CLOCK_BOOTTIME: detection unavailable
++    const bool woke = bootOffsetNs_ >= 0 && off - bootOffsetNs_ > RESUME_GAP_NS;
++    bootOffsetNs_ = off;
++    if (!woke) return;
++    resumePassesLeft_ = RESUME_PASSES;  // a new suspend restarts the sequence
++    resumePass_->start(RESUME_DELAY_MS);
++}
++
++void SceneEngine::resumePass() {
++    if (!auto_.enabled || !auto_.onResume || resumePassesLeft_ <= 0) { resumePassesLeft_ = 0; return; }
++    --resumePassesLeft_;
++    // The charger may have been (un)plugged while asleep; take the fresh state, applyForSource honours
++    // pause, a running game (deferred) and a scene already being applied (queued).
++    if (const auto now = onAc()) {
++        if (!ac_ || *now != *ac_) { ac_ = now; candidate_.reset(); stableReads_ = 0; Q_EMIT powerSourceChanged(*ac_); }
++    }
++    if (ac_) applyForSource(*ac_);
++    if (resumePassesLeft_ > 0) resumePass_->start(RESUME_REPASS_MS);
++}
++
+ void SceneEngine::retunePoll() {
+     const bool busy = candidate_ || deferred_ || sawGameScene_ || gameGoneReads_ > 0 || uevFd_ < 0;
+     const int want = busy ? POWER_POLL_MS : IDLE_POLL_MS;
+diff -ru legion-power-manager-main/gui/src/scenes.h legion-power-manager-main/gui/src/scenes.h
+--- legion-power-manager-main/gui/src/scenes.h	2026-10-01 15:50:36.000000000 +0000
++++ legion-power-manager-main/gui/src/scenes.h	2026-10-03 15:47:41.844816369 +0000
+@@ -51,6 +51,7 @@
+     bool enabled = false;
+     QString onAc, onBattery;       // scene names; empty = leave as is
+     bool paused = false;           // no automatic scene changes (power source, login, game); manual Apply still works
++    bool onResume = false;         // after waking from suspend, reapply the scene for the current power source (needs `enabled`)
+ };
+ 
+ QString dir();
+@@ -123,6 +124,9 @@
+     void retunePoll();
+     void watchUevents();
+     void checkGameEnd();
++    void retuneResume();
++    void resumeTick();
++    void resumePass();
+     void applyForSource(bool onAc);
+     void startupApply();
+     void helper(const QString &name, const QJsonObject &req, Done done,
+@@ -142,4 +146,7 @@
+     int gameGoneReads_ = 0;
+     bool sawGameScene_ = false;
+     int uevFd_ = -1;  // uevent socket; -1 → poll at the fast cadence as before
++    QTimer *resumeTick_ = nullptr, *resumePass_ = nullptr;  // suspend detector / reapply passes after a wake
++    long long bootOffsetNs_ = -1;  // CLOCK_BOOTTIME - CLOCK_MONOTONIC at the last tick; it grows by the time spent suspended
++    int resumePassesLeft_ = 0;
+ };
+diff -ru legion-power-manager-main/gui/src/scenestab.cpp legion-power-manager-main/gui/src/scenestab.cpp
+--- legion-power-manager-main/gui/src/scenestab.cpp	2026-10-01 15:50:36.000000000 +0000
++++ legion-power-manager-main/gui/src/scenestab.cpp	2026-10-03 15:47:41.846148110 +0000
+@@ -236,6 +236,10 @@
+     ag->addWidget(onBattery_, 1, 3);
+     power_ = muted(QString());
+     ag->addWidget(power_, 2, 0, 1, 4);
++    resume_ = new QCheckBox("Reapply the scene after waking from suspend");
++    resume_->setToolTip("Firmware and the EC can reset limits during sleep. After a wake the scene for the current power source is "
++                        "applied again (5 s after waking, once more 30 s later). Needs automatic switching; honours Pause and running games.");
++    ag->addWidget(resume_, 3, 0, 1, 4);
+     pause_ = new QPushButton;
+     pause_->setCheckable(true);
+     pause_->setToolTip("Pause every automatic scene change (power source, login, game scene). Apply still works.");
+@@ -274,7 +278,8 @@
+     for (QComboBox *c : {profile_, cpu_, gpu_, tuning_, lightProfile_, lightBright_, fan_})
+         if (c) connect(c, &QComboBox::currentIndexChanged, this, [this] { if (!filling_) updateDirty(); });
+     connect(command_, &QLineEdit::textChanged, this, [this] { if (!filling_) updateDirty(); });
+-    connect(auto_, &QCheckBox::toggled, this, [this] { if (!filling_) storeAuto(); });
++    connect(auto_, &QCheckBox::toggled, this, [this](bool on) { resume_->setEnabled(on); if (!filling_) storeAuto(); });
++    connect(resume_, &QCheckBox::toggled, this, [this] { if (!filling_) storeAuto(); });
+     for (QComboBox *c : {onAc_, onBattery_})
+         connect(c, &QComboBox::currentIndexChanged, this, [this] { if (!filling_) storeAuto(); });
+ 
+@@ -566,6 +571,8 @@
+         c->setCurrentIndex(std::max(0, c->findData(sel)));
+     }
+     auto_->setChecked(a.enabled);
++    resume_->setChecked(a.onResume);
++    resume_->setEnabled(a.enabled);
+     onAc_->setEnabled(!names.isEmpty());
+     onBattery_->setEnabled(!names.isEmpty());
+     filling_ = false;
+@@ -574,6 +581,7 @@
+ void ScenesTab::storeAuto() {
+     scenes::Auto a = eng_->autoConfig();  // keeps the pause state
+     a.enabled = auto_->isChecked();
++    a.onResume = resume_->isChecked();
+     a.onAc = onAc_->currentData().toString();
+     a.onBattery = onBattery_->currentData().toString();
+     QString err;
+diff -ru legion-power-manager-main/gui/src/scenestab.h legion-power-manager-main/gui/src/scenestab.h
+--- legion-power-manager-main/gui/src/scenestab.h	2026-10-01 15:50:36.000000000 +0000
++++ legion-power-manager-main/gui/src/scenestab.h	2026-10-03 15:47:41.845718296 +0000
+@@ -55,6 +55,7 @@
+     QLineEdit *command_;
+     QPushButton *save_, *apply_, *dup_, *del_;
+     QCheckBox *auto_;
++    QCheckBox *resume_ = nullptr;
+     class QPushButton *pause_ = nullptr;
+     QComboBox *onAc_, *onBattery_;
+     QLabel *power_, *status_, *empty_;
