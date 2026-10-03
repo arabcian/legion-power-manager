@@ -311,20 +311,39 @@ void OptimizeTab::buildUi() {
     wirelessLock_->setToolTip(QStringLiteral(
         "Master switch. While it is on, Wi-Fi power save, runtime power management of the Wi-Fi and Bluetooth devices and\n"
         "Bluetooth USB autosuspend are kept off — scenes, presets, game mode and autotune cannot turn them back on.\n"
-        "With NetworkManager installed a drop-in is also written so it does not re-enable Wi-Fi power save on reconnect."));
+        "With NetworkManager installed a drop-in is also written so it does not re-enable Wi-Fi power save on reconnect.\n\n"
+        "Recommended if you have any wireless trouble: random Wi-Fi disconnects, an adapter that stops responding until the\n"
+        "module is reloaded or the machine is rebooted, Bluetooth devices dropping out, or ping spikes on an idle link.\n"
+        "Power management of Wi-Fi and Bluetooth chips (802.11 power save, PCIe ASPM, runtime PM, USB autosuspend) has been\n"
+        "unreliable on Linux for many years, and several drivers and firmwares (notably some MediaTek adapters) misbehave when\n"
+        "the radio or its link is put to sleep. The price is a little more idle power."));
     root->addWidget(wirelessLock_);
     connect(wirelessLock_, &QCheckBox::toggled, this, [this](bool on) {
-        if (busy_) {
-            const QSignalBlocker b(wirelessLock_);
-            wirelessLock_->setChecked(!on);
-            return;
-        }
-        runOp({{"op", "set_wireless_pm_lock"}, {"on", on}}, QStringLiteral("Wi-Fi / Bluetooth power management lock"), [this, on](const QJsonObject &r) {
-            if (!r.value("ok").toBool()) {
-                const QSignalBlocker b(wirelessLock_);
-                wirelessLock_->setChecked(!on);
+        auto revert = [this, on] { const QSignalBlocker b(wirelessLock_); wirelessLock_->setChecked(!on); };
+        if (busy_) { revert(); return; }
+        // Deliberately not runOp(): its setBusy() greys out and re-enables the whole group tree and its
+        // epilogue refills the preset combo — that was the full-tab repaint. The switch changes none of
+        // that state, so only the checkbox itself is locked while the helper runs; the poll refresh
+        // afterwards updates the affected rows in place.
+        const QString what = QStringLiteral("Wi-Fi / Bluetooth power management lock");
+        wirelessLock_->setEnabled(false);
+        showStatus(what + QStringLiteral("…"), theme::MUTED, 0);
+        privileged::run(helperForOp(QStringLiteral("set_wireless_pm_lock")), QJsonObject{{"op", "set_wireless_pm_lock"}, {"on", on}}, this,
+                        [this, what, revert](const privileged::Result &r) {
+            wirelessLock_->setEnabled(true);
+            if (!r.reached) {
+                revert();
+                showStatus(what + QStringLiteral(" failed."), theme::DANGER);
+                QMessageBox::critical(this, what, r.error);
+            } else if (!r.ok()) {
+                revert();
+                showStatus(what + QStringLiteral(" failed."), theme::DANGER);
+                QMessageBox::critical(this, what, r.message().isEmpty() ? QStringLiteral("unknown error") : r.message());
+            } else {
+                showStatus(what + QStringLiteral(" updated."), theme::OK, 4000);
             }
-        });
+            refresh();
+        }, PKEXEC_TIMEOUT_MS);
     });
 
     // Presets
